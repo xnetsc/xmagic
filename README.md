@@ -112,10 +112,12 @@ and upstream records to keep them distinct upstream.
 
 ### Settings (including render-level configuration)
 
-Besides the session lifetime, Settings holds four render-level options
+Besides the session lifetime, Settings holds the render-level options
 that otherwise only exist in `.env`: the VLESS / Trojan WS path lists,
-the upstream pool strategy, the default SS method for new users, and
-whether direct egress to private addresses is allowed. A value stored
+the upstream pool strategy, the default SS method for new users,
+whether direct egress to private addresses is allowed, and the
+group opt-out list for same-group interconnect (on by default - see
+"Same-group interconnect" below). A value stored
 in the database wins; clearing it falls back to the `.env` deployment
 default; saving re-renders and applies at once. Port configuration is
 not here - ports belong to the dispatcher / sshd processes and stay in
@@ -170,6 +172,11 @@ python3 xmagic.py upstreams edit b1 --port 8443      # same API as the web edito
 python3 xmagic.py users rotate-uuid alice
 python3 xmagic.py settings set --session-ttl-hours 24
 python3 xmagic.py settings set --upstream-strategy random --ss-method chacha20-ietf-poly1305
+python3 xmagic.py keys list        # SSH keys usable here: ~/.ssh, ~/.xmagic/keys, ssh-agent
+python3 xmagic.py keys generate alice   # mint an ed25519 pair under ~/.xmagic/keys
+python3 xmagic.py users add alice --ssh-key alice   # register one of those keys as her credential
+python3 xmagic.py users add bob --ssh-key-generate  # mint + register in one step
+python3 xmagic.py update           # update this CLI to the latest version from the repo
 ```
 
 - The node registry lives in `~/.xmagic/config.json`. Target
@@ -185,6 +192,18 @@ python3 xmagic.py settings set --upstream-strategy random --ss-method chacha20-i
   other commands select it with the same flag (or
   `XMAGIC_SESSION_FILE`) - one session per file, switch per node in
   scripts, suited to managing many nodes.
+- SSH keys never need external tools: the console, this CLI and
+  users.py all generate ed25519 keypairs in place. For a user, the
+  private key stays on the client (the console offers it as a one-time
+  download; the node stores only the public key); for an SSH upstream
+  the generated key is stored on the node as its managed key. On the
+  console, a user with a registered key shows the ready-made
+  `ssh -D 1080 -N -p <port> <user>@<node>` command - a plain SSH
+  client is a working proxy client.
+- `xmagic update` self-updates from the repository: the download is
+  version-checked and self-tested before it replaces the running
+  file, and the previous version is kept as `xmagic.py.bak`
+  (`--check` only reports, `--from URL` overrides the source).
 - Exit codes: 0 success, 1 API error, 2 config/usage error,
   3 not signed in or session expired - scripts can re-run `login`
   based on them.
@@ -289,6 +308,27 @@ python3 users.py route-add --kind full --pattern example.com --to intl --user ca
   -> per-user group rules -> fallback (default pool or direct). A rule
   pointing at a group with no enabled upstream is skipped at render
   time with a warning instead of breaking the whole config.
+
+## Same-group interconnect
+
+Users in the same group can reach each other's services through the
+gateway, LAN-style. It is **on by default**; Settings (or
+`settings --interconnect-off-groups`) lists the groups that opt out.
+
+- Expose: a user holds a reverse forward to the gateway loopback,
+  e.g. `ssh -R 127.0.0.1:20005:127.0.0.1:8080 -N -p <port> <user>@<node>`
+  publishes their local port 8080. Each user owns a fixed slice of
+  16 ports (20000-21599, shown in the console's user list); sshd
+  enforces the slice per key (`permitlisten` in authorized_keys), so
+  nobody can squat on another user's ports.
+- Visit: any member of the group dials `127.0.0.1:<port>` through
+  their proxy like any other destination. Routing sends a member's
+  slice only to members of the group; every other loopback
+  destination is blocked at the gateway, so the node's own loopback
+  services stay unreachable.
+- Scope: TCP only, and only services a user explicitly forwards -
+  this is gateway-mediated reachability, not a virtual LAN (no
+  virtual IPs, no UDP, no discovery).
 
 ## Images and CI
 

@@ -28,16 +28,35 @@ Login:
   session to use - that is what makes batch management of many nodes
   scriptable: one session file per node, chosen per invocation.
 
+Keys:
+  `xmagic keys list` shows the SSH keys usable in this environment
+  (~/.ssh pairs, keys this CLI generated under ~/.xmagic/keys, and
+  ssh-agent identities); `xmagic keys generate` mints a fresh ed25519
+  pair there. `users add/setkey --ssh-key NAME|FINGERPRINT` registers
+  one of them as a gateway user's credential; `--ssh-key-generate`
+  mints and registers in one step.
+
+Update:
+  `xmagic update` replaces this file with the latest version from
+  the repository (XMAGIC_UPDATE_URL or --from overrides the source).
+  The download is version-checked and self-tested (--version probe)
+  before it lands; the previous file is kept next to it as .bak.
+
 Exit codes: 0 ok, 1 API/server error, 2 config/usage error,
 3 not logged in / session expired (run `xmagic login`).
 """
 import argparse
+import base64
 import hashlib
 import http.server
 import json
 import os
+import re
 import secrets
 import socket
+import struct
+import subprocess
+import tempfile
 import sys
 import threading
 import time
@@ -407,6 +426,9 @@ def cmd_settings_show(args):
         f"({src[payload['ss_method_from_db']]})",
         f"direct_allow_private: {payload['direct_allow_private']} "
         f"({src[payload['direct_allow_private_from_db']]})",
+        f"interconnect_off_groups: "
+        f"{','.join(payload['interconnect_off_groups']) or '(none)'} "
+        f"({src[payload['interconnect_off_groups_from_db']]})",
     ]))
 
 
@@ -441,7 +463,7 @@ def cmd_settings_set(args):
     api, _, _ = authed_api(args)
     body = {}
     for key in ("session_ttl_hours", "vless_ws_paths", "trojan_ws_paths",
-                "upstream_strategy", "ss_method"):
+                "upstream_strategy", "ss_method", "interconnect_off_groups"):
         if getattr(args, key) is not None:
             body[key] = getattr(args, key)
     if getattr(args, "direct_allow_private", None) is not None:
@@ -453,7 +475,9 @@ def cmd_settings_set(args):
     emit(args, payload,
          f"settings saved; session_ttl_hours={payload['session_ttl_hours']}, "
          f"strategy={payload['upstream_strategy']}, "
-         f"ss_method={payload['ss_method']}\n"
+         f"ss_method={payload['ss_method']}, "
+         f"interconnect_off_groups="
+         f"{','.join(payload['interconnect_off_groups']) or '(none)'}\n"
          + applied_line(payload.get("applied")))
 
 
@@ -461,6 +485,19 @@ def _read_key(args):
     if getattr(args, "ssh_key_file", None):
         with open(args.ssh_key_file) as f:
             return f.read().strip()
+    if getattr(args, "ssh_key", None):
+        return resolve_env_key(args.ssh_key)
+    if getattr(args, "ssh_key_generate", None) is not None:
+        name = args.ssh_key_generate or getattr(args, "user", None) or "xmagic"
+        priv = os.path.join(base_dir(), "keys", name)
+        if os.path.exists(priv) or os.path.exists(priv + ".pub"):
+            die(2, f"key already exists: {priv}"
+                   " - pass --ssh-key-generate NAME for a fresh one")
+        os.makedirs(os.path.dirname(priv), exist_ok=True)
+        pub, fp = _save_keypair(priv, name)
+        print(f"generated ssh key {priv} ({fp}); the node stores only"
+              " the public key", file=sys.stderr)
+        return pub
     return getattr(args, "ssh_pubkey", None)
 
 
@@ -536,13 +573,328 @@ def _key_upload_content(args):
         die(2, f"cannot read key file {path}: {exc.strerror or exc}")
 
 
+# ------------------------------------------------------------ self-update
+
+VERSION = "1.1.0"
+UPDATE_URL = ("https://raw.githubusercontent.com/xnetsc/xmagic"
+              "/main/xmagic.py")
+
+
+def _vkey(v):
+    parts = []
+    for p in str(v).split("."):
+        digits = "".join(c for c in p if c.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts)
+
+
+def cmd_update(args):
+    """Replace this file with the latest xmagic.py from the repo.
+
+    The download must carry a VERSION, compile, and pass a --version
+    probe before anything is replaced; the old file stays as .bak.
+    Purely local - no node, no session."""
+    target = os.path.realpath(__file__)
+    url = (getattr(args, "update_url", None)
+           or os.environ.get("XMAGIC_UPDATE_URL") or UPDATE_URL)
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": f"xmagic/{VERSION}"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = resp.read()
+    except (urllib.error.URLError, OSError) as exc:
+        die(1, f"update download failed: {exc}")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        die(1, "downloaded file is not valid UTF-8 - refusing to install")
+    m = re.search(r'^VERSION = "([^"]+)"', text, re.M)
+    if not m or "gateway" not in text[:2000]:
+        die(1, "downloaded file does not look like xmagic.py"
+               " - refusing to install")
+    remote = m.group(1)
+    if remote == VERSION:
+        emit(args, {"updated": False, "version": VERSION},
+             f"already up to date (xmagic {VERSION})")
+        return
+    if _vkey(remote) < _vkey(VERSION) and not getattr(args, "force", False):
+        die(1, f"remote version {remote} is older than this {VERSION}"
+               " - pass --force to downgrade")
+    if getattr(args, "check", False):
+        emit(args, {"updated": False, "version": VERSION,
+                    "available": remote},
+             f"update available: {VERSION} -> {remote}"
+             f" (run: xmagic update)")
+        return
+    directory = os.path.dirname(target) or "."
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".xmagic-update-",
+                               suffix=".py")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        try:
+            compile(text, tmp, "exec")
+        except SyntaxError as exc:
+            die(1, f"downloaded file does not compile: {exc}"
+                  " - refusing to install")
+        probe = subprocess.run([sys.executable, tmp, "--version"],
+                               capture_output=True, text=True, timeout=15)
+        if probe.returncode != 0 or remote not in probe.stdout:
+            die(1, "downloaded file failed its --version self-check"
+                   " - refusing to install")
+        backup = target + ".bak"
+        try:
+            with open(target, "rb") as f:
+                old = f.read()
+            with open(backup, "wb") as f:
+                f.write(old)
+            os.chmod(tmp, 0o755)
+            os.replace(tmp, target)
+        except OSError as exc:
+            die(1, f"cannot replace {target}: {exc}")
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    emit(args, {"updated": True, "from": VERSION, "to": remote,
+                "path": target, "backup": backup},
+         f"updated {target}: {VERSION} -> {remote}"
+         f" (previous version kept at {backup})")
+
+
+# ------------------------------------------------------------ ssh key tools
+# Pure-stdlib ed25519 keypair generation (OpenSSH formats) plus a scan
+# of the SSH keys already usable in this environment (~/.ssh pairs,
+# keys this CLI generated, ssh-agent identities), so a key can be
+# minted or picked where it is used - no external tools needed.
+
+_ED_Q = 2 ** 255 - 19
+_ED_D = (-121665 * pow(121666, _ED_Q - 2, _ED_Q)) % _ED_Q
+_ED_I = pow(2, (_ED_Q - 1) // 4, _ED_Q)
+
+
+def _ed_xrecover(y):
+    xx = (y * y - 1) * pow(_ED_D * y * y + 1, _ED_Q - 2, _ED_Q) % _ED_Q
+    x = pow(xx, (_ED_Q + 3) // 8, _ED_Q)
+    if (x * x - xx) % _ED_Q != 0:
+        x = (x * _ED_I) % _ED_Q
+    if x % 2 != 0:
+        x = _ED_Q - x
+    return x
+
+
+_ED_BY = (4 * pow(5, _ED_Q - 2, _ED_Q)) % _ED_Q
+_ED_BX = _ed_xrecover(_ED_BY)
+_ED_B = (_ED_BX, _ED_BY, 1, (_ED_BX * _ED_BY) % _ED_Q)
+_ED_IDENTITY = (0, 1, 1, 0)
+
+
+def _ed_add(P, Q):
+    A = (P[1] - P[0]) * (Q[1] - Q[0]) % _ED_Q
+    B = (P[1] + P[0]) * (Q[1] + Q[0]) % _ED_Q
+    C = 2 * _ED_D * P[3] * Q[3] % _ED_Q
+    D = 2 * P[2] * Q[2] % _ED_Q
+    E, F, G, H = B - A, D - C, D + C, B + A
+    return (E * F % _ED_Q, G * H % _ED_Q, F * G % _ED_Q, E * H % _ED_Q)
+
+
+def _ed_double(P):
+    A = P[0] * P[0] % _ED_Q
+    B = P[1] * P[1] % _ED_Q
+    C = 2 * P[2] * P[2] % _ED_Q
+    D = (-A) % _ED_Q
+    E = ((P[0] + P[1]) * (P[0] + P[1]) - A - B) % _ED_Q
+    G, F, H = D + B, (D + B) - C, D - B
+    return (E * F % _ED_Q, G * H % _ED_Q, F * G % _ED_Q, E * H % _ED_Q)
+
+
+def _ed_scalarmult(P, e):
+    R = _ED_IDENTITY
+    while e > 0:
+        if e & 1:
+            R = _ed_add(R, P)
+        P = _ed_double(P)
+        e >>= 1
+    return R
+
+
+def _ssh_str(b):
+    return struct.pack(">I", len(b)) + b
+
+
+def pubkey_fingerprint(line):
+    parts = (line or "").strip().split()
+    if len(parts) < 2:
+        return None
+    try:
+        blob = base64.b64decode(parts[1])
+    except Exception:
+        return None
+    return "SHA256:" + base64.b64encode(
+        hashlib.sha256(blob).digest()).decode().rstrip("=")
+
+
+def generate_ed25519_keypair(comment=""):
+    """-> (private_pem, public_line, fingerprint). Pure stdlib."""
+    seed = os.urandom(32)
+    h = bytearray(hashlib.sha512(seed).digest()[:32])
+    h[0] &= 248
+    h[31] &= 63
+    h[31] |= 64
+    a = int.from_bytes(h, "little")
+    P = _ed_scalarmult(_ED_B, a)
+    zi = pow(P[2], _ED_Q - 2, _ED_Q)
+    x, y = P[0] * zi % _ED_Q, P[1] * zi % _ED_Q
+    pub = (y | ((x & 1) << 255)).to_bytes(32, "little")
+    blob = _ssh_str(b"ssh-ed25519") + _ssh_str(pub)
+    check = struct.unpack(">I", os.urandom(4))[0]
+    section = struct.pack(">II", check, check)
+    section += _ssh_str(b"ssh-ed25519") + _ssh_str(pub)
+    section += _ssh_str(seed + pub) + _ssh_str(comment.encode())
+    pad = 8 - (len(section) % 8) or 8
+    section += bytes(range(1, pad + 1))
+    raw = b"openssh-key-v1\x00"
+    raw += _ssh_str(b"none") + _ssh_str(b"none") + _ssh_str(b"")
+    raw += struct.pack(">I", 1) + _ssh_str(blob) + _ssh_str(section)
+    b64 = base64.b64encode(raw).decode()
+    pem = ("-----BEGIN OPENSSH PRIVATE KEY-----\n"
+           + "\n".join(b64[i:i + 70] for i in range(0, len(b64), 70))
+           + "\n-----END OPENSSH PRIVATE KEY-----\n")
+    pub_line = "ssh-ed25519 " + base64.b64encode(blob).decode()
+    if comment:
+        pub_line += " " + comment
+    return pem, pub_line, pubkey_fingerprint(pub_line)
+
+
+def _save_keypair(priv_path, comment):
+    """Write a fresh keypair (private 0600, exclusive create) and its
+    .pub next to it. -> (public_line, fingerprint)."""
+    pem, pub, fp = generate_ed25519_keypair(comment)
+    fd = os.open(priv_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(pem)
+    with open(priv_path + ".pub", "w") as f:
+        f.write(pub + "\n")
+    return pub, fp
+
+
+def _read_pub_line(path):
+    try:
+        with open(path) as f:
+            line = f.read().strip().splitlines()[0].strip()
+    except (OSError, IndexError):
+        return None
+    return line if pubkey_fingerprint(line) else None
+
+
+def scan_env_keys():
+    """SSH keys usable in this environment. File pairs in ~/.ssh and
+    in ~/.xmagic/keys, plus ssh-agent identities when an agent answers.
+    Entries: {name, type, fingerprint, comment, source, pubkey,
+    priv_path} - deduplicated by fingerprint, files before agent."""
+    entries, seen = [], set()
+
+    def add(name, line, source, priv_path):
+        fp = pubkey_fingerprint(line)
+        if not fp or fp in seen:
+            return
+        seen.add(fp)
+        parts = line.split()
+        entries.append({"name": name, "type": parts[0], "fingerprint": fp,
+                        "comment": parts[2] if len(parts) > 2 else "",
+                        "source": source, "pubkey": line,
+                        "priv_path": priv_path})
+
+    for directory, source in ((os.path.join(os.path.expanduser("~"), ".ssh"),
+                               "file"),
+                              (os.path.join(base_dir(), "keys"), "xmagic")):
+        if os.path.isdir(directory):
+            for fn in sorted(os.listdir(directory)):
+                if fn.endswith(".pub"):
+                    line = _read_pub_line(os.path.join(directory, fn))
+                    if line:
+                        priv = os.path.join(directory, fn[:-4])
+                        add(fn[:-4], line, source,
+                            priv if os.path.exists(priv) else None)
+    if os.environ.get("SSH_AUTH_SOCK"):
+        try:
+            out = subprocess.run(["ssh-add", "-L"], capture_output=True,
+                                 text=True, timeout=5)
+            if out.returncode == 0:
+                for line in out.stdout.splitlines():
+                    line = line.strip()
+                    if pubkey_fingerprint(line):
+                        parts = line.split()
+                        add(parts[2] if len(parts) > 2 else "agent-key",
+                            line, "agent", None)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return entries
+
+
+def resolve_env_key(selector):
+    """Resolve a key selector - a .pub file path, a name from the
+    environment scan, or a (prefix of a) SHA256 fingerprint - to a
+    public key line. Dies with a config error when unmatched/ambiguous."""
+    if os.path.isfile(selector):
+        line = _read_pub_line(selector)
+        if line:
+            return line
+        die(2, f"{selector} does not contain a usable public key")
+    hits = [e for e in scan_env_keys()
+            if e["name"] == selector or e["fingerprint"] == selector
+            or e["fingerprint"].startswith(selector)
+            or e["fingerprint"].split(":", 1)[1].startswith(selector)]
+    if len(hits) == 1:
+        return hits[0]["pubkey"]
+    if not hits:
+        die(2, f"no environment key matches {selector!r}"
+               " - see: xmagic keys list")
+    die(2, f"key selector {selector!r} matches {len(hits)} keys"
+           " - use a full fingerprint")
+
+
+def cmd_keys_list(args):
+    entries = scan_env_keys()
+    lines = [f"{e['fingerprint']}  {e['type']:<11} {e['source']:<6} "
+             f"{e['name']:<20} "
+             + (e["priv_path"] or "(public key only)")
+             for e in entries]
+    emit(args, {"keys": entries},
+         "\n".join(lines) if lines else
+         "(no ssh keys found - create one: xmagic keys generate)")
+
+
+def cmd_keys_generate(args):
+    name = args.name or "xmagic"
+    priv = os.path.join(base_dir(), "keys", name)
+    if os.path.exists(priv) or os.path.exists(priv + ".pub"):
+        die(2, f"key already exists: {priv} - pick another name")
+    os.makedirs(os.path.dirname(priv), exist_ok=True)
+    pub, fp = _save_keypair(priv, name)
+    emit(args, {"private_key": priv, "public_key_file": priv + ".pub",
+                "public_key": pub, "fingerprint": fp},
+         f"private key: {priv} (0600 - keep it secret)\n"
+         f"public key:  {priv}.pub\n"
+         f"fingerprint: {fp}\n{pub}\n"
+         f"register it: xmagic users add <user> --ssh-key {name}")
+
+
+def cmd_keys_show(args):
+    line = resolve_env_key(args.selector)
+    emit(args, {"selector": args.selector, "public_key": line,
+                "fingerprint": pubkey_fingerprint(line)}, line)
+
+
 def cmd_upstreams_add(args):
+    if getattr(args, "key_generate", False) and (args.key_file or args.key_upload):
+        die(2, "--key-generate replaces --key-file/--key-upload")
     api, _, _ = authed_api(args)
     payload = api.call("POST", "/api/upstreams", {
         "name": args.name, "address": args.addr, "port": args.port,
         "protocol": args.proto, "group": args.group, "path": args.path,
         "uuid": args.uuid, "username": args.username, "password": args.password,
         "key_file": args.key_file, "key_content": _key_upload_content(args),
+        "key_generate": bool(getattr(args, "key_generate", False)),
         "tls": args.tls, "method": args.method,
         "note": args.note})
     emit(args, payload,
@@ -574,6 +926,10 @@ def cmd_upstreams_edit(args):
     content = _key_upload_content(args)
     if content is not None:
         body["key_content"] = content
+    if getattr(args, "key_generate", False):
+        if content is not None or body.get("key_file"):
+            die(2, "--key-generate replaces --key-upload/--key-file")
+        body["key_generate"] = True
     if not body:
         die(2, "nothing to change: pass at least one --option")
     payload = api.call("POST", f"/api/upstreams/{args.name}/update", body)
@@ -703,6 +1059,8 @@ def main():
 
     p = argparse.ArgumentParser(prog="xmagic", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--version", action="version",
+                   version=f"xmagic {VERSION}")
     p.add_argument("--config", help="config file (default ~/.xmagic/config.json)")
     p.add_argument("--node", help="target node name (overrides config current)")
     p.add_argument("--url", help="target admin console URL (overrides config)")
@@ -760,22 +1118,61 @@ def main():
     a.add_argument("--direct-allow-private", dest="direct_allow_private",
                    action="store_true", default=None,
                    help="allow direct egress to private/LAN addresses")
+    a.add_argument("--interconnect-off-groups",
+                   help="comma-separated user groups whose members may NOT"
+                        " interconnect (on by default); empty string ="
+                        " nobody opted out")
     a.add_argument("--no-direct-allow-private", dest="direct_allow_private",
                    action="store_false",
                    help="disallow direct egress to private/LAN addresses")
     a.set_defaults(fn=cmd_settings_set)
+
+    a = sub.add_parser("update", parents=C,
+                       help="update this CLI to the latest repo version")
+    a.add_argument("--check", action="store_true",
+                   help="only report whether an update is available")
+    a.add_argument("--force", action="store_true",
+                   help="install even if the remote version is not newer")
+    a.add_argument("--from", dest="update_url", metavar="URL",
+                   help="download from this URL instead of the repository")
+    a.set_defaults(fn=cmd_update)
+
+    k = sub.add_parser("keys", parents=C,
+                       help="ssh keys available in this environment")
+    ksub = k.add_subparsers(dest="keys_cmd", required=True)
+    ksub.add_parser("list", parents=C).set_defaults(fn=cmd_keys_list)
+    a = ksub.add_parser("generate", parents=C)
+    a.add_argument("name", nargs="?", default="xmagic",
+                   help="key name under ~/.xmagic/keys (default: xmagic)")
+    a.set_defaults(fn=cmd_keys_generate)
+    a = ksub.add_parser("show", parents=C); a.add_argument("selector")
+    a.set_defaults(fn=cmd_keys_show)
 
     u = sub.add_parser("users", parents=C, help="gateway users")
     usub = u.add_subparsers(dest="users_cmd", required=True)
     usub.add_parser("list", parents=C).set_defaults(fn=cmd_users_list)
     a = usub.add_parser("add", parents=C); a.add_argument("user")
     a.add_argument("--group"); a.add_argument("--ssh-key-file"); a.add_argument("--ssh-pubkey")
+    a.add_argument("--ssh-key", metavar="SELECTOR",
+                   help="public key from this environment: a name or"
+                        " fingerprint from `xmagic keys list`, or a .pub path")
+    a.add_argument("--ssh-key-generate", nargs="?", const="", metavar="NAME",
+                   help="generate a fresh ed25519 keypair under"
+                        " ~/.xmagic/keys (default name: the username) and"
+                        " register its public key")
     a.add_argument("--note"); a.set_defaults(fn=cmd_users_add)
     for action in ("passwd", "enable", "disable", "remove", "rotate-uuid"):
         a = usub.add_parser(action, parents=C); a.add_argument("user")
         a.set_defaults(fn=cmd_users_action, action=action)
     a = usub.add_parser("setkey", parents=C); a.add_argument("user")
     a.add_argument("--ssh-key-file"); a.add_argument("--ssh-pubkey")
+    a.add_argument("--ssh-key", metavar="SELECTOR",
+                   help="public key from this environment: a name or"
+                        " fingerprint from `xmagic keys list`, or a .pub path")
+    a.add_argument("--ssh-key-generate", nargs="?", const="", metavar="NAME",
+                   help="generate a fresh ed25519 keypair under"
+                        " ~/.xmagic/keys (default name: the username) and"
+                        " register its public key")
     a.set_defaults(fn=cmd_users_action, action="setkey")
     a = usub.add_parser("setgroup", parents=C); a.add_argument("user"); a.add_argument("group")
     a.set_defaults(fn=cmd_users_action, action="setgroup")
@@ -796,6 +1193,9 @@ def main():
     a.add_argument("--username"); a.add_argument("--password"); a.add_argument("--key-file")
     a.add_argument("--key-upload", help="ssh upstream: upload this local private key"
                                         " file; the node stores it")
+    a.add_argument("--key-generate", action="store_true",
+                   help="ssh upstream: the node generates a fresh ed25519"
+                        " keypair and stores the private key for this upstream")
     a.add_argument("--tls", action="store_true"); a.add_argument("--method")
     a.add_argument("--note"); a.set_defaults(fn=cmd_upstreams_add)
     for action in ("enable", "disable", "remove"):
@@ -808,6 +1208,9 @@ def main():
     a.add_argument("--username"); a.add_argument("--password"); a.add_argument("--key-file")
     a.add_argument("--key-upload", help="ssh upstream: replace the key with this"
                                         " local file; the node stores it")
+    a.add_argument("--key-generate", action="store_true",
+                   help="ssh upstream: replace the key with a fresh node-"
+                        "generated ed25519 keypair")
     a.add_argument("--tls", action="store_true"); a.add_argument("--no-tls", action="store_true")
     a.add_argument("--method"); a.add_argument("--note")
     a.set_defaults(fn=cmd_upstreams_edit)

@@ -9,6 +9,7 @@ Run: python3 tests/test_cli.py
 """
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -142,8 +143,11 @@ def main():
     rc, out, _ = cli("render", "--out", cfg_path)
     cfg = json.load(open(cfg_path))
     direct = [o for o in cfg["outbounds"] if o.get("tag") == "direct"][0]
-    check("default render has no finalRules (xray blocks private targets)",
-          "settings" not in direct, json.dumps(direct))
+    rules0 = direct.get("settings", {}).get("finalRules", [])
+    check("default render: only the interconnect loopback finalRule, "
+          "private targets stay blocked",
+          len(rules0) == 1 and rules0[0]["ip"] == ["127.0.0.0/8"],
+          json.dumps(direct))
     rc, out, _ = cli("settings", "--direct-allow-private", "on")
     check("settings enable direct_allow_private via CLI",
           rc == 0 and "True" in out, out)
@@ -157,6 +161,103 @@ def main():
     rc, out, _ = cli("settings", "--direct-allow-private", "off")
     check("settings disable direct_allow_private via CLI",
           rc == 0 and "False" in out, out)
+
+    # ---- ssh key generation (engine) + upstream --key-generate
+    keys_dir = os.path.join(workdir, "keys")
+    rc, out, err = cli("--json", "keygen", "kg1", "--out-dir", keys_dir)
+    kg = json.loads(out) if rc == 0 else {}
+    priv = os.path.join(keys_dir, "kg1")
+    check("keygen writes a 0600 private key + matching .pub",
+          rc == 0 and os.path.exists(priv)
+          and (os.stat(priv).st_mode & 0o777) == 0o600
+          and open(priv + ".pub").read().strip() == kg.get("public_key"),
+          err + out)
+    if shutil.which("ssh-keygen"):
+        derived = subprocess.run(["ssh-keygen", "-y", "-f", priv],
+                                 capture_output=True, text=True).stdout.split()[:2]
+        check("generated keypair matches ssh-keygen -y",
+              derived == (kg.get("public_key") or "").split()[:2])
+    rc, out, _ = cli("keygen", "kg1", "--out-dir", keys_dir)
+    check("keygen refuses to overwrite an existing key", rc != 0)
+    dave_key = os.path.join(workdir, "kdave.key")
+    rc, out, err = cli("--json", "add", "kdave", "--group", "team",
+                       "--ssh-key-generate", dave_key)
+    dave = json.loads(out) if rc == 0 else {}
+    check("add --ssh-key-generate registers pubkey, private stays local",
+          rc == 0 and dave.get("ssh_key") is True
+          and bool(dave.get("ssh_fingerprint"))
+          and os.path.exists(dave_key), err + out)
+    rc, out, err = cli("--json", "upstream-add", "upssh2", "--proto", "ssh",
+                       "--addr", "10.1.1.1", "--port", "22",
+                       "--username", "tun", "--key-generate")
+    up = json.loads(out) if rc == 0 else {}
+    up_stored = os.path.join(workdir, "data", "ssh_client_keys", "upssh2.key")
+    check("upstream-add --key-generate stores a node-generated key",
+          rc == 0 and up.get("key_file") == "/keys/upssh2.key"
+          and os.path.exists(up_stored)
+          and "BEGIN OPENSSH PRIVATE KEY" in open(up_stored).read(),
+          err + out)
+    rc, _, _ = cli("upstream-remove", "upssh2")
+    check("upstream-remove after --key-generate cleans up",
+          rc == 0 and not os.path.exists(up_stored))
+
+    # ---- same-group interconnect: settings + render assertions
+    rc, out, err = cli("--json", "add", "kerin", "--group", "team",
+                       "--ssh-key-file", os.path.join(keys_dir, "kg1.pub"))
+    check("add kerin (team, with key)", rc == 0, err)
+    rc, out, _ = cli("--json", "settings")
+    info = json.loads(out)
+    everyone = {"alice", "bob", "carol", "kdave", "kerin"}
+    check("interconnect on by default: no opt-outs, every user a member",
+          info.get("interconnect_off_groups") == []
+          and set(info.get("interconnect_slices", {})) == everyone, out)
+    rc, out, _ = cli("render", "--out", cfg_path)
+    cfg = json.load(open(cfg_path))
+    rules = cfg["routing"]["rules"]
+    band = [r for r in rules if r.get("outboundTag") == "direct"
+            and r.get("ip") == ["127.0.0.0/8"]]
+    blocks = [r for r in rules if r.get("outboundTag") == "block"
+              and r.get("ip") == ["127.0.0.0/8"]]
+    direct = [o for o in cfg["outbounds"] if o.get("tag") == "direct"][0]
+    by_port = {r.get("port"): r.get("user") for r in band}
+    check("interconnect render: one slice rule per member, dialers are"
+          " groupmates only, loopback block, loopback-only finalRule",
+          len(band) == 5
+          and by_port.get("20000-20015") == ["alice", "bob", "carol"]
+          and by_port.get("20048-20063") == ["kdave", "kerin"]
+          and by_port.get("20064-20079") == ["kdave", "kerin"]
+          and set(by_port) == {"20000-20015", "20016-20031", "20032-20047",
+                               "20048-20063", "20064-20079"}
+          and len(blocks) == 1
+          and direct.get("settings", {}).get("finalRules", [{}])[0].get("ip")
+          == ["127.0.0.0/8"], json.dumps(rules))
+    keys_out = os.path.join(workdir, "data", "authorized_keys")
+    rc, out, _ = cli("render-keys", "--out", keys_out)
+    ktext = open(keys_out).read()
+    check("interconnect keys: every keyed user carries their own slice only",
+          'permitlisten="127.0.0.1:20048"' in ktext
+          and 'permitlisten="127.0.0.1:20064"' in ktext
+          and ktext.count("permitlisten=") == 32, ktext[:160])
+    if shutil.which("ssh-keygen"):
+        derived = subprocess.run(["ssh-keygen", "-y", "-f", dave_key],
+                                 capture_output=True, text=True).stdout
+        check("kdave's generated pubkey is the one in authorized_keys",
+              derived.split()[1] in ktext)
+    rc, out, _ = cli("settings", "--interconnect-off-groups", "team")
+    check("settings opt team out of interconnect",
+          rc == 0 and "team" in out, out)
+    rc, out, _ = cli("render", "--out", cfg_path)
+    cfg = json.load(open(cfg_path))
+    band = [r for r in cfg["routing"]["rules"]
+            if r.get("outboundTag") == "direct"
+            and r.get("ip") == ["127.0.0.0/8"]]
+    check("opted-out members lose their slice rules (unreachable + cannot dial)",
+          {r.get("port") for r in band}
+          == {"20000-20015", "20016-20031", "20032-20047"}
+          and all(r.get("user") == ["alice", "bob", "carol"] for r in band),
+          json.dumps(band))
+    rc, out, _ = cli("settings", "--interconnect-off-groups", "")
+    check("clearing the opt-out restores the default", rc == 0, out)
 
     # Pidfile restart channel (single-container form): apply restarts
     # only the processes whose rendered inputs changed - it writes a

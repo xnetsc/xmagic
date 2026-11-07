@@ -94,6 +94,7 @@ so keep the file at mode 600 on a root-only path. `add` prints the new
 user's credentials once; store them in your password manager.
 """
 import argparse
+import base64
 import hashlib
 import ipaddress
 import json
@@ -104,6 +105,7 @@ import socket
 import sqlite3
 import signal
 import string
+import struct
 import sys
 import time
 import urllib.parse
@@ -903,9 +905,30 @@ def cmd_init(_):
           f"({cfg['type']}: {mask_target(cfg['type'], cfg['target'])})")
 
 
+def cmd_keygen(args):
+    os.makedirs(args.out_dir, exist_ok=True)
+    priv = os.path.join(args.out_dir, args.name)
+    if os.path.exists(priv) or os.path.exists(priv + ".pub"):
+        sys.exit(f"refusing to overwrite an existing key: {priv}")
+    pub, fp = write_generated_key(priv, args.comment or args.name)
+    with open(priv + ".pub", "w") as f:
+        f.write(pub + "\n")
+    if JSON_OUT:
+        print(json.dumps({"private_key": priv, "public_key_file": priv + ".pub",
+                          "public_key": pub, "fingerprint": fp}, indent=2))
+        return
+    print(f"private key: {priv} (0600 - keep it secret)")
+    print(f"public key:  {priv}.pub")
+    print(f"fingerprint: {fp}")
+    print(pub)
+
+
 def cmd_add(args):
     pubkey = None
-    if args.ssh_key_file:
+    gen_fp = None
+    if getattr(args, "ssh_key_generate", None):
+        pubkey, gen_fp = write_generated_key(args.ssh_key_generate, args.user)
+    elif args.ssh_key_file:
         with open(args.ssh_key_file) as f:
             pubkey = f.read().strip()
     user_uuid = str(uuid.uuid4())
@@ -926,13 +949,19 @@ def cmd_add(args):
         print(json.dumps({"username": args.user, "vless_uuid": user_uuid,
                           "password": trojan_pw, "ss_method": method,
                           "ss_password": ss_pw, "group": args.group,
-                          "ssh_key": bool(pubkey)}, indent=2))
+                          "ssh_key": bool(pubkey),
+                          "ssh_private_key_file": (args.ssh_key_generate
+                                                   if gen_fp else None),
+                          "ssh_fingerprint": gen_fp}, indent=2))
         return
     print(f"user:            {args.user}")
     print(f"vless uuid:      {user_uuid}")
     print(f"password (trojan/http/socks): {trojan_pw}")
     print(f"ss:              {method} / {ss_pw}")
     print(f"ssh key:         {'registered' if pubkey else '(none)'}")
+    if gen_fp:
+        print(f"ssh private key: {args.ssh_key_generate} ({gen_fp})"
+              " - yours to keep; the node stores only the public key")
     print("shown once - store it now, then run: users.py render")
 
 
@@ -952,17 +981,24 @@ def cmd_passwd(args):
 
 
 def cmd_setkey(args):
+    gen_fp = None
     if getattr(args, "clear", False):
         pubkey = None
+    elif getattr(args, "ssh_key_generate", None):
+        pubkey, gen_fp = write_generated_key(args.ssh_key_generate, args.user)
     elif args.ssh_key_file:
         with open(args.ssh_key_file) as f:
             pubkey = f.read().strip()
     else:
-        sys.exit("setkey needs --ssh-key-file FILE or --clear")
+        sys.exit("setkey needs --ssh-key-file FILE, --ssh-key-generate PATH"
+                 " or --clear")
     with db() as conn:
         get_user(conn, args.user)
         conn.execute("UPDATE users SET ssh_pubkey = ? WHERE username = ?", (pubkey, args.user))
     print(f"ssh key {'cleared for' if pubkey is None else 'updated for'} {args.user}")
+    if gen_fp:
+        print(f"ssh private key: {args.ssh_key_generate} ({gen_fp})"
+              " - yours to keep; the node stores only the public key")
 
 
 def cmd_rotate_uuid(args):
@@ -1120,6 +1156,11 @@ def _read_key_content_arg(args):
 
 def cmd_upstream_add(args):
     key_content = _read_key_content_arg(args)
+    if getattr(args, "key_generate", False):
+        if key_content is not None or args.key_file:
+            sys.exit("--key-generate replaces --key-file/--key-content-file")
+        key_content = generate_ed25519_keypair(
+            f"xmagic upstream {args.name}")[0]
     if args.proto in ("vless-ws", "vless") and not args.uuid:
         sys.exit(f"{args.proto} upstream needs --uuid (the uuid the upstream operator issued you)")
     if args.proto in ("trojan-ws", "ss") and not args.password:
@@ -1260,6 +1301,124 @@ def cmd_upstream_edit(args):
         print(json.dumps({k: row[k] for k in row.keys()}, indent=2, default=str))
         return
     print(f"upstream {args.name} updated; run: users.py render")
+
+
+# ------------------------------------------------------- ssh key generation
+# Pure-stdlib ed25519 keypair generation in OpenSSH formats, so every
+# management surface can mint keys in place: no ssh-keygen dependency
+# and no external tool for operators. Generation only - the private
+# half is handed to the caller and never kept by this module (upstream
+# keys are the exception: they live on the node by design, stored via
+# write_upstream_key).
+
+_ED_Q = 2 ** 255 - 19
+_ED_D = (-121665 * pow(121666, _ED_Q - 2, _ED_Q)) % _ED_Q
+_ED_I = pow(2, (_ED_Q - 1) // 4, _ED_Q)
+
+
+def _ed_xrecover(y):
+    xx = (y * y - 1) * pow(_ED_D * y * y + 1, _ED_Q - 2, _ED_Q) % _ED_Q
+    x = pow(xx, (_ED_Q + 3) // 8, _ED_Q)
+    if (x * x - xx) % _ED_Q != 0:
+        x = (x * _ED_I) % _ED_Q
+    if x % 2 != 0:
+        x = _ED_Q - x
+    return x
+
+
+_ED_BY = (4 * pow(5, _ED_Q - 2, _ED_Q)) % _ED_Q
+_ED_BX = _ed_xrecover(_ED_BY)
+_ED_B = (_ED_BX, _ED_BY, 1, (_ED_BX * _ED_BY) % _ED_Q)
+_ED_IDENTITY = (0, 1, 1, 0)
+
+
+def _ed_add(P, Q):
+    A = (P[1] - P[0]) * (Q[1] - Q[0]) % _ED_Q
+    B = (P[1] + P[0]) * (Q[1] + Q[0]) % _ED_Q
+    C = 2 * _ED_D * P[3] * Q[3] % _ED_Q
+    D = 2 * P[2] * Q[2] % _ED_Q
+    E, F, G, H = B - A, D - C, D + C, B + A
+    return (E * F % _ED_Q, G * H % _ED_Q, F * G % _ED_Q, E * H % _ED_Q)
+
+
+def _ed_double(P):
+    A = P[0] * P[0] % _ED_Q
+    B = P[1] * P[1] % _ED_Q
+    C = 2 * P[2] * P[2] % _ED_Q
+    D = (-A) % _ED_Q
+    E = ((P[0] + P[1]) * (P[0] + P[1]) - A - B) % _ED_Q
+    G, F, H = D + B, (D + B) - C, D - B
+    return (E * F % _ED_Q, G * H % _ED_Q, F * G % _ED_Q, E * H % _ED_Q)
+
+
+def _ed_scalarmult(P, e):
+    R = _ED_IDENTITY
+    while e > 0:
+        if e & 1:
+            R = _ed_add(R, P)
+        P = _ed_double(P)
+        e >>= 1
+    return R
+
+
+def _ssh_str(b):
+    return struct.pack(">I", len(b)) + b
+
+
+def generate_ed25519_keypair(comment=""):
+    """-> (private_pem, public_line, fingerprint). Pure stdlib."""
+    seed = os.urandom(32)
+    h = bytearray(hashlib.sha512(seed).digest()[:32])
+    h[0] &= 248
+    h[31] &= 63
+    h[31] |= 64
+    a = int.from_bytes(h, "little")
+    P = _ed_scalarmult(_ED_B, a)
+    zi = pow(P[2], _ED_Q - 2, _ED_Q)
+    x, y = P[0] * zi % _ED_Q, P[1] * zi % _ED_Q
+    pub = (y | ((x & 1) << 255)).to_bytes(32, "little")
+    blob = _ssh_str(b"ssh-ed25519") + _ssh_str(pub)
+    check = struct.unpack(">I", os.urandom(4))[0]
+    section = struct.pack(">II", check, check)
+    section += _ssh_str(b"ssh-ed25519") + _ssh_str(pub)
+    section += _ssh_str(seed + pub) + _ssh_str(comment.encode())
+    pad = 8 - (len(section) % 8) or 8
+    section += bytes(range(1, pad + 1))
+    raw = b"openssh-key-v1\x00"
+    raw += _ssh_str(b"none") + _ssh_str(b"none") + _ssh_str(b"")
+    raw += struct.pack(">I", 1) + _ssh_str(blob) + _ssh_str(section)
+    b64 = base64.b64encode(raw).decode()
+    pem = ("-----BEGIN OPENSSH PRIVATE KEY-----\n"
+           + "\n".join(b64[i:i + 70] for i in range(0, len(b64), 70))
+           + "\n-----END OPENSSH PRIVATE KEY-----\n")
+    pub_line = "ssh-ed25519 " + base64.b64encode(blob).decode()
+    if comment:
+        pub_line += " " + comment
+    return pem, pub_line, pubkey_fingerprint(pub_line)
+
+
+def pubkey_fingerprint(line):
+    """SHA256: fingerprint of an authorized_keys-style public key line,
+    or None when the line does not parse."""
+    parts = (line or "").strip().split()
+    if len(parts) < 2:
+        return None
+    try:
+        blob = base64.b64decode(parts[1])
+    except Exception:
+        return None
+    return "SHA256:" + base64.b64encode(
+        hashlib.sha256(blob).digest()).decode().rstrip("=")
+
+
+def write_generated_key(priv_path, comment):
+    """Generate a keypair and write the private half to priv_path
+    (exclusive create, 0600). -> (public_line, fingerprint)."""
+    pem, pub, fp = generate_ed25519_keypair(comment)
+    fd = os.open(priv_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(pem)
+    return pub, fp
 
 
 # ---------------------------------------------------------------- routes
@@ -1505,6 +1664,8 @@ def build_egress(conn, users):
     ups = conn.execute("SELECT * FROM upstreams WHERE enabled = 1 ORDER BY grp, name").fetchall()
     groups = sorted({u["grp"] for u in ups})
     route_rules, need_block = target_route_rules(conn, set(groups))
+    icon = interconnect_groups_members(conn)
+    allow_priv = allow_private_direct(conn)
     vpaths, tpaths = vless_paths(conn), trojan_paths(conn)
     outbounds = []
     ssh_idx = 0
@@ -1515,19 +1676,39 @@ def build_egress(conn, users):
         else:
             outbounds.append(upstream_outbound(u, None, vpaths, tpaths))
     direct = {"tag": "direct", "protocol": "freedom"}
-    if allow_private_direct(conn):
+    if allow_priv:
         # operator opt-in: an allow finalRule ahead of Xray's default
         # block-private rule, for nodes that must reach their own LAN
         direct["settings"] = {"finalRules": [
             {"action": "allow", "ip": list(PRIVATE_CIDRS)}]}
+    elif icon:
+        # interconnect needs only the loopback through freedom; the
+        # band rule below is its only sender
+        direct["settings"] = {"finalRules": [
+            {"action": "allow", "ip": ["127.0.0.0/8"]}]}
     outbounds.append(direct)
-    if need_block:
+    if need_block or (icon and not allow_priv):
         outbounds.append({"tag": "block", "protocol": "blackhole"})
-    if not ups and not route_rules:
+    if not ups and not route_rules and not icon:
         return outbounds, None, 0
     balancers = [{"tag": f"pool-{g}", "selector": [f"up-{g}-"],
                   "strategy": {"type": upstream_strategy(conn)}} for g in groups]
-    rules = list(route_rules)
+    rules = []
+    if icon:
+        # per group, one rule per member scoped to that member's own
+        # slice: dialers are the slice owner's groupmates only, and a
+        # group that opts out loses its rules entirely
+        for gname in sorted(icon):
+            members = sorted(icon[gname])
+            for name in members:
+                lo, hi = icon[gname][name]
+                rules.append({"type": "field", "user": members,
+                              "ip": ["127.0.0.0/8"], "port": f"{lo}-{hi}",
+                              "outboundTag": "direct"})
+        if not allow_priv:
+            rules.append({"type": "field", "ip": ["127.0.0.0/8"],
+                          "outboundTag": "block"})
+    rules += route_rules
     for g in groups:
         if g == "default":
             continue
@@ -1680,6 +1861,8 @@ def cmd_render_keys(args):
         rows = conn.execute(
             "SELECT username, ssh_pubkey FROM users WHERE enabled = 1 AND ssh_pubkey IS NOT NULL"
             " ORDER BY username").fetchall()
+        slices = (interconnect_slices(conn)
+                  if interconnect_members(conn) else {})
     out = args.out or "./data/authorized_keys"
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     tmp = out + ".tmp"
@@ -1688,6 +1871,13 @@ def cmd_render_keys(args):
             key = r["ssh_pubkey"].strip()
             if not key.endswith(r["username"]):
                 key = f"{key} {r['username']}"
+            if r["username"] in slices:
+                lo, hi = slices[r["username"]]
+                # permitlisten takes one port per option (no ranges),
+                # so the slice is spelled out option by option
+                opts = ",".join(f'permitlisten="127.0.0.1:{p}"'
+                                for p in range(lo, hi + 1))
+                key = opts + " " + key
             f.write(key + "\n")
     os.replace(tmp, out)
     os.chmod(out, 0o600)
@@ -1766,6 +1956,82 @@ PRIVATE_CIDRS = ("127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12",
 DIRECT_ALLOW_PRIVATE = os.environ.get("DIRECT_ALLOW_PRIVATE", "")
 
 
+# ------------------------------------------------------------ interconnect
+# Same-group interconnect (on by default; groups can opt out). A user
+# exposes a local service by holding a reverse forward to the gateway
+# loopback (ssh -R); each member owns a 16-port slice of 20000-21599,
+# enforced per key by an authorized_keys permitlisten option. Members
+# dial the band through the proxy like any destination; the routing
+# rules below send the band to direct for members only and (unless
+# direct_allow_private is on) block every other loopback destination,
+# so the gateway's own loopback services stay unreachable.
+
+INTERCONNECT_PORT_BASE = 20000
+INTERCONNECT_PORTS_PER_USER = 16
+INTERCONNECT_MAX_USERS = 100
+
+
+def normalize_group_list(raw):
+    """Comma-separated group names -> canonical stored form."""
+    names = []
+    for part in str(raw or "").split(","):
+        name = part.strip()
+        if name and name not in names:
+            names.append(name)
+    if len(names) > 32 or any(len(n) > 64 for n in names):
+        raise ValueError("interconnect groups: at most 32 names,"
+                         " each at most 64 characters")
+    return ",".join(names)
+
+
+def interconnect_off_groups(conn):
+    """Groups whose members may NOT interconnect. Interconnect is on
+    by default for every group; this list is the opt-out."""
+    raw = get_setting(conn, "interconnect_off_groups") or ""
+    return {g.strip() for g in raw.split(",") if g.strip()}
+
+
+def interconnect_slices(conn):
+    """{username: (first_port, last_port)} for every enabled user, in
+    creation order - stable across renders and group toggles."""
+    rows = conn.execute(
+        "SELECT username FROM users WHERE enabled = 1"
+        " ORDER BY created_at, username").fetchall()
+    out = {}
+    for i, r in enumerate(rows):
+        if i >= INTERCONNECT_MAX_USERS:
+            break
+        start = INTERCONNECT_PORT_BASE + i * INTERCONNECT_PORTS_PER_USER
+        out[r["username"]] = (start, start + INTERCONNECT_PORTS_PER_USER - 1)
+    return out
+
+
+def interconnect_groups_members(conn):
+    """{group: {username: (first_port, last_port)}} - interconnect is
+    same-group only: a group's members may dial each other's slices,
+    never another group's."""
+    off = interconnect_off_groups(conn)
+    slices = interconnect_slices(conn)
+    rows = conn.execute(
+        "SELECT username, upstream_group FROM users WHERE enabled = 1"
+    ).fetchall()
+    groups = {}
+    for r in rows:
+        if r["upstream_group"] not in off and r["username"] in slices:
+            groups.setdefault(r["upstream_group"], {})[r["username"]] = \
+                slices[r["username"]]
+    return groups
+
+
+def interconnect_members(conn):
+    """Flat {username: (first_port, last_port)} across all groups -
+    who holds a slice at all (console display, key rendering)."""
+    out = {}
+    for members in interconnect_groups_members(conn).values():
+        out.update(members)
+    return out
+
+
 def allow_private_direct(conn=None):
     """Whether direct egress may reach private / LAN addresses.
 
@@ -1795,6 +2061,12 @@ def settings_info(conn):
         "direct_allow_private": allow_private_direct(conn),
         "direct_allow_private_from_db":
             get_setting(conn, "direct_allow_private") is not None,
+        "interconnect_off_groups": sorted(interconnect_off_groups(conn)),
+        "interconnect_off_groups_from_db":
+            get_setting(conn, "interconnect_off_groups") is not None,
+        "interconnect_slices": {
+            name: list(span) for name, span
+            in interconnect_members(conn).items()},
     }
 
 
@@ -1831,6 +2103,16 @@ def cmd_settings(args):
             if key.endswith("_paths"):
                 value = ",".join(_parse_paths(value, "/unused"))
             set_setting(conn, key, value)
+        if getattr(args, "interconnect_off_groups", None) is not None:
+            if args.interconnect_off_groups == "":
+                delete_setting(conn, "interconnect_off_groups")
+            else:
+                try:
+                    set_setting(conn, "interconnect_off_groups",
+                                normalize_group_list(
+                                    args.interconnect_off_groups))
+                except ValueError as exc:
+                    sys.exit(str(exc))
         if args.direct_allow_private is not None:
             if args.direct_allow_private == "":
                 delete_setting(conn, "direct_allow_private")
@@ -1855,6 +2137,9 @@ def cmd_settings(args):
           f"({src[info['ss_method_from_db']]})")
     print(f"direct_allow_private: {info['direct_allow_private']} "
           f"({src[info['direct_allow_private_from_db']]})")
+    print(f"interconnect_off_groups: "
+          f"{','.join(info['interconnect_off_groups']) or '(none)'} "
+          f"({src[info['interconnect_off_groups_from_db']]})")
 
 
 def render_all(out_dir):
@@ -1886,6 +2171,11 @@ def render_all(out_dir):
         rows = conn.execute(
             "SELECT username, ssh_pubkey FROM users WHERE enabled = 1"
             " AND ssh_pubkey IS NOT NULL ORDER BY username").fetchall()
+        # when interconnect is armed, EVERY user gets a permitlisten
+        # for their own slice: a non-member must not be able to squat
+        # on a member's ports and intercept the group's traffic
+        slices = (interconnect_slices(conn)
+                  if interconnect_members(conn) else {})
     keys_path = os.path.join(out_dir, "authorized_keys")
     tmp = keys_path + ".tmp"
     with open(tmp, "w") as f:
@@ -1893,6 +2183,13 @@ def render_all(out_dir):
             key = r["ssh_pubkey"].strip()
             if not key.endswith(r["username"]):
                 key = f"{key} {r['username']}"
+            if r["username"] in slices:
+                lo, hi = slices[r["username"]]
+                # permitlisten takes one port per option (no ranges),
+                # so the slice is spelled out option by option
+                opts = ",".join(f'permitlisten="127.0.0.1:{p}"'
+                                for p in range(lo, hi + 1))
+                key = opts + " " + key
             f.write(key + "\n")
     os.replace(tmp, keys_path)
     # 0644, not 0600: sshd opens authorized_keys as the login user
@@ -2355,6 +2652,10 @@ def main():
     a.add_argument("--trojan-ws-paths", help="comma-separated; empty string = back to env")
     a.add_argument("--upstream-strategy")
     a.add_argument("--ss-method", help="default method for new users")
+    a.add_argument("--interconnect-off-groups",
+                   help="comma-separated user groups whose members may NOT"
+                        " interconnect (interconnect is on by default);"
+                        " empty string = nobody opted out")
     a.add_argument("--direct-allow-private", choices=("on", "off", ""),
                    help="allow direct egress to private/LAN addresses;"
                         " empty string = back to env")
@@ -2364,13 +2665,26 @@ def main():
     a.set_defaults(fn=cmd_sessions_revoke)
     sub.add_parser("sessions-revoke-all").set_defaults(fn=cmd_sessions_revoke_all)
     sub.add_parser("admin-reset").set_defaults(fn=cmd_admin_reset)
+    a = sub.add_parser("keygen"); a.add_argument("name")
+    a.add_argument("--out-dir", default=".",
+                   help="directory for NAME and NAME.pub (default: .)")
+    a.add_argument("--comment", help="key comment (default: the name)")
+    a.set_defaults(fn=cmd_keygen)
     a = sub.add_parser("add"); a.add_argument("user")
-    a.add_argument("--ssh-key-file"); a.add_argument("--note")
+    a.add_argument("--ssh-key-file")
+    a.add_argument("--ssh-key-generate", metavar="PATH",
+                   help="generate a fresh ed25519 keypair: the public key is"
+                        " registered, the private key written to PATH (0600)")
+    a.add_argument("--note")
     a.add_argument("--group", default="default", help="upstream group for this user")
     a.set_defaults(fn=cmd_add)
     a = sub.add_parser("passwd"); a.add_argument("user"); a.set_defaults(fn=cmd_passwd)
     a = sub.add_parser("setkey"); a.add_argument("user")
-    a.add_argument("--ssh-key-file"); a.add_argument("--clear", action="store_true",
+    a.add_argument("--ssh-key-file")
+    a.add_argument("--ssh-key-generate", metavar="PATH",
+                   help="generate a fresh ed25519 keypair: the public key is"
+                        " registered, the private key written to PATH (0600)")
+    a.add_argument("--clear", action="store_true",
                    help="remove the user's ssh key instead of setting one")
     a.set_defaults(fn=cmd_setkey)
     a = sub.add_parser("rotate-uuid"); a.add_argument("user")
@@ -2402,6 +2716,10 @@ def main():
     a.add_argument("--tls", action="store_true",
                    help="vless-ws/vless/trojan-ws upstream: dial with TLS (SNI = address);"
                         " required by Xray for plaintext protocols to public IPs")
+    a.add_argument("--key-generate", action="store_true",
+                   help="ssh upstream: generate a fresh ed25519 keypair on"
+                        " the node and store the private key as this"
+                        " upstream's managed key")
     a.add_argument("--method", default="aes-256-gcm"); a.add_argument("--note")
     a.set_defaults(fn=cmd_upstream_add)
     a = sub.add_parser("upstream-edit"); a.add_argument("name")

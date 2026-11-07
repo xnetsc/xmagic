@@ -186,6 +186,10 @@ def main():
         status, _ = client.call("POST", "/api/users", {"username": "mallory"})
         check("API rejects anonymous writes", status == 401, f"got {status}")
 
+        status, _ = client.call("POST", "/api/keys/generate", {})
+        check("keys/generate rejects anonymous calls", status == 401,
+              f"got {status}")
+
         auth = Authenticator()
         status, opts = client.call("POST", "/api/register/options", {})
         check("register options issued", status == 200 and "challenge" in opts)
@@ -286,6 +290,63 @@ def main():
         status, body = client.call("POST", "/api/upstreams/up-ssh/remove", {})
         check("removing the upstream deletes the stored key",
               status == 200 and not os.path.exists(stored), f"{status} {body}")
+
+        # ---- keypair generation endpoint + upstream key_generate
+        status, gen1 = client.call("POST", "/api/keys/generate",
+                                   {"comment": "t"})
+        status2, gen2 = client.call("POST", "/api/keys/generate",
+                                    {"comment": "t"})
+        check("keys/generate mints a fresh ed25519 pair per call",
+              status == 200 and status2 == 200
+              and "BEGIN OPENSSH PRIVATE KEY" in gen1["private_key"]
+              and gen1["public_key"].startswith("ssh-ed25519 ")
+              and gen1["fingerprint"].startswith("SHA256:")
+              and gen1["private_key"] != gen2["private_key"], f"{status}")
+        gen_stored = os.path.join(workdir, "data", "ssh_client_keys",
+                                  "up-gen.key")
+        status, body = client.call("POST", "/api/upstreams",
+                                   {"name": "up-gen", "protocol": "ssh",
+                                    "address": "10.4.4.6", "port": 22,
+                                    "username": "tunnel", "key_generate": True})
+        check("ssh upstream with key_generate stores a node-generated key",
+              status == 201
+              and body["upstream"]["key_file"] == "/keys/up-gen.key"
+              and os.path.exists(gen_stored)
+              and "BEGIN OPENSSH PRIVATE KEY" in open(gen_stored).read(),
+              f"{status} {body}")
+        status, body = client.call("POST", "/api/upstreams/up-gen/remove", {})
+        check("generated upstream key removed with the upstream",
+              status == 200 and not os.path.exists(gen_stored),
+              f"{status} {body}")
+
+        # ---- interconnect via settings + user rows
+        status, body = client.call("POST", "/api/users",
+                                   {"username": "gina", "group": "team"})
+        check("console adds a team user", status == 201, f"{status} {body}")
+        status, body = client.call("GET", "/api/users")
+        gina = [u for u in body["users"] if u["username"] == "gina"][0]
+        check("interconnect on by default: member row carries a slice",
+              isinstance(gina.get("interconnect"), list)
+              and gina["interconnect"][1] - gina["interconnect"][0] == 15,
+              f"{gina}")
+        status, body = client.call("POST", "/api/settings",
+                                   {"interconnect_off_groups": "team"})
+        check("settings: interconnect opt-out stored",
+              status == 200 and body["interconnect_off_groups"] == ["team"]
+              and body["db_values"]["interconnect_off_groups"] == "team",
+              f"{status} {body}")
+        status, body = client.call("GET", "/api/users")
+        gina = [u for u in body["users"] if u["username"] == "gina"][0]
+        check("opted-out member's row loses the slice",
+              "interconnect" not in gina, f"{gina}")
+        status, body = client.call("POST", "/api/settings",
+                                   {"interconnect_off_groups": ""})
+        check("settings: opt-out cleared, default-on restored",
+              status == 200 and body["interconnect_off_groups"] == [],
+              f"{status} {body}")
+        status, body = client.call("POST", "/api/users/gina/remove", {})
+        check("interconnect test user removed again", status == 200,
+              f"{status} {body}")
         status, body = client.call("POST", "/api/routes/1/update",
                                    {"to": "direct"})
         check("route edit applies",
@@ -520,6 +581,14 @@ def main():
               and 'id="cli-install"' in page
               and 'id="btn-copy-install"' in page
               and 'id="cli-onboard"' in page, f"status {resp.status}")
+
+        check("console page carries the keypair-generate buttons and the "
+              "interconnect setting",
+              'id="btn-gen-userkey"' in page
+              and 'id="btn-gen-upkey"' in page
+              and 'name="interconnect_off_groups"' in page
+              and "组内互访端口" in page,
+              f"status {resp.status}")
 
         # --- CLI-issued passkey replacement (ticket flow): the ticket
         # is issued by one session, the ceremony runs in a browser, and

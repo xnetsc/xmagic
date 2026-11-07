@@ -603,7 +603,14 @@ def _user_dict(r, with_secrets=False):
 def api_list_users():
     with users_mod.db() as conn:
         rows = conn.execute("SELECT * FROM users ORDER BY username").fetchall()
-    return {"users": [_user_dict(r, with_secrets=True) for r in rows]}
+        members = users_mod.interconnect_members(conn)
+    users = []
+    for r in rows:
+        d = _user_dict(r, with_secrets=True)
+        if r["username"] in members:
+            d["interconnect"] = list(members[r["username"]])
+        users.append(d)
+    return {"users": users}
 
 
 def api_add_user(body):
@@ -682,6 +689,16 @@ def api_list_upstreams():
     return {"upstreams": [_upstream_dict(r) for r in rows]}
 
 
+def api_generate_keypair(body):
+    """Mint a fresh ed25519 keypair. The private half is returned ONCE
+    in this response and never stored on the node - a user's private
+    key belongs on the user's machine. (Upstream keys are the designed
+    exception: they live on the node via key_content/key_generate.)"""
+    comment = str((body or {}).get("comment") or "xmagic")[:64]
+    pem, pub, fp = users_mod.generate_ed25519_keypair(comment)
+    return {"private_key": pem, "public_key": pub, "fingerprint": fp}
+
+
 def api_add_upstream(body):
     proto = body.get("protocol")
     if proto in ("vless-ws", "vless") and not body.get("uuid"):
@@ -691,6 +708,9 @@ def api_add_upstream(body):
     if proto in ("http", "socks") and body.get("username") and not body.get("password"):
         raise ApiError(400, f"{proto} upstream with a username also needs a password")
     key_content = body.get("key_content")
+    if body.get("key_generate") and not key_content:
+        key_content = users_mod.generate_ed25519_keypair(
+            f"xmagic upstream {body.get('name') or 'upstream'}")[0]
     if proto == "ssh" and not (body.get("username")
                                and (body.get("key_file") or key_content)):
         raise ApiError(400, "ssh upstream needs a username and a key"
@@ -744,6 +764,9 @@ def api_update_upstream(name, body):
     changes = {k: body.get(k) for k in
                ("grp", "address", "port", "protocol", "path", "uuid", "username",
                 "password", "key_file", "key_content", "tls", "method", "note")}
+    if body.get("key_generate"):
+        changes["key_content"] = users_mod.generate_ed25519_keypair(
+            f"xmagic upstream {name}")[0]
     if "group" in body:  # friendlier alias for grp
         changes["grp"] = body["group"]
     with users_mod.db() as conn:
@@ -820,7 +843,8 @@ def api_get_settings():
         info = users_mod.settings_info(conn)
         info["db_values"] = {
             k: users_mod.get_setting(conn, k) for k in
-            ("vless_ws_paths", "trojan_ws_paths", "upstream_strategy", "ss_method")}
+            ("vless_ws_paths", "trojan_ws_paths", "upstream_strategy", "ss_method",
+             "interconnect_off_groups")}
     info.update({
         "session_ttl_default": users_mod.SESSION_TTL_HOURS_DEFAULT,
         "session_ttl_min": users_mod.SESSION_TTL_HOURS_MIN,
@@ -875,6 +899,20 @@ def api_set_settings(body):
                                       "1" if value else "0")
             else:
                 raise ApiError(400, "direct_allow_private must be a boolean")
+        if "interconnect_off_groups" in body:
+            render_relevant = True
+            value = body["interconnect_off_groups"]
+            if value is None or value == "" or value == []:
+                users_mod.delete_setting(conn, "interconnect_off_groups")
+            else:
+                if isinstance(value, list):
+                    value = ",".join(str(v) for v in value)
+                try:
+                    users_mod.set_setting(
+                        conn, "interconnect_off_groups",
+                        users_mod.normalize_group_list(value))
+                except ValueError as exc:
+                    raise ApiError(400, str(exc))
     result = api_get_settings()
     if render_relevant:
         result["applied"] = apply_changes()
@@ -1098,6 +1136,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send_json(200, cli_exchange(body))
             return
         self._require_auth()
+        if path == "/api/keys/generate":
+            self._send_json(200, api_generate_keypair(body))
+            return
         if path == "/api/cli-token":
             self._send_json(200, cli_token_request(body))
             return
@@ -1366,6 +1407,7 @@ td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
               <div class="wide"><label>SSH 公钥（可选，可粘贴或选文件）</label>
                 <div class="keyrow"><input name="ssh_pubkey" placeholder="ssh-ed25519 AAAA…">
                 <button type="button" class="btn ghost sm" id="btn-pick-pubkey">选文件</button>
+                <button type="button" class="btn ghost sm" id="btn-gen-userkey">生成密钥对</button>
                 <input type="file" id="pick-pubkey" class="hidden"></div></div>
             </div>
             <div class="form-actions"><button class="primary">添加用户</button></div>
@@ -1395,6 +1437,7 @@ td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
               <div class="wide"><label>SSH 私钥（粘贴内容或选文件上传，存于节点、不回显）</label>
                 <div class="keyrow"><textarea name="key_content" rows="3" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea>
                 <button type="button" class="btn ghost sm" id="btn-pick-privkey">选文件</button>
+                <button type="button" class="btn ghost sm" id="btn-gen-upkey">生成密钥对</button>
                 <input type="file" id="pick-privkey" class="hidden"></div></div>
               <div><label>或：节点上的密钥路径</label><input name="key_file" placeholder="/keys/id_ed25519"></div>
               <div><label>SS 方法</label><input name="method" placeholder="SS method"></div>
@@ -1444,6 +1487,7 @@ td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
               <div><label>新用户默认 SS 方法</label><select name="ss_method"></select></div>
               <div class="wide"><label>VLESS WS 路径（逗号分隔）</label><input name="vless_ws_paths"></div>
               <div class="wide"><label>Trojan WS 路径（逗号分隔）</label><input name="trojan_ws_paths"></div>
+              <div class="wide"><label>关闭组内互访的分组（逗号分隔，空 = 全部组互访）</label><input name="interconnect_off_groups" placeholder="例如 team"></div>
             </div>
             <div class="form-actions">
               <span class="check"><input type="checkbox" name="direct_allow_private" id="set-dap"><label for="set-dap">允许直连内网地址</label></span>
@@ -1453,7 +1497,10 @@ td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
           <p class="hint">会话有效期默认 168 小时（1 周），范围 1–2160，只影响新签发会话。
           WS 路径 / 策略 / 默认方法：留空保存 = 回退到部署时 .env 的值；输入框灰字是当前生效值。
           直连内网地址默认关闭：经 VLESS / Trojan / Shadowsocks 进来的流量直连时不能访问本机与内网地址
-          （Xray 的防 SSRF 默认规则）；节点需要访问自家局域网服务时再打开。</p>
+          （Xray 的防 SSRF 默认规则）；节点需要访问自家局域网服务时再打开。<br>
+          组内互访默认开启：同一分组的成员可用 <code>ssh -R</code> 把自己机器上的服务暴露到网关回环的
+          专属端口段（每人 16 个端口，见用户列表），同组成员经代理拨 <code>127.0.0.1:端口</code> 即可
+          互访，如同在同一局域网；不想互访的分组填到上面即关闭该组互访。非同组成员拨回环一律拦截。</p>
           <div class="divider">
             <p class="small" style="margin:0 0 .5rem"><span id="admin-line"></span></p>
             <button type="button" id="btn-replace">更换管理员 Passkey</button>
@@ -1561,7 +1608,7 @@ async function refresh() {
     users.map(u => `<tr><td><strong>${u.username}</strong>${u.note ? `<br><span class="small">${u.note}</span>` : ""}</td><td>${u.group}</td>
       <td><span class="badge ${u.enabled ? "on" : "off"}">${u.enabled ? "启用" : "停用"}</span></td>
       <td><code>uuid ${u.vless_uuid}<br>密码 ${u.password}<br>ss ${u.ss_method} / ${u.ss_password}` +
-      `${u.ssh_key ? "<br>SSH 公钥已登记" : ""}</code></td>
+      `${u.ssh_key ? "<br>SSH 公钥已登记<br>ssh -D 1080 -N -p " + s.public_port + " " + u.username + "@" + location.hostname : ""}${u.interconnect ? "<br>组内互访端口 " + u.interconnect[0] + "-" + u.interconnect[1] : ""}</code></td>
       <td><div class="row-actions"><button class="sm" data-act="passwd" data-u="${u.username}">换密码</button>
       <button class="sm" data-act="rotate-uuid" data-u="${u.username}">换UUID</button>
       <button class="sm" data-act="setkey" data-u="${u.username}">公钥</button>
@@ -1594,6 +1641,8 @@ async function refresh() {
     `<option ${x === settings.ss_method ? "selected" : ""}>${x}</option>`).join("");
   sf.querySelector("[name=direct_allow_private]").checked =
     !!settings.direct_allow_private;
+  sf.querySelector("[name=interconnect_off_groups]").value =
+    settings.db_values.interconnect_off_groups || "";
   $("admin-line").textContent = s.admin_registered
     ? `管理员 Passkey：${s.admin_label || "(无标签)"}，注册于 ${s.admin_created_at || "?"}，累计验签 ${s.admin_sign_count} 次。` : "";
   const sessions = (await api("/api/sessions")).sessions;
@@ -1680,6 +1729,32 @@ function wireKeyPicker(btnId, pickId, target) {
 }
 wireKeyPicker("btn-pick-pubkey", "pick-pubkey", document.querySelector('#form-user [name="ssh_pubkey"]'));
 wireKeyPicker("btn-pick-privkey", "pick-privkey", document.querySelector('#form-upstream [name="key_content"]'));
+// Keypair generation: the node mints the pair; for a USER the private
+// half is downloaded once and never stored on the node; for an
+// UPSTREAM it is filled into the form (stored on the node on submit)
+// with a downloaded copy for the operator's own records.
+function downloadText(name, text) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([text], {type: "text/plain"}));
+  a.download = name; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+$("btn-gen-userkey").onclick = async () => {
+  try { const form = $("form-user");
+    const uname = form.querySelector("[name=username]").value.trim() || "user";
+    const r = await api("/api/keys/generate", {comment: "xmagic " + uname});
+    form.querySelector('[name="ssh_pubkey"]').value = r.public_key;
+    downloadText("xmagic-" + uname + ".key", r.private_key);
+    msg("已生成密钥对：公钥已填入，私钥已下载（只出现这一次，节点不保存）", true);
+  } catch (err) { msg(String(err)); } };
+$("btn-gen-upkey").onclick = async () => {
+  try { const form = $("form-upstream");
+    const uname = form.querySelector("[name=name]").value.trim() || "upstream";
+    const r = await api("/api/keys/generate", {comment: "xmagic upstream " + uname});
+    form.querySelector('[name="key_content"]').value = r.private_key;
+    downloadText("xmagic-upstream-" + uname + ".key", r.private_key);
+    msg("已生成密钥对：私钥已填入（提交后存于节点），并下载了一份副本", true);
+  } catch (err) { msg(String(err)); } };
 $("form-database").onsubmit = async e => { e.preventDefault();
   try { const r = await api("/api/databases", formJson(e.target));
     msg(`数据库配置 ${r.database.name} 已添加`, true); e.target.reset(); refresh(); }
@@ -1808,6 +1883,7 @@ $("form-settings").onsubmit = async e => { e.preventDefault();
       trojan_ws_paths: f.querySelector("[name=trojan_ws_paths]").value,
       upstream_strategy: f.querySelector("[name=upstream_strategy]").value,
       direct_allow_private: f.querySelector("[name=direct_allow_private]").checked,
+      interconnect_off_groups: f.querySelector("[name=interconnect_off_groups]").value,
       ss_method: f.querySelector("[name=ss_method]").value});
     msg("设置已保存。" + (r.applied ? appliedText(r.applied) : ""), true); refresh(); }
   catch (err) { msg(String(err)); } };

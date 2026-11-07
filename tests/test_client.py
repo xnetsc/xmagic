@@ -331,6 +331,122 @@ def main():
         rc, out, _ = cli("--json", "settings", "show")
         check("settings show via CLI", json.loads(out)["session_ttl_hours"] == 24)
 
+        # ---- ssh keys: generate, scan, select (remote CLI)
+        rc, out, err = cli("--json", "keys", "generate", "ck1")
+        kg = json.loads(out) if rc == 0 else {}
+        ck_priv = os.path.join(cli_home, "keys", "ck1")
+        check("keys generate writes a managed 0600 keypair",
+              rc == 0 and os.path.exists(ck_priv)
+              and (os.stat(ck_priv).st_mode & 0o777) == 0o600
+              and kg.get("public_key", "").startswith("ssh-ed25519 "),
+              err + out)
+        rc, out, err = cli("--json", "keys", "generate", "ck2")
+        kg2 = json.loads(out) if rc == 0 else {}
+        fake_home = os.path.join(workdir, "fakehome")
+        os.makedirs(os.path.join(fake_home, ".ssh"))
+        for src_name, dst in (("ck2", "id_test"),):
+            with open(os.path.join(cli_home, "keys", src_name), "rb") as f:
+                data = f.read()
+            with open(os.path.join(fake_home, ".ssh", dst), "wb") as f:
+                f.write(data)
+            with open(os.path.join(fake_home, ".ssh", dst + ".pub"), "w") as f:
+                f.write(kg2["public_key"] + "\n")
+        real_home = env.get("HOME")
+        env["HOME"] = fake_home
+        rc, out, err = cli("--json", "keys", "list")
+        env["HOME"] = real_home
+        listed = json.loads(out)["keys"] if rc == 0 else []
+        check("keys list scans ~/.ssh pairs, ~/.xmagic keys and dedupes",
+              rc == 0
+              and any(k["name"] == "id_test" and k["source"] == "file"
+                      for k in listed)
+              and sum(1 for k in listed
+                      if k["fingerprint"] == kg["fingerprint"]) == 1,
+              err + out)
+        rc, out, err = cli("keys", "show", "ck1")
+        check("keys show resolves a name to the public key line",
+              rc == 0 and out.strip() == kg["public_key"], err + out)
+        rc, out, err = cli("--json", "users", "add", "henry",
+                           "--ssh-key", "ck1")
+        henry = json.loads(out)["user"] if rc == 0 else {}
+        check("users add --ssh-key registers the scanned pubkey",
+              rc == 0 and henry.get("ssh_pubkey") == kg["public_key"],
+              err + out)
+        rc, out, err = cli("--json", "users", "add", "irene",
+                           "--ssh-key-generate")
+        check("users add --ssh-key-generate mints + registers a keypair",
+              rc == 0
+              and os.path.exists(os.path.join(cli_home, "keys", "irene"))
+              and json.loads(out)["user"].get("ssh_key") is True, err + out)
+        rc, out, err = cli("--json", "upstreams", "add", "upgen",
+                           "--proto", "ssh", "--addr", "10.9.9.11",
+                           "--port", "22", "--username", "tunnel",
+                           "--key-generate")
+        check("upstreams add ssh with --key-generate stores a node key",
+              rc == 0
+              and json.loads(out)["upstream"]["key_file"] == "/keys/upgen.key"
+              and os.path.exists(os.path.join(
+                  workdir, "a", "data", "ssh_client_keys", "upgen.key")),
+              err + out)
+        rc, out, err = cli("settings", "set", "--interconnect-off-groups",
+                           "team")
+        check("settings opt a group out of interconnect via remote CLI",
+              rc == 0 and "interconnect_off_groups=team" in out, err + out)
+        rc, out, err = cli("settings", "set", "--interconnect-off-groups", "")
+        check("settings clear the interconnect opt-out via remote CLI",
+              rc == 0 and "interconnect_off_groups=(none)" in out, err + out)
+        cli("users", "remove", "henry")
+        cli("users", "remove", "irene")
+        rc, out, err = cli("upstreams", "remove", "upgen")
+        check("cleanup: key-test users + upstream removed again",
+              rc == 0, err + out)
+
+        # ---- self-update: a copied CLI updates itself from a local
+        # server (never the repo file itself)
+        upd_dir = os.path.join(workdir, "upd")
+        os.makedirs(upd_dir)
+        cli_src = open(xmagic).read()
+        copy_path = os.path.join(upd_dir, "cli.py")
+        with open(copy_path, "w") as f:
+            f.write(cli_src)
+        with open(os.path.join(upd_dir, "xmagic.py"), "w") as f:
+            f.write(cli_src.replace('VERSION = "1.1.0"',
+                                    'VERSION = "9.9.9"'))
+        with open(os.path.join(upd_dir, "bad.py"), "w") as f:
+            f.write("not a cli\n")
+        httpd = subprocess.Popen(
+            [sys.executable, "-m", "http.server", "18103",
+             "--directory", upd_dir, "--bind", "127.0.0.1"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        def cli_copy(*args):
+            proc = subprocess.run([sys.executable, copy_path, *args],
+                                  env=env, capture_output=True, text=True,
+                                  timeout=30)
+            return proc.returncode, proc.stdout, proc.stderr
+
+        try:
+            base = "http://127.0.0.1:18103"
+            rc, out, err = cli_copy("update", "--check", "--from",
+                                    base + "/xmagic.py")
+            check("update --check reports the newer version, file untouched",
+                  rc == 0 and "9.9.9" in out
+                  and 'VERSION = "1.1.0"' in open(copy_path).read(), err + out)
+            rc, out, err = cli_copy("update", "--from", base + "/bad.py")
+            check("update refuses a download that is not xmagic.py",
+                  rc == 1 and 'VERSION = "1.1.0"' in open(copy_path).read(),
+                  err + out)
+            rc, out, err = cli_copy("update", "--from", base + "/xmagic.py")
+            check("update replaces the file and keeps a .bak",
+                  rc == 0 and 'VERSION = "9.9.9"' in open(copy_path).read()
+                  and 'VERSION = "1.1.0"' in open(copy_path + ".bak").read(),
+                  err + out)
+            rc, out, err = cli_copy("--version")
+            check("updated CLI runs and reports the new version",
+                  rc == 0 and "9.9.9" in out, err + out)
+        finally:
+            httpd.terminate()
+
         rc, out, err = drive_login(cli_home, PORT_A, auth_a)
         saved = json.load(open(session_a))
         ttl = saved["expires_at"] - time.time()

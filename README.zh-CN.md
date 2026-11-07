@@ -86,7 +86,8 @@ HTTP 代理（CONNECT）、VLESS-WS、VLESS（裸 TCP）、Trojan-WS、裸 Shado
 
 ### 设置（含渲染级配置）
 
-后台「设置」里除了会话有效期，还管四项原本只能写在 .env 里的渲染级配置：
+后台「设置」里除了会话有效期，还管几项原本只能写在 .env 里的渲染级配置，
+以及组内互访的分组退出名单（互访默认开启，见下文「组内互访」）：
 VLESS / Trojan 的 WS 路径列表、上级池策略、新用户的默认 SS 方法、是否允许
 直连内网地址。存进库里的值优先生效，清空即回退到 .env 的部署默认值；保存
 后自动重新渲染生效。端口类配置不在此列——它们绑在分发器 / sshd 进程上，
@@ -138,6 +139,11 @@ python3 xmagic.py upstreams edit b1 --port 8443      # 与 Web 编辑同一接�
 python3 xmagic.py users rotate-uuid alice
 python3 xmagic.py settings set --session-ttl-hours 24
 python3 xmagic.py settings set --upstream-strategy random --ss-method chacha20-ietf-poly1305
+python3 xmagic.py keys list        # 本机可用的 SSH 密钥：~/.ssh、~/.xmagic/keys、ssh-agent
+python3 xmagic.py keys generate alice   # 在 ~/.xmagic/keys 下生成一对 ed25519 密钥
+python3 xmagic.py users add alice --ssh-key alice   # 把这把钥登记为她的登录凭据
+python3 xmagic.py users add bob --ssh-key-generate  # 生成 + 登记一步完成
+python3 xmagic.py update           # 从仓库把本 CLI 更新到最新版
 ```
 
 - 节点注册表在 `~/.xmagic/config.json`；目标节点的选择优先级：
@@ -149,6 +155,15 @@ python3 xmagic.py settings set --upstream-strategy random --ss-method chacha20-i
 - 会话默认存 `~/.xmagic/sessions/<节点名>.json`（0600）；`login --session-file
   路径` 可存到指定位置，其它命令同名参数（或 `XMAGIC_SESSION_FILE`）选用哪份
   会话——一份会话一个文件，脚本里按节点切换，适合批量管理。
+- SSH 密钥不用再找外部工具：控制台、本 CLI 与 users.py 都能当场生成
+  ed25519 密钥对。给用户生成时私钥只留在客户端（控制台是一次性下载，
+  节点只存公钥）；给 SSH 上级生成时私钥按托管密钥存于节点。控制台的
+  用户列表会给登记了公钥的用户直接显示现成的
+  `ssh -D 1080 -N -p <端口> <用户>@<节点>` 命令——普通 SSH 客户端
+  就是可用的代理客户端。
+- `xmagic update` 从仓库自更新：下载先过版本校验与自检（--version
+  探针），通过才替换当前文件，旧版保留为 `xmagic.py.bak`
+  （`--check` 只报告，`--from URL` 换下载源）。
 - 退出码约定：0 成功、1 接口错误、2 配置/用法错误、3 未登录或会话过期，
   脚本可据此决定是否重跑 `login`。
 
@@ -229,6 +244,23 @@ python3 users.py route-add --kind full --pattern example.com --to intl --user ca
 - 判定顺序：带用户的目标规则 → 全局目标规则 → 按用户分组规则 → 兜底
   （default 池或直连）。目标规则指向的组若没有任何启用的上级，该规则在渲染时
   被跳过并打印 warning，不会让整份配置失效。
+
+## 组内互访
+
+同一分组的用户可以经网关互访彼此的服务，像在同一个局域网里。
+**默认开启**；设置里的「关闭组内互访的分组」（或
+`settings --interconnect-off-groups`）填入的分组退出互访。
+
+- 暴露：用户用反向转发把服务挂到网关回环，如
+  `ssh -R 127.0.0.1:20005:127.0.0.1:8080 -N -p <端口> <用户>@<节点>`
+  把本机 8080 暴露出来。每人固定一段 16 个端口（20000–21599，
+  见控制台用户列表），sshd 按钥逐段限制（authorized_keys 的
+  `permitlisten`），谁也占不了别人的端口。
+- 访问：同组成员经自己的代理拨 `127.0.0.1:<端口>`，与拨任何目标
+  无异。路由只把成员的端口段放给同组成员；其余回环目标一律在
+  网关拦截，节点自身的回环服务不会因此暴露。
+- 范围：仅 TCP、仅用户显式转发的服务——这是网关中转的可达性，
+  不是虚拟局域网（没有虚拟 IP、UDP 与服务发现）。
 
 ## 镜像与 CI
 
