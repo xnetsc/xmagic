@@ -3,11 +3,12 @@
 
 Two admin servers stand in for two nodes. A simulated browser performs
 the Passkey ceremonies (software authenticator from test_admin) against
-each node's /cli-auth handoff, so the real login path - loopback
-callback, one-time code, code exchange, session file - is exercised
-exactly as an operator's browser would drive it. Then: node registry,
-per-node sessions, --session-file selection, argument-over-config
-precedence, settings round-trip, and the effective session TTL.
+each node's /cli-auth handoff, so the real login path - ECDH-bound
+ceremony, in-channel CLI session delegation, loopback callback with
+public values only, encrypted session file - is exercised exactly as
+an operator's browser would drive it. Then: node registry, per-node
+sessions, --session-file selection, argument-over-config precedence,
+settings round-trip, and the effective session TTL.
 
 Run: python3 tests/test_client.py
 """
@@ -22,7 +23,7 @@ import urllib.parse
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from test_admin import Authenticator  # noqa: E402
+from test_admin import Authenticator, Client as Browser  # noqa: E402
 
 PASS, FAIL = [], []
 PORT_A, PORT_B = 18101, 18102
@@ -31,34 +32,6 @@ PORT_A, PORT_B = 18101, 18102
 def check(name, cond, extra=""):
     (PASS if cond else FAIL).append(name)
     print(("PASS " if cond else "FAIL ") + name + (f"  {extra}" if extra and not cond else ""))
-
-
-class Browser:
-    """Cookie-aware HTTP client standing in for the operator's browser."""
-
-    def __init__(self, port):
-        self.port = port
-        self.cookie = None
-
-    def call(self, method, path, body=None):
-        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
-        headers = {"Content-Type": "application/json",
-                   "Origin": f"http://localhost:{self.port}"}
-        if self.cookie:
-            headers["Cookie"] = self.cookie
-        conn.request(method, path,
-                     json.dumps(body) if body is not None else None, headers)
-        resp = conn.getresponse()
-        raw = resp.read()
-        set_cookie = resp.getheader("Set-Cookie")
-        if set_cookie and "xmagic_session=" in set_cookie:
-            token = set_cookie.split("xmagic_session=", 1)[1].split(";", 1)[0]
-            self.cookie = f"xmagic_session={token}" if token else None
-        conn.close()
-        try:
-            return resp.status, json.loads(raw)
-        except ValueError:
-            return resp.status, {"raw": raw[:200]}
 
 
 def start_server(port, workdir):
@@ -77,6 +50,47 @@ def start_server(port, workdir):
         except OSError:
             time.sleep(0.2)
     raise RuntimeError(f"server on {port} did not come up")
+
+
+def hit_callback(callback, **params):
+    p = urllib.parse.urlparse(callback)
+    conn = http.client.HTTPConnection(p.hostname, p.port, timeout=10)
+    conn.request("GET", "/callback?" + urllib.parse.urlencode(params))
+    resp = conn.getresponse()
+    resp.read()
+    conn.close()
+    return resp.status
+
+
+def play_browser_login(port, auth, callback, state, cli_pub):
+    """Play the /cli-auth page: passkey ceremony if needed (adopting
+    the web session it negotiates), then mint the CLI session inside
+    that encrypted channel and hand public values to the callback."""
+    browser = Browser(port)
+    status, _ = browser.call(
+        "GET", f"/cli-auth?callback={urllib.parse.quote(callback)}"
+               f"&state={state}&cli_pub={cli_pub}")
+    assert status == 200, status
+    _, st = browser.call("GET", "/api/status")
+    origin = f"http://localhost:{port}"
+    if not st["registered"]:
+        _, opts = browser.options("register")
+        status, body = browser.verify(
+            "register", auth.attestation(opts["challenge"], "localhost",
+                                         origin))
+        assert status == 200, body
+    else:
+        _, opts = browser.options("login")
+        status, body = browser.verify(
+            "login", auth.assertion(opts["challenge"], "localhost", origin))
+        assert status == 200, body
+    status, body = browser.call("POST", "/api/cli/sessions",
+                                {"client_pub": cli_pub,
+                                 "label": "test drive"})
+    assert status == 201, body
+    hit_callback(callback, sid=body["id"], spub=body["server_pub"],
+                 state=state, exp=body["expires_at"])
+    return browser
 
 
 def drive_login(cli_home, port, auth, extra_args=()):
@@ -98,34 +112,8 @@ def drive_login(cli_home, port, auth, extra_args=()):
         out, err = proc.communicate()
         raise RuntimeError(f"login printed no URL: {out} {err}")
     query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
-    callback, state = query["callback"][0], query["state"][0]
-    browser = Browser(port)
-    status, _ = browser.call("GET", f"/cli-auth?callback="
-                             f"{urllib.parse.quote(callback)}&state={state}")
-    assert status == 200, status
-    _, st = browser.call("GET", "/api/status")
-    origin = f"http://localhost:{port}"
-    if not st["registered"]:
-        _, opts = browser.call("POST", "/api/register/options", {})
-        status, body = browser.call(
-            "POST", "/api/register/verify",
-            auth.attestation(opts["challenge"], "localhost", origin))
-        assert status == 200, body
-    else:
-        _, opts = browser.call("POST", "/api/login/options", {})
-        status, body = browser.call(
-            "POST", "/api/login/verify",
-            auth.assertion(opts["challenge"], "localhost", origin))
-        assert status == 200, body
-    status, body = browser.call("POST", "/api/cli-token",
-                                {"callback": callback, "state": state})
-    assert status == 200, body
-    redirect = urllib.parse.urlparse(body["redirect"])
-    conn = http.client.HTTPConnection(redirect.hostname, redirect.port, timeout=10)
-    conn.request("GET", redirect.path + "?" + redirect.query)
-    resp = conn.getresponse()
-    resp.read()
-    conn.close()
+    play_browser_login(port, auth, query["callback"][0], query["state"][0],
+                       query["cli_pub"][0])
     out, err = proc.communicate(timeout=30)
     return proc.returncode, out, err
 
@@ -156,15 +144,15 @@ def drive_replace(cli_home, port, current_auth, new_auth):
     status, _ = browser.call("GET", f"/cli-replace?ticket={ticket}")
     assert status == 200, status
     origin = f"http://localhost:{port}"
-    _, opts = browser.call("POST", "/api/login/options", {})
-    status, body = browser.call(
-        "POST", "/api/login/verify",
-        current_auth.assertion(opts["challenge"], "localhost", origin))
+    _, opts = browser.options("login")
+    status, body = browser.verify(
+        "login", current_auth.assertion(opts["challenge"], "localhost",
+                                        origin))
     assert status == 200, body
-    _, opts = browser.call("POST", "/api/cli-replace-options",
-                           {"ticket": ticket})
-    status, body = browser.call(
-        "POST", "/api/cli-replace-verify",
+    _, opts = browser.options_at("/api/cli-replace-options",
+                                 {"ticket": ticket})
+    status, body = browser.verify_at(
+        "/api/cli-replace-verify",
         dict(new_auth.attestation(opts["challenge"], "localhost", origin),
              ticket=ticket))
     assert status == 200, body
@@ -192,7 +180,8 @@ def spawn_login(cli_home):
         out, err = proc.communicate()
         raise RuntimeError(f"login printed no URL: {out} {err}")
     query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
-    return proc, query["callback"][0], query["state"][0]
+    return (proc, query["callback"][0], query["state"][0],
+            query["cli_pub"][0])
 
 
 def hit_listener(callback, path):
@@ -209,25 +198,10 @@ def drive_login_stray(cli_home, port, auth):
     """Login while stray requests (favicon, bare /) hit the loopback
     listener before the real callback - they must be ignored, not
     mistaken for a failed handoff."""
-    proc, callback, state = spawn_login(cli_home)
+    proc, callback, state, cli_pub = spawn_login(cli_home)
     hit_listener(callback, "/favicon.ico")
     hit_listener(callback, "/")
-    browser = Browser(port)
-    status, _ = browser.call("GET", f"/cli-auth?callback="
-                             f"{urllib.parse.quote(callback)}&state={state}")
-    assert status == 200, status
-    origin = f"http://localhost:{port}"
-    _, opts = browser.call("POST", "/api/login/options", {})
-    status, body = browser.call(
-        "POST", "/api/login/verify",
-        auth.assertion(opts["challenge"], "localhost", origin))
-    assert status == 200, body
-    status, body = browser.call("POST", "/api/cli-token",
-                                {"callback": callback, "state": state})
-    assert status == 200, body
-    hit_listener(body["redirect"], urllib.parse.urlparse(
-        body["redirect"]).path + "?" + urllib.parse.urlparse(
-            body["redirect"]).query)
+    play_browser_login(port, auth, callback, state, cli_pub)
     out, err = proc.communicate(timeout=30)
     return proc.returncode, out, err
 
@@ -265,8 +239,9 @@ def main():
         rc, out, err = drive_login_stray(cli_home, PORT_A, auth_a)
         check("login tolerates stray listener hits before the callback",
               rc == 0 and "logged in" in out, err + out)
-        proc, callback, _state = spawn_login(cli_home)
-        hit_listener(callback, "/callback?code=fake&state=wrong-state")
+        proc, callback, _state, _pub = spawn_login(cli_home)
+        hit_listener(callback, "/callback?sid=fake&spub=fake"
+                               "&state=wrong-state")
         out, err = proc.communicate(timeout=30)
         check("callback with a wrong state still aborts the login",
               proc.returncode == 3 and "state mismatch" in err, err + out)
@@ -503,19 +478,26 @@ def main():
         check("only the current session survives revoke-others",
               len(sess) == 1 and sess[0]["current"] is True, out)
 
-        # a one-time code is single-use; a bogus code is refused
-        status, _ = browser_b.call("POST", "/api/cli-exchange", {"code": "bogus"})
-        check("bogus handoff code rejected", status == 401, f"got {status}")
+        # no channel, no CLI session: delegation needs the web
+        # session's encrypted channel; a forged callback state aborts
+        # the CLI's login instead of storing anything
+        status, _ = browser_b.call("POST", "/api/cli/sessions",
+                                   {"client_pub": "AAAA"})
+        check("CLI session minting without a channel rejected",
+              status == 401, f"got {status}")
+        proc, callback, state, cli_pub = spawn_login(cli_home)
+        hit_callback(callback, sid="forged", spub="AAAA", state="WRONG",
+                     exp=0)
+        _, err = proc.communicate(timeout=30)
+        check("forged callback state aborts the login",
+              proc.returncode == 3 and "state mismatch" in err,
+              f"rc={proc.returncode} {err}")
         _, st = browser_b.call("GET", "/api/status")
         auth_b = Authenticator()
-        _, opts = browser_b.call("POST", "/api/register/options", {})
-        browser_b.call("POST", "/api/register/verify",
-                       auth_b.attestation(opts["challenge"], "localhost",
-                                          f"http://localhost:{PORT_B}"))
-        status, _ = browser_b.call("POST", "/api/cli-token",
-                                   {"callback": "https://evil.example.com/cb",
-                                    "state": "x"})
-        check("non-loopback callback rejected", status == 400, f"got {status}")
+        _, opts = browser_b.options("register")
+        browser_b.verify("register",
+                         auth_b.attestation(opts["challenge"], "localhost",
+                                            f"http://localhost:{PORT_B}"))
 
         # multi-node: log in to B with an explicit session file
         custom = os.path.join(workdir, "b-session.json")
@@ -716,18 +698,16 @@ def main():
               rc == 0 and [u["username"] for u in json.loads(out)["users"]]
               == ["alice"], out)
         probe = Browser(PORT_A)
-        _, opts = probe.call("POST", "/api/login/options", {})
-        status, _ = probe.call(
-            "POST", "/api/login/verify",
-            auth_a.assertion(opts["challenge"], "localhost",
-                             f"http://localhost:{PORT_A}"))
+        _, opts = probe.options("login")
+        status, _ = probe.verify(
+            "login", auth_a.assertion(opts["challenge"], "localhost",
+                                      f"http://localhost:{PORT_A}"))
         check("old passkey rejected after CLI replacement",
               status in (400, 401), f"got {status}")
-        _, opts = probe.call("POST", "/api/login/options", {})
-        status, _ = probe.call(
-            "POST", "/api/login/verify",
-            auth_a2.assertion(opts["challenge"], "localhost",
-                              f"http://localhost:{PORT_A}"))
+        _, opts = probe.options("login")
+        status, _ = probe.verify(
+            "login", auth_a2.assertion(opts["challenge"], "localhost",
+                                       f"http://localhost:{PORT_A}"))
         check("new passkey logs in after CLI replacement",
               status == 200, f"got {status}")
         rc, out, err = cli("--json", "db", "list")

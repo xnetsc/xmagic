@@ -22,6 +22,7 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 import admin as admin_mod  # noqa: E402  (for EC helpers + b64u)
+import xmagic as cli_mod  # noqa: E402  (the real client's envelope code)
 
 PORT = 18099
 ORIGIN = f"http://localhost:{PORT}"
@@ -137,27 +138,97 @@ class Authenticator:
 # ------------------------------------------------ HTTP client
 
 class Client:
-    def __init__(self):
-        self.cookie = None
+    """Speaks the key-bound session protocol, like the browser pages
+    and the real CLI: ceremonies contribute an ECDH public key and
+    verify the challenge binding (SHA-256 of nonce || client pub ||
+    server pub), the verify response's session material is adopted,
+    and every later call is an encrypted envelope."""
+
+    def __init__(self, port=None):
+        self.port = port or PORT
+        self.origin = f"http://localhost:{self.port}"
+        self.sid = None
+        self.master = None
+        self._kp = None  # (priv, pub) of the in-flight ceremony
+
+    def drop(self):
+        self.sid = None
+        self.master = None
 
     def call(self, method, path, body=None):
-        conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=10)
-        headers = {"Content-Type": "application/json", "Origin": ORIGIN}
-        if self.cookie:
-            headers["Cookie"] = self.cookie
-        conn.request(method, path,
-                     json.dumps(body) if body is not None else None, headers)
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        headers = {"Content-Type": "application/json", "Origin": self.origin}
+        data = None
+        if self.master is not None:
+            headers["X-Session-Id"] = self.sid
+            if method == "GET":
+                headers["X-Enc"] = cli_mod.seal_envelope(
+                    self.master, cli_mod._aad(self.sid, method, path),
+                    cli_mod._wrap_body({}))
+            else:
+                data = json.dumps({"e": cli_mod.seal_envelope(
+                    self.master, cli_mod._aad(self.sid, method, path),
+                    cli_mod._wrap_body(body or {}))})
+        elif body is not None:
+            data = json.dumps(body)
+        conn.request(method, path, data, headers)
         resp = conn.getresponse()
         raw = resp.read()
-        set_cookie = resp.getheader("Set-Cookie")
-        if set_cookie and "xmagic_session=" in set_cookie:
-            token = set_cookie.split("xmagic_session=", 1)[1].split(";", 1)[0]
-            self.cookie = f"xmagic_session={token}" if token else None
         conn.close()
         try:
-            return resp.status, json.loads(raw)
+            payload = json.loads(raw)
         except ValueError:
             return resp.status, {"raw": raw[:200]}
+        if self.master is not None and isinstance(payload, dict) \
+                and "e" in payload:
+            plain = cli_mod.open_envelope(
+                self.master, cli_mod._aad(self.sid, method, path),
+                payload["e"])
+            payload = json.loads(plain)["body"]
+        return resp.status, payload
+
+    def options(self, kind, extra=None):
+        return self.options_at(f"/api/{kind}/options", extra)
+
+    def options_at(self, path, extra=None):
+        priv, pub = cli_mod._ec_keypair()
+        self._kp = (priv, pub)
+        body = {"ecdh_pub": admin_mod.b64u_encode(pub)}
+        body.update(extra or {})
+        status, resp = self.call("POST", path, body)
+        if status == 200 and "ecdh" in resp:
+            digest = hashlib.sha256(
+                admin_mod.b64u_decode(resp["ecdh"]["nonce"]) + pub
+                + admin_mod.b64u_decode(resp["ecdh"]["server_pub"])).digest()
+            if digest != admin_mod.b64u_decode(resp["challenge"]):
+                raise AssertionError("challenge does not bind the ECDH pubs")
+        return status, resp
+
+    def verify(self, kind, payload):
+        return self.verify_at(f"/api/{kind}/verify", payload)
+
+    def verify_at(self, path, payload):
+        status, resp = self.call("POST", path, payload)
+        if status in (200, 201) and "session" in resp:
+            priv, pub = self._kp
+            self.sid = resp["session"]["id"]
+            self.master = cli_mod.derive_session_key(
+                pub, priv,
+                admin_mod.b64u_decode(resp["session"]["server_pub"]))
+        return status, resp
+
+    def mint_cli_session(self, label="test-cli"):
+        """In-channel ECDH delegation -> (status, body, cli_client)."""
+        priv, pub = cli_mod._ec_keypair()
+        status, resp = self.call(
+            "POST", "/api/cli/sessions",
+            {"client_pub": admin_mod.b64u_encode(pub), "label": label})
+        other = Client()
+        if status == 201:
+            other.sid = resp["id"]
+            other.master = cli_mod.derive_session_key(
+                pub, priv, admin_mod.b64u_decode(resp["server_pub"]))
+        return status, resp, other
 
 
 def main():
@@ -191,19 +262,46 @@ def main():
               f"got {status}")
 
         auth = Authenticator()
-        status, opts = client.call("POST", "/api/register/options", {})
+        status, opts = client.options("register")
         check("register options issued", status == 200 and "challenge" in opts)
-        status, body = client.call("POST", "/api/register/verify",
-                                   auth.attestation(opts["challenge"], "localhost"))
+        check("challenge binds both ECDH public keys",
+              "ecdh" in opts and bool(opts["ecdh"].get("server_pub"))
+              and bool(opts["ecdh"].get("nonce")), f"{opts}")
+        status, body = client.verify(
+            "register", auth.attestation(opts["challenge"], "localhost"))
         check("registration succeeds", status == 200, f"{status} {body}")
-        check("session cookie set on register", client.cookie is not None)
+        check("register establishes a key-bound session",
+              client.master is not None and bool(client.sid))
 
         status, body = client.call("GET", "/api/status")
-        check("status: registered + authenticated",
-              body["registered"] is True and body["authenticated"] is True)
+        check("status: registered", body["registered"] is True)
+        status, _ = client.call("GET", "/api/state")
+        check("the negotiated session key opens the API", status == 200)
+
+        # envelope discipline: a replayed request and a tampered one die
+        headers = {"Content-Type": "application/json", "Origin": ORIGIN,
+                   "X-Session-Id": client.sid}
+        sealed = json.dumps({"e": cli_mod.seal_envelope(
+            client.master, cli_mod._aad(client.sid, "POST", "/api/apply"),
+            cli_mod._wrap_body({}))})
+        conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=10)
+        conn.request("POST", "/api/apply", sealed, headers)
+        first = conn.getresponse(); first.read(); conn.close()
+        conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=10)
+        conn.request("POST", "/api/apply", sealed, headers)
+        second = conn.getresponse(); second.read(); conn.close()
+        conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=10)
+        blob = json.loads(sealed)["e"]
+        conn.request("POST", "/api/apply",
+                     json.dumps({"e": blob[:-6] + "AAAAAA"}), headers)
+        third = conn.getresponse(); third.read(); conn.close()
+        check("envelope replay + tamper are rejected",
+              first.status == 200 and second.status == 401
+              and third.status == 401,
+              f"{first.status} {second.status} {third.status}")
 
         stranger = Client()
-        status, _ = stranger.call("POST", "/api/register/options", {})
+        status, _ = stranger.options("register")
         check("second registration refused for strangers", status == 403,
               f"got {status}")
 
@@ -420,29 +518,31 @@ def main():
               and sess[0]["kind"] == "web", f"{status} {body}")
 
         client.call("POST", "/api/logout", {})
+        client.drop()
         status, _ = client.call("GET", "/api/users")
         check("API closed after logout", status == 401, f"got {status}")
 
-        status, opts = client.call("POST", "/api/login/options", {})
+        status, opts = client.options("login")
         assertion = auth.assertion(opts["challenge"], "localhost")
-        status, body = client.call("POST", "/api/login/verify", assertion)
-        check("login succeeds", status == 200, f"{status} {body}")
+        status, body = client.verify("login", assertion)
+        check("login succeeds and re-negotiates the session key",
+              status == 200 and client.master is not None, f"{status} {body}")
 
-        status, body = client.call("POST", "/api/cli-token",
-                                   {"callback": "http://127.0.0.1:9999/callback",
-                                    "state": "s1"})
-        code = body["redirect"].split("code=")[1].split("&")[0]
         anon = Client()
-        status, body = anon.call("POST", "/api/cli-exchange",
-                                 {"code": code, "label": "test-cli"})
-        cli_token = body.get("token")
-        check("cli exchange mints a token", status == 200 and bool(cli_token),
-              f"{status} {body}")
+        status, _ = anon.call("POST", "/api/cli/sessions",
+                              {"client_pub": "AAAA"})
+        check("minting a CLI session requires an encrypted channel",
+              status == 401, f"got {status}")
+        status, body, cli_client = client.mint_cli_session()
+        check("in-channel ECDH mints a CLI session",
+              status == 201 and bool(body.get("id"))
+              and bool(body.get("server_pub")), f"{status} {body}")
         check("cli session expiry follows the 24h setting",
               abs(body.get("expires_at", 0)
                   - (time.time() + 24 * 3600)) < 120, f"{body}")
-        status, _ = anon.call("POST", "/api/cli-exchange", {"code": code})
-        check("handoff code is single-use", status == 401, f"got {status}")
+        status, _ = cli_client.call("GET", "/api/users")
+        check("the CLI session key opens the API", status == 200,
+              f"got {status}")
         status, body = client.call("GET", "/api/sessions")
         kinds = sorted(s["kind"] for s in body["sessions"])
         check("session list shows web + cli sessions", kinds == ["cli", "web"],
@@ -450,22 +550,20 @@ def main():
         cli_id = next(s["id"] for s in body["sessions"] if s["kind"] == "cli")
         status, body = client.call("POST", f"/api/sessions/{cli_id}/revoke", {})
         check("revoke cli session by id", status == 200, f"{status} {body}")
-        dead = Client()
-        dead.cookie = f"xmagic_session={cli_token}"
-        status, _ = dead.call("GET", "/api/users")
-        check("revoked token is rejected", status == 401, f"got {status}")
+        status, _ = cli_client.call("GET", "/api/users")
+        check("revoked session key is rejected", status == 401, f"got {status}")
         status, body = client.call("POST", "/api/sessions/revoke-others", {})
         check("revoke-others keeps the current session",
               status == 200 and body["revoked_others"] == 0, f"{status} {body}")
 
-        status, body = client.call("POST", "/api/login/verify", assertion)
+        status, body = client.verify("login", assertion)
         check("assertion replay rejected", status in (400, 401), f"got {status}")
 
         impostor = Authenticator()
         impostor.cred_id = auth.cred_id  # right id, wrong key
-        status, opts = client.call("POST", "/api/login/options", {})
-        status, body = client.call("POST", "/api/login/verify",
-                                   impostor.assertion(opts["challenge"], "localhost"))
+        status, opts = client.options("login")
+        status, body = client.verify(
+            "login", impostor.assertion(opts["challenge"], "localhost"))
         check("wrong-key assertion rejected", status == 401, f"got {status}")
 
         # --- full surface: state, lists, remaining user/upstream/route
@@ -641,6 +739,9 @@ def main():
               and "buildUpProtoOptions" in page
               and "genUserKeypair" in page
               and "crypto.subtle" in page
+              and "checkChallengeBinding" in page
+              and "sealEnvelope" in page
+              and "sessionStorage" in page
               and 'id="up-add-btns"' in page
               and 'data-up-tab="list"' in page
               and 'id="up-form-tab"' in page
@@ -657,17 +758,11 @@ def main():
         status, _ = anon2.call("POST", "/api/cli-replace-ticket", {})
         check("replace ticket requires auth", status == 401, f"got {status}")
         other = Client()
-        status, opts = other.call("POST", "/api/login/options", {})
-        status, _ = other.call("POST", "/api/login/verify",
-                               auth.assertion(opts["challenge"], "localhost"))
+        status, opts = other.options("login")
+        status, _ = other.verify(
+            "login", auth.assertion(opts["challenge"], "localhost"))
         check("second web session established", status == 200, f"{status}")
-        status, body = client.call("POST", "/api/cli-token",
-                                   {"callback": "http://127.0.0.1:9999/callback",
-                                    "state": "s2"})
-        code2 = body["redirect"].split("code=")[1].split("&")[0]
-        status, body = anon2.call("POST", "/api/cli-exchange", {"code": code2})
-        initiator = Client()
-        initiator.cookie = f"xmagic_session={body.get('token')}"
+        _, _, initiator = client.mint_cli_session(label="initiator-cli")
         status, body = initiator.call("POST", "/api/cli-replace-ticket", {})
         ticket = body.get("ticket")
         check("CLI session can issue a replace ticket",
@@ -676,8 +771,8 @@ def main():
                                       {"ticket": ticket})
         check("ticket starts not-done",
               status == 200 and body["done"] is False, f"{status} {body}")
-        status, _ = client.call("POST", "/api/cli-replace-options",
-                                {"ticket": "bogus"})
+        status, _ = client.options_at("/api/cli-replace-options",
+                                      {"ticket": "bogus"})
         check("replace options reject a bogus ticket", status == 400,
               f"got {status}")
         conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=10)
@@ -689,12 +784,12 @@ def main():
               resp.status == 200 and "更换管理员 Passkey" in page,
               f"status {resp.status}")
         auth_new = Authenticator()
-        status, opts = client.call("POST", "/api/cli-replace-options",
-                                   {"ticket": ticket})
+        status, opts = client.options_at("/api/cli-replace-options",
+                                         {"ticket": ticket})
         check("replace options issued", status == 200 and "challenge" in opts,
               f"{status}")
-        status, body = client.call(
-            "POST", "/api/cli-replace-verify",
+        status, body = client.verify_at(
+            "/api/cli-replace-verify",
             dict(auth_new.attestation(opts["challenge"], "localhost"),
                  ticket=ticket))
         check("CLI-ticket passkey replacement succeeds",
@@ -710,45 +805,47 @@ def main():
         check("unrelated web session is revoked by replacement",
               status == 401, f"got {status}")
         status, _ = client.call("GET", "/api/users")
-        check("performing browser session survives (fresh cookie)",
+        check("performing browser session survives (fresh session key)",
               status == 200, f"got {status}")
-        status, opts = client.call("POST", "/api/login/options", {})
-        status, _ = client.call("POST", "/api/login/verify",
-                                auth.assertion(opts["challenge"], "localhost"))
+        status, opts = client.options("login")
+        status, _ = client.verify(
+            "login", auth.assertion(opts["challenge"], "localhost"))
         check("old passkey dead after CLI-ticket replacement",
               status in (400, 401), f"got {status}")
-        status, opts = client.call("POST", "/api/login/options", {})
-        status, _ = client.call("POST", "/api/login/verify",
-                                auth_new.assertion(opts["challenge"],
-                                                   "localhost"))
+        status, opts = client.options("login")
+        status, _ = client.verify(
+            "login", auth_new.assertion(opts["challenge"], "localhost"))
         check("new passkey logs in after CLI-ticket replacement",
               status == 200, f"got {status}")
 
         # --- admin passkey replacement while authenticated ---
-        old_cookie = client.cookie
+        victim = Client()
+        status, opts = victim.options("login")
+        status, _ = victim.verify(
+            "login", auth_new.assertion(opts["challenge"], "localhost"))
+        check("bystander session established before replacement",
+              status == 200, f"{status}")
         auth2 = Authenticator()
-        status, opts = client.call("POST", "/api/register/options", {})
+        status, opts = client.options("register")
         check("authed admin may start a passkey replacement",
               status == 200 and "challenge" in opts, f"{status}")
-        status, body = client.call("POST", "/api/register/verify",
-                                   auth2.attestation(opts["challenge"], "localhost"))
+        status, body = client.verify(
+            "register", auth2.attestation(opts["challenge"], "localhost"))
         check("passkey replacement succeeds", status == 200, f"{status} {body}")
         status, body = client.call("GET", "/api/sessions")
         check("replacement revokes every other session",
               status == 200 and len(body["sessions"]) == 1
               and body["sessions"][0]["current"] is True, f"{status} {body}")
-        stale = Client()
-        stale.cookie = old_cookie
-        status, _ = stale.call("GET", "/api/users")
+        status, _ = victim.call("GET", "/api/users")
         check("pre-replacement session is dead", status == 401, f"got {status}")
-        status, opts = client.call("POST", "/api/login/options", {})
-        status, body = client.call("POST", "/api/login/verify",
-                                   auth.assertion(opts["challenge"], "localhost"))
+        status, opts = client.options("login")
+        status, body = client.verify(
+            "login", auth.assertion(opts["challenge"], "localhost"))
         check("old passkey no longer logs in", status in (400, 401),
               f"got {status}")
-        status, opts = client.call("POST", "/api/login/options", {})
-        status, body = client.call("POST", "/api/login/verify",
-                                   auth2.assertion(opts["challenge"], "localhost"))
+        status, opts = client.options("login")
+        status, body = client.verify(
+            "login", auth2.assertion(opts["challenge"], "localhost"))
         check("new passkey logs in", status == 200, f"{status} {body}")
 
         proc = subprocess.run([sys.executable, os.path.join(ROOT, "users.py"),

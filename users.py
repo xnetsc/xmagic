@@ -318,7 +318,7 @@ class Cursor:
         return self._raw.rowcount
 
 
-_REPLACE_PK = {"admin_sessions": "token_hash", "admin_credentials": "id"}
+_REPLACE_PK = {"admin_sessions": "sid", "admin_credentials": "id"}
 _REPLACE_RE = re.compile(
     r"INSERT OR REPLACE INTO (\w+) \(([^)]*)\) VALUES \(([^)]*)\)",
     re.IGNORECASE)
@@ -401,8 +401,8 @@ class DB:
             # the keyed text columns become VARCHARs of a safe length.
             sql = sql.replace("key TEXT PRIMARY KEY",
                               "`key` VARCHAR(255) PRIMARY KEY")
-            sql = sql.replace("token_hash TEXT PRIMARY KEY",
-                              "token_hash VARCHAR(255) PRIMARY KEY")
+            sql = sql.replace("sid TEXT PRIMARY KEY",
+                              "sid VARCHAR(255) PRIMARY KEY")
             sql = sql.replace("username TEXT UNIQUE NOT NULL",
                               "username VARCHAR(255) UNIQUE NOT NULL")
             sql = sql.replace("name TEXT UNIQUE NOT NULL",
@@ -528,7 +528,7 @@ def ensure_schema(conn):
     apply the additive column migrations older databases need."""
     conn.executescript(SCHEMA)
     conn.execute(SETTINGS_SCHEMA)
-    conn.execute(SESSIONS_SCHEMA)
+    _sessions_ensure(conn)
     conn.execute(CREDENTIALS_SCHEMA)
     cols = conn.columns("users")
     if cols and "upstream_group" not in cols:  # migrate pre-group databases
@@ -2512,53 +2512,68 @@ def cmd_status(_):
 
 # ------------------------------------------------------------ sessions
 # Login sessions (web console and remote CLI alike) are rows in
-# admin_sessions, keyed by the SHA-256 of the bearer token: the raw
-# token is never stored, so a database leak does not hand out live
-# sessions. One admin may hold many sessions at once (several browsers
-# and CLI logins); every management interface can list and revoke them.
+# admin_sessions. A session is NOT a bearer token: it is a public
+# session id plus the ECDH-derived session key (see admin.py's
+# session crypto) that encrypts every API call on that session. The
+# key must be stored - it cannot be hashed, the server needs it to
+# decrypt - so a database leak exposes live session keys until they
+# expire or are revoked; sessions are short-lived for that reason.
+# One admin may hold many sessions at once (several browsers and CLI
+# logins); every management interface can list and revoke them.
 
 SESSIONS_SCHEMA = ("CREATE TABLE IF NOT EXISTS admin_sessions"
-                   " (token_hash TEXT PRIMARY KEY, kind TEXT NOT NULL,"
-                   "  label TEXT, created_at INTEGER NOT NULL,"
+                   " (sid TEXT PRIMARY KEY, key TEXT NOT NULL,"
+                   "  client_pub TEXT, server_pub TEXT,"
+                   "  kind TEXT NOT NULL, label TEXT,"
+                   "  created_at INTEGER NOT NULL,"
                    "  expires_at INTEGER NOT NULL)")
 
 
-def token_hash(token):
-    return hashlib.sha256(token.encode()).hexdigest()
-
-
-def session_id_of(token):
-    return token_hash(token)[:12]
-
-
-def mint_session(conn, token, kind, label, ttl_seconds):
+def _sessions_ensure(conn):
+    """Create the session table. A pre-ECDH table (keyed by token
+    hash) is dropped: bearer-token sessions do not survive the
+    cutover to key-bound sessions, everyone signs in again."""
+    if hasattr(conn, "columns"):
+        cols = conn.columns("admin_sessions")
+    else:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(admin_sessions)")]
+    if cols and "sid" not in cols:
+        conn.execute("DROP TABLE admin_sessions")
     conn.execute(SESSIONS_SCHEMA)
+
+
+def mint_session_keyed(conn, sid, key_b64, client_pub, server_pub,
+                       kind, label, ttl_seconds):
+    _sessions_ensure(conn)
     now = int(time.time())
+    expires = now + int(ttl_seconds)
     conn.execute(
         "INSERT OR REPLACE INTO admin_sessions"
-        " (token_hash, kind, label, created_at, expires_at) VALUES (?,?,?,?,?)",
-        (token_hash(token), kind, label, now, now + int(ttl_seconds)))
+        " (sid, key, client_pub, server_pub, kind, label, created_at,"
+        " expires_at) VALUES (?,?,?,?,?,?,?,?)",
+        (sid, key_b64, client_pub, server_pub, kind, label, now, expires))
+    return expires
 
 
-def find_session(conn, token):
-    if not token:
+def find_session_by_sid(conn, sid):
+    if not sid:
         return None
+    _sessions_ensure(conn)
     try:
-        row = conn.execute("SELECT * FROM admin_sessions WHERE token_hash = ?",
-                           (token_hash(token),)).fetchone()
+        row = conn.execute("SELECT * FROM admin_sessions WHERE sid = ?",
+                           (sid,)).fetchone()
     except OperationalError:
         return None
     if row is None:
         return None
     if row["expires_at"] <= int(time.time()):
-        conn.execute("DELETE FROM admin_sessions WHERE token_hash = ?",
-                     (token_hash(token),))
+        conn.execute("DELETE FROM admin_sessions WHERE sid = ?", (sid,))
         return None
     return row
 
 
 def list_session_rows(conn):
-    conn.execute(SESSIONS_SCHEMA)
+    _sessions_ensure(conn)
     conn.execute("DELETE FROM admin_sessions WHERE expires_at <= ?",
                  (int(time.time()),))
     return conn.execute(
@@ -2566,39 +2581,39 @@ def list_session_rows(conn):
 
 
 def session_row_dict(row):
-    return {"id": row["token_hash"][:12], "kind": row["kind"],
+    return {"id": row["sid"][:12], "kind": row["kind"],
             "label": row["label"], "created_at": row["created_at"],
             "expires_at": row["expires_at"]}
 
 
-def revoke_token(conn, token):
-    conn.execute(SESSIONS_SCHEMA)
-    cur = conn.execute("DELETE FROM admin_sessions WHERE token_hash = ?",
-                       (token_hash(token),))
+def revoke_sid(conn, sid):
+    _sessions_ensure(conn)
+    cur = conn.execute("DELETE FROM admin_sessions WHERE sid = ?", (sid,))
     return cur.rowcount > 0
 
 
 def revoke_session_by_id(conn, id_prefix):
     matches = [r for r in list_session_rows(conn)
-               if r["token_hash"].startswith(id_prefix)]
+               if r["sid"].startswith(id_prefix)]
     if len(matches) != 1:
         return None
-    conn.execute("DELETE FROM admin_sessions WHERE token_hash = ?",
-                 (matches[0]["token_hash"],))
+    conn.execute("DELETE FROM admin_sessions WHERE sid = ?",
+                 (matches[0]["sid"],))
     return matches[0]
 
 
-def revoke_other_sessions(conn, keep_token):
-    conn.execute(SESSIONS_SCHEMA)
-    cur = conn.execute("DELETE FROM admin_sessions WHERE token_hash != ?",
-                       (token_hash(keep_token),))
+def revoke_other_sessions(conn, keep_sid):
+    _sessions_ensure(conn)
+    cur = conn.execute("DELETE FROM admin_sessions WHERE sid != ?",
+                       (keep_sid,))
     return cur.rowcount
 
 
 def revoke_all_sessions(conn):
-    conn.execute(SESSIONS_SCHEMA)
+    _sessions_ensure(conn)
     cur = conn.execute("DELETE FROM admin_sessions")
     return cur.rowcount
+
 
 
 def _fmt_ts(epoch):
@@ -2623,7 +2638,7 @@ def cmd_sessions_revoke(args):
         row = revoke_session_by_id(conn, args.id)
     if row is None:
         sys.exit(f"no unique live session with id prefix {args.id!r}")
-    print(f"revoked session {row['token_hash'][:12]} ({row['kind']}, "
+    print(f"revoked session {row['sid'][:12]} ({row['kind']}, "
           f"created {_fmt_ts(row['created_at'])})")
 
 

@@ -17,12 +17,16 @@ Configuration:
   XMAGIC_HOME changes the base directory (default ~/.xmagic).
 
 Login:
-  `xmagic login` opens the browser on the node's /cli-auth page; the
+  `xmagic login` generates an ephemeral ECDH keypair and opens the
+  browser on the node's /cli-auth page with its public half. The
   Passkey ceremony happens there (first visit can also register the
-  admin passkey). The page hands a one-time code back to a loopback
-  listener this CLI runs, the CLI exchanges it for a session token, and
-  the token is stored - never in a URL, never in the config file.
-  Sessions live in ~/.xmagic/sessions/<node>.json (mode 600).
+  admin passkey); once the page holds an encrypted web session it
+  mints a CLI session bound to this CLI's public key inside that
+  channel, and only public values (the session id and the server's
+  public key) come back to the CLI's loopback listener - the CLI
+  derives the session key locally, and every later API call is an
+  encrypted envelope under it. Sessions live in
+  ~/.xmagic/sessions/<node>.json (mode 600).
   --session-file PATH on `login` saves elsewhere; the same flag (or
   XMAGIC_SESSION_FILE) on any other command selects which stored
   session to use - that is what makes batch management of many nodes
@@ -37,8 +41,9 @@ Keys:
   mints and registers in one step.
 
 Update:
-  `xmagic update` replaces this file with the latest version from
-  the repository (XMAGIC_UPDATE_URL or --from overrides the source).
+  `xmagic update` replaces this file with the copy bundled with the
+  selected node, byte-compared by hash (XMAGIC_UPDATE_URL or --from
+  overrides the source).
   The download is version-checked and self-tested (--version probe)
   before it lands; the previous file is kept next to it as .bak.
 
@@ -48,6 +53,7 @@ Exit codes: 0 ok, 1 API/server error, 2 config/usage error,
 import argparse
 import base64
 import hashlib
+import hmac
 import http.server
 import json
 import os
@@ -147,37 +153,194 @@ def load_session(args, name, url):
     return session
 
 
-def save_session(args, name, url, token, expires_at):
+def save_session(args, name, url, sid, key_b64, expires_at):
     path = session_path(args, name, url)
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
-        json.dump({"node": name, "url": url, "token": token,
+        json.dump({"node": name, "url": url, "id": sid, "key": key_b64,
                    "expires_at": expires_at}, f, indent=2)
     os.replace(tmp, path)
     os.chmod(path, 0o600)
     return path
 
 
+# ------------------------------------------------------- session crypto
+# Mirrors the node's session crypto (admin.py): ephemeral P-256
+# ECDH, HKDF-SHA256 over the shared secret, and an AEAD envelope
+# (HMAC-SHA256 counter-mode keystream + encrypt-then-MAC) for every
+# authenticated API call. The session id is a public lookup key;
+# the derived key in the session file is the actual credential.
+
+_P = 0xFFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF
+_A = _P - 3
+_N = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+_G = (0x6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296,
+      0x4FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5)
+_CURVE_B = 0x5AC635D8AA3A93E7B3EBBD55769886BC651D06B0CC53B0F63BCE3C3E27D2604B
+
+
+def _b64u_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+def _b64u_decode(text: str) -> bytes:
+    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+
+
+def _ec_add(p1, p2):
+    if p1 is None:
+        return p2
+    if p2 is None:
+        return p1
+    x1, y1 = p1
+    x2, y2 = p2
+    if x1 == x2 and (y1 + y2) % _P == 0:
+        return None
+    if p1 == p2:
+        slope = (3 * x1 * x1 + _A) * pow(2 * y1, -1, _P) % _P
+    else:
+        slope = (y2 - y1) * pow(x2 - x1, -1, _P) % _P
+    x3 = (slope * slope - x1 - x2) % _P
+    return x3, (slope * (x1 - x3) - y1) % _P
+
+
+def _ec_mul(k, point):
+    result = None
+    addend = point
+    while k:
+        if k & 1:
+            result = _ec_add(result, addend)
+        addend = _ec_add(addend, addend)
+        k >>= 1
+    return result
+
+
+def _ec_pub_bytes(point):
+    x, y = point
+    return b"\x04" + x.to_bytes(32, "big") + y.to_bytes(32, "big")
+
+
+def _ec_point_from_pub(pub: bytes):
+    if len(pub) != 65 or pub[0] != 0x04:
+        raise ValueError("ecdh public key must be an uncompressed P-256 point")
+    x = int.from_bytes(pub[1:33], "big")
+    y = int.from_bytes(pub[33:65], "big")
+    if (y * y - (x * x * x + _A * x + _CURVE_B)) % _P != 0:
+        raise ValueError("ecdh public key is not on the P-256 curve")
+    return x, y
+
+
+def _ec_keypair():
+    priv = secrets.randbelow(_N - 1) + 1
+    return priv, _ec_pub_bytes(_ec_mul(priv, _G))
+
+
+def _hkdf_sha256(ikm, salt, info, length=32):
+    prk = hmac.new(salt, ikm, hashlib.sha256).digest()
+    out, block, counter = b"", b"", 1
+    while len(out) < length:
+        block = hmac.new(prk, block + info + bytes([counter]),
+                         hashlib.sha256).digest()
+        out += block
+        counter += 1
+    return out[:length]
+
+
+def derive_session_key(own_pub: bytes, own_priv: int, peer_pub: bytes) -> bytes:
+    shared = _ec_mul(own_priv, _ec_point_from_pub(peer_pub))
+    return _hkdf_sha256(shared[0].to_bytes(32, "big"),
+                        own_pub + peer_pub, b"xmagic session key v1")
+
+
+def _env_keys(master):
+    return (hmac.new(master, b"xmagic enc", hashlib.sha256).digest(),
+            hmac.new(master, b"xmagic mac", hashlib.sha256).digest())
+
+
+def _keystream(enc_key, nonce, length):
+    out, counter = b"", 0
+    while len(out) < length:
+        out += hmac.new(enc_key, nonce + counter.to_bytes(4, "big"),
+                        hashlib.sha256).digest()
+        counter += 1
+    return out[:length]
+
+
+def _aad(sid, method, path):
+    return f"{sid}\n{method}\n{path}".encode()
+
+
+def seal_envelope(master, aad: bytes, plaintext: bytes) -> str:
+    enc_key, mac_key = _env_keys(master)
+    nonce = secrets.token_bytes(16)
+    ks = _keystream(enc_key, nonce, len(plaintext))
+    ct = bytes(a ^ b for a, b in zip(plaintext, ks))
+    tag = hmac.new(mac_key, aad + nonce + ct, hashlib.sha256).digest()[:16]
+    return _b64u_encode(nonce + tag + ct)
+
+
+def open_envelope(master, aad: bytes, blob: str) -> bytes:
+    raw = _b64u_decode(blob)
+    nonce, tag, ct = raw[:16], raw[16:32], raw[32:]
+    enc_key, mac_key = _env_keys(master)
+    want = hmac.new(mac_key, aad + nonce + ct, hashlib.sha256).digest()[:16]
+    if not hmac.compare_digest(tag, want):
+        raise ValueError("encrypted envelope failed authentication")
+    ks = _keystream(enc_key, nonce, len(ct))
+    return bytes(a ^ b for a, b in zip(ct, ks))
+
+
+def _wrap_body(obj):
+    return json.dumps({"t": int(time.time()), "body": obj}).encode()
+
+
 # ------------------------------------------------------------ API client
 
 class Api:
-    def __init__(self, url, token=None):
+    """One node's admin API. With a session, every call is an
+    encrypted envelope under the session key; without one, only the
+    public bootstrap endpoints are reachable (update checks)."""
+
+    def __init__(self, url, session=None):
         self.url = url.rstrip("/")
-        self.token = token
+        self.sid = session["id"] if session else None
+        self.master = _b64u_decode(session["key"]) if session else None
+
+    def _decrypt(self, method, path, payload):
+        if self.master is not None and isinstance(payload, dict) \
+                and "e" in payload:
+            plain = open_envelope(self.master,
+                                  _aad(self.sid, method, path), payload["e"])
+            return json.loads(plain)["body"]
+        return payload
 
     def call(self, method, path, body=None):
-        data = json.dumps(body).encode() if body is not None else None
-        req = urllib.request.Request(self.url + path, data=data, method=method)
+        req = urllib.request.Request(self.url + path, method=method)
         req.add_header("Content-Type", "application/json")
-        if self.token:
-            req.add_header("Cookie", f"xmagic_session={self.token}")
+        data = None
+        if self.sid:
+            req.add_header("X-Session-Id", self.sid)
+            if method == "GET":
+                req.add_header("X-Enc", seal_envelope(
+                    self.master, _aad(self.sid, method, path),
+                    _wrap_body({})))
+            else:
+                data = json.dumps({"e": seal_envelope(
+                    self.master, _aad(self.sid, method, path),
+                    _wrap_body(body or {}))}).encode()
+        elif body is not None:
+            data = json.dumps(body).encode()
+        if data is not None:
+            req.data = data
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
-                return json.loads(resp.read() or b"{}")
+                return self._decrypt(method, path,
+                                     json.loads(resp.read() or b"{}"))
         except urllib.error.HTTPError as exc:
             try:
-                message = json.loads(exc.read()).get("error", exc.reason)
+                message = self._decrypt(
+                    method, path, json.loads(exc.read())).get("error", exc.reason)
             except Exception:
                 message = exc.reason
             if exc.code == 401:
@@ -192,7 +355,7 @@ def authed_api(args):
     cfg, _ = load_config(args)
     name, url = resolve_node(args, cfg)
     session = load_session(args, name, url)
-    return Api(url, session["token"]), name, url
+    return Api(url, session), name, url
 
 
 def emit(args, payload, human):
@@ -231,8 +394,8 @@ class _CallbackHandler(http.server.BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         query = {k: v[0] for k, v in
                  urllib.parse.parse_qs(parsed.query).items()}
-        if parsed.path != "/callback" or "code" not in query \
-                or "state" not in query:
+        if parsed.path != "/callback" or "sid" not in query \
+                or "spub" not in query or "state" not in query:
             # Not the handoff: a favicon fetch, a browser probe, a
             # restored completion tab re-requesting its page. Answer
             # and keep waiting - a stray request must not pose as the
@@ -262,12 +425,14 @@ def cmd_login(args):
     cfg, _ = load_config(args)
     name, url = resolve_node(args, cfg)
     state = secrets.token_urlsafe(16)
+    priv, pub = _ec_keypair()
     _CallbackHandler.result = None
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _CallbackHandler)
     port = server.server_address[1]
     callback = f"http://127.0.0.1:{port}/callback"
     auth_url = (url.rstrip("/") + "/cli-auth?" + urllib.parse.urlencode(
-        {"callback": callback, "state": state}))
+        {"callback": callback, "state": state,
+         "cli_pub": _b64u_encode(pub)}))
     opened = False
     if not args.no_browser:
         opened = webbrowser.open(auth_url)
@@ -284,14 +449,18 @@ def cmd_login(args):
         die(EXIT_AUTH, "timed out waiting for the browser login")
     if result.get("state") != state:
         die(EXIT_AUTH, "state mismatch in the login callback - aborting")
-    if not result.get("code"):
-        die(EXIT_AUTH, f"login callback carried no code: {result}")
-    exchanged = Api(url).call("POST", "/api/cli-exchange", {
-        "code": result["code"],
-        "label": f"xmagic-cli on {socket.gethostname()}"})
-    path = save_session(args, name, url, exchanged["token"], exchanged["expires_at"])
-    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(exchanged["expires_at"]))
-    print(f"logged in to {name or url}; session saved to {path} (expires {when})")
+    if not result.get("sid") or not result.get("spub"):
+        die(EXIT_AUTH, f"login callback carried no session material: {result}")
+    try:
+        master = derive_session_key(pub, priv, _b64u_decode(result["spub"]))
+        expires_at = int(result.get("exp") or 0)
+    except Exception as exc:
+        die(EXIT_AUTH, f"could not derive the session key: {exc}")
+    path = save_session(args, name, url, result["sid"],
+                        _b64u_encode(master), expires_at)
+    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(expires_at))
+    print(f"logged in to {name or url}; encrypted session saved to {path} "
+          f"(expires {when})")
 
 
 def cmd_passkey_replace(args):
@@ -331,9 +500,9 @@ def cmd_logout(args):
     if os.path.exists(path):
         try:
             with open(path) as f:
-                token = json.load(f).get("token")
-            if token:
-                Api(url, token).call("POST", "/api/logout", {})
+                session = json.load(f)
+            if session.get("id") and session.get("key"):
+                Api(url, session).call("POST", "/api/logout", {})
         except SystemExit:
             pass
         os.remove(path)

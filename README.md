@@ -110,10 +110,17 @@ and upstream records to keep them distinct upstream.
 - **Sessions last 1 week by default**, adjustable in Settings
   (1-2160 hours) from web or CLI; it only affects newly issued
   sessions.
-- Sessions are stored as SHA-256 hashes of the token (never the raw
-  token). The console's Sessions page lists each session's id, type
-  (web/cli), origin, creation and expiry, and can **revoke one** or
-  **revoke all others**; the CLIs can too (below).
+- Sessions are key-bound, not bearer tokens: signing in runs an
+  ECDH exchange inside the Passkey ceremony - the WebAuthn challenge
+  is SHA-256 over a random nonce and both sides' ephemeral public
+  keys, so the Passkey signature itself covers the key exchange -
+  and every API call afterwards travels encrypted under the derived
+  session key. The session id is only a lookup key. Session rows
+  hold the derived key (it cannot be hashed; the server needs it to
+  decrypt), so live sessions are key material. The console's
+  Sessions page lists each session's id, type (web/cli), origin,
+  creation and expiry, and can **revoke one** or **revoke all
+  others**; the CLIs can too (below).
 
 ### Settings (including render-level configuration)
 
@@ -193,17 +200,26 @@ python3 xmagic.py keys list        # SSH keys usable here: ~/.ssh, ~/.xmagic/key
 python3 xmagic.py keys generate alice   # mint an ed25519 pair under ~/.xmagic/keys
 python3 xmagic.py users add alice --ssh-key alice   # register one of those keys as her credential
 python3 xmagic.py users add bob --ssh-key-generate  # mint + register in one step
-python3 xmagic.py update           # update this CLI to the latest version from the repo
+python3 xmagic.py update           # sync this CLI with the selected node's bundled copy
 ```
 
 - The node registry lives in `~/.xmagic/config.json`. Target
   resolution order: **CLI flags > environment > config file**
   (`--node` / `--url` > `XMAGIC_NODE` / `XMAGIC_URL` > the config's
   current). Global flags are accepted before or after the subcommand.
-- Login flow: the CLI starts a temporary loopback listener and sends
-  the browser to the node's `/cli-auth` page for the Passkey ceremony;
-  the page returns a one-time code, which the CLI exchanges for the
-  real session token - the token never appears in any URL.
+- Login flow: the CLI generates an ephemeral ECDH keypair, starts
+  a temporary loopback listener (127.0.0.1, random port) and sends
+  the browser to the node's `/cli-auth` page, passing the callback
+  address, a one-time state marker and its public key as parameters.
+  The page runs the Passkey ceremony; once it holds an encrypted
+  web session (an existing one counts - no new ceremony then), it
+  asks the node, inside that encrypted channel, to mint a CLI
+  session bound to the CLI's public key, then calls the loopback
+  callback with only public values (the session id and the server's
+  public key). The CLI derives the session key locally: the key
+  never travels anywhere and is never fetched from the server, so
+  the browser and the CLI may well reach different members of a
+  cluster - only the session row in the shared database crosses.
 - Sessions are stored in `~/.xmagic/sessions/<node>.json` (0600) by
   default; `login --session-file <path>` stores to a chosen file and
   other commands select it with the same flag (or
@@ -486,7 +502,9 @@ suits light self-use; for the full gateway use a VPS + compose.
 - `data/users.db` holds recoverable protocol secrets (Xray needs
   them), mode 600; when backing up the machine, treat it and
   `data/ssh_client_keys/` as key material - do not share them.
-  Session tokens are stored hashed only and are not in this category.
+  Live session keys are stored in it as well (a session key cannot
+  be hashed - the server needs it to decrypt), so live sessions are
+  key material too.
 - The `proxy` account in the sshd container is unlocked but permits
   public-key login only (`passwd -u` in the Dockerfile).
 

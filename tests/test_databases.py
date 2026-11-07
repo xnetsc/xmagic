@@ -147,11 +147,11 @@ def part_a():
 # ------------------------------------------------- part B: dialect units
 def part_b():
     sess_sql = ("INSERT OR REPLACE INTO admin_sessions"
-                " (token_hash, kind, label, created_at, expires_at)"
-                " VALUES (?,?,?,?,?)")
+                " (sid, key, client_pub, server_pub, kind, label,"
+                " created_at, expires_at) VALUES (?,?,?,?,?,?,?,?)")
     pg = users_mod.DB(None, "postgres")._translate(sess_sql)
     check("B pg session upsert translation",
-          "ON CONFLICT (token_hash) DO UPDATE SET" in pg
+          "ON CONFLICT (sid) DO UPDATE SET" in pg
           and "excluded.kind" in pg and "%s" in pg and "?" not in pg, pg)
     my = users_mod.DB(None, "mysql")._translate(sess_sql)
     check("B mysql session upsert translation",
@@ -190,8 +190,8 @@ def part_b():
     check("B mysql settings key becomes VARCHAR",
           "`key` VARCHAR(255) PRIMARY KEY" in set_my, set_my)
     sess_my = users_mod.DB._translate_ddl(users_mod.SESSIONS_SCHEMA, "mysql")
-    check("B mysql session token becomes VARCHAR",
-          "token_hash VARCHAR(255) PRIMARY KEY" in sess_my, sess_my)
+    check("B mysql session id becomes VARCHAR",
+          "sid VARCHAR(255) PRIMARY KEY" in sess_my, sess_my)
     masked = users_mod.mask_target(
         "postgres", "postgresql://u:secretpw@h:5432/db")
     check("B mask_target hides the DSN password",
@@ -270,10 +270,10 @@ def part_d():
         return proc.returncode, proc.stdout, proc.stderr
 
     try:
-        _, opts = browser.call("POST", "/api/register/options", {})
-        status, body = browser.call(
-            "POST", "/api/register/verify",
-            auth.attestation(opts["challenge"], "localhost", origin))
+        _, opts = browser.options("register")
+        status, body = browser.verify(
+            "register", auth.attestation(opts["challenge"], "localhost",
+                                         origin))
         check("D register admin passkey", status == 200, str(body))
 
         status, body = browser.call("GET", "/api/databases")

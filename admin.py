@@ -46,6 +46,7 @@ Environment:
 """
 import base64
 import hashlib
+import hmac
 import http.server
 import ipaddress
 import json
@@ -228,6 +229,104 @@ def ecdsa_verify(pub_xy, signature_der: bytes, message: bytes) -> bool:
     return point is not None and point[0] % _N == r
 
 
+# ------------------------------------------------------- session crypto
+# Sessions are key-bound, not token-bound. During the passkey
+# ceremony the client contributes an ephemeral P-256 public key with
+# its options request; the server answers with its own ephemeral
+# public key and a challenge that binds both shares:
+#     challenge = SHA-256(nonce || client_pub || server_pub)
+# so the passkey signature covers both ECDH shares (the client
+# recomputes the challenge from the nonce and refuses a mismatch).
+# The session key is HKDF-SHA256 over the ECDH shared secret, and
+# every authenticated API call then travels in an AEAD envelope
+# keyed by it: HMAC-SHA256 in counter mode as the keystream plus
+# encrypt-then-MAC - a construction every client here (browser
+# WebCrypto, the pure-Python CLI) can implement from hash/HMAC
+# primitives alone. The session id is a public lookup key, not a
+# credential: without the key, requests can neither be produced
+# nor read.
+
+_CURVE_B = 0x5AC635D8AA3A93E7B3EBBD55769886BC651D06B0CC53B0F63BCE3C3E27D2604B
+
+
+def _ec_pub_bytes(point):
+    x, y = point
+    return b"\x04" + x.to_bytes(32, "big") + y.to_bytes(32, "big")
+
+
+def _ec_point_from_pub(pub: bytes):
+    if len(pub) != 65 or pub[0] != 0x04:
+        raise ApiError(400, "ecdh public key must be an uncompressed P-256 point")
+    x = int.from_bytes(pub[1:33], "big")
+    y = int.from_bytes(pub[33:65], "big")
+    if (y * y - (x * x * x + _A * x + _CURVE_B)) % _P != 0:
+        raise ApiError(400, "ecdh public key is not on the P-256 curve")
+    return x, y
+
+
+def _ec_keypair():
+    priv = secrets.randbelow(_N - 1) + 1
+    return priv, _ec_pub_bytes(_ec_mul(priv, _G))
+
+
+def _hkdf_sha256(ikm, salt, info, length=32):
+    prk = hmac.new(salt, ikm, hashlib.sha256).digest()
+    out, block, counter = b"", b"", 1
+    while len(out) < length:
+        block = hmac.new(prk, block + info + bytes([counter]),
+                         hashlib.sha256).digest()
+        out += block
+        counter += 1
+    return out[:length]
+
+
+def derive_session_key(client_pub: bytes, server_priv: int,
+                       server_pub: bytes) -> bytes:
+    shared = _ec_mul(server_priv, _ec_point_from_pub(client_pub))
+    return _hkdf_sha256(shared[0].to_bytes(32, "big"),
+                        client_pub + server_pub,
+                        b"xmagic session key v1")
+
+
+def _env_keys(master):
+    return (hmac.new(master, b"xmagic enc", hashlib.sha256).digest(),
+            hmac.new(master, b"xmagic mac", hashlib.sha256).digest())
+
+
+def _keystream(enc_key, nonce, length):
+    out, counter = b"", 0
+    while len(out) < length:
+        out += hmac.new(enc_key, nonce + counter.to_bytes(4, "big"),
+                        hashlib.sha256).digest()
+        counter += 1
+    return out[:length]
+
+
+def seal_envelope(master, aad: bytes, plaintext: bytes) -> str:
+    enc_key, mac_key = _env_keys(master)
+    nonce = secrets.token_bytes(16)
+    ks = _keystream(enc_key, nonce, len(plaintext))
+    ct = bytes(a ^ b for a, b in zip(plaintext, ks))
+    tag = hmac.new(mac_key, aad + nonce + ct, hashlib.sha256).digest()[:16]
+    return b64u_encode(nonce + tag + ct)
+
+
+def open_envelope(master, aad: bytes, blob: str) -> bytes:
+    try:
+        raw = b64u_decode(blob)
+        nonce, tag, ct = raw[:16], raw[16:32], raw[32:]
+        if len(nonce) != 16 or len(tag) != 16:
+            raise ValueError("short envelope")
+    except Exception:
+        raise ApiError(401, "malformed encrypted envelope")
+    enc_key, mac_key = _env_keys(master)
+    want = hmac.new(mac_key, aad + nonce + ct, hashlib.sha256).digest()[:16]
+    if not hmac.compare_digest(tag, want):
+        raise ApiError(401, "encrypted envelope failed authentication")
+    ks = _keystream(enc_key, nonce, len(ct))
+    return bytes(a ^ b for a, b in zip(ct, ks))
+
+
 # ---------------------------------------------------------------- WebAuthn
 
 def parse_auth_data(auth_data: bytes):
@@ -281,99 +380,123 @@ def check_auth_data_basics(auth, require_uv=True):
 # ------------------------------------------------------------ state stores
 
 _lock = threading.Lock()
-_challenges = {}  # token -> (purpose, expires_at)
-_cli_codes = {}   # one-time handoff code -> expires_at
-_cli_replace_tickets = {}  # passkey-replace ticket -> {expires, initiator_hash, done}
+_challenges = {}  # challenge -> {purpose, expires, ecdh}
+_seen_envelopes = {}  # sid -> {envelope hash: seen_at} (anti-replay)
+_cli_replace_tickets = {}  # passkey-replace ticket -> {expires, initiator_sid, done}
 
 
-def new_challenge(purpose: str) -> bytes:
-    raw = secrets.token_bytes(32)
+def new_challenge(purpose: str, client_pub_b64=None):
+    """Issue a WebAuthn challenge -> (challenge_bytes, ecdh_public).
+    With a client ECDH public key the challenge binds both shares:
+    SHA-256(nonce || client_pub || server_pub); the ceremony state
+    (both pubs, the nonce, the server's ephemeral private) stays
+    server-side until verify pops it. ecdh_public is the part the
+    options response may show: {server_pub, nonce}."""
+    ecdh = None
+    if client_pub_b64:
+        client_pub = b64u_decode(client_pub_b64)
+        _ec_point_from_pub(client_pub)  # validate before binding to it
+        server_priv, server_pub = _ec_keypair()
+        nonce = secrets.token_bytes(32)
+        raw = hashlib.sha256(nonce + client_pub + server_pub).digest()
+        ecdh = {"client_pub": client_pub_b64,
+                "server_pub": b64u_encode(server_pub),
+                "nonce": b64u_encode(nonce), "_priv": server_priv}
+    else:
+        raw = secrets.token_bytes(32)
     with _lock:
-        _challenges[b64u_encode(raw)] = (purpose, time.time() + CHALLENGE_TTL)
-    return raw
+        _challenges[b64u_encode(raw)] = {
+            "purpose": purpose, "expires": time.time() + CHALLENGE_TTL,
+            "ecdh": ecdh}
+    public = None
+    if ecdh:
+        public = {"server_pub": ecdh["server_pub"], "nonce": ecdh["nonce"]}
+    return raw, public
 
 
 def take_challenge(raw: bytes, purpose: str):
+    """Pop a ceremony; returns its ECDH state (dict or None)."""
     key = b64u_encode(raw)
     with _lock:
         entry = _challenges.pop(key, None)
-    if entry is None or entry[0] != purpose or entry[1] < time.time():
+    if entry is None or entry["purpose"] != purpose \
+            or entry["expires"] < time.time():
         raise ApiError(400, "challenge expired or unknown - retry the ceremony")
+    return entry["ecdh"]
 
 
-def new_session(kind: str = "web", label=None) -> str:
-    """Mint a session. Sessions are stored in the DB keyed by the
-    token's SHA-256 (see users.py), so they survive console restarts
-    and every interface can list and revoke them."""
-    token = secrets.token_urlsafe(32)
+def establish_session(kind: str, label, ecdh) -> dict:
+    """Turn a passkey ceremony's ECDH state into a stored key-bound
+    session. Sessions live in the DB (users.py), so they survive
+    console restarts and every interface can list and revoke them."""
+    if ecdh is None:
+        raise ApiError(400, "the ceremony did not negotiate a session key")
+    master = derive_session_key(b64u_decode(ecdh["client_pub"]),
+                                ecdh["_priv"],
+                                b64u_decode(ecdh["server_pub"]))
+    sid = secrets.token_urlsafe(24)
     with admin_db() as conn:
-        users_mod.mint_session(conn, token, kind, label, session_ttl_seconds())
-    return token
+        expires = users_mod.mint_session_keyed(
+            conn, sid, b64u_encode(master), ecdh["client_pub"],
+            ecdh["server_pub"], kind, label, session_ttl_seconds())
+    return {"id": sid, "server_pub": ecdh["server_pub"],
+            "expires_at": expires}
 
 
-def session_valid(token) -> bool:
-    if not token:
-        return False
+def establish_cli_session(client_pub_b64, label) -> dict:
+    """Key exchange for a CLI session, run inside an already
+    encrypted channel (that channel's session is the authentication):
+    the CLI contributed its ephemeral public key, the server answers
+    with its own, and both sides derive the same session key. No
+    passkey ceremony and no challenge are involved here."""
+    client_pub = b64u_decode(client_pub_b64 or "")
+    _ec_point_from_pub(client_pub)
+    server_priv, server_pub = _ec_keypair()
+    master = derive_session_key(client_pub, server_priv, server_pub)
+    sid = secrets.token_urlsafe(24)
     with admin_db() as conn:
-        return users_mod.find_session(conn, token) is not None
+        expires = users_mod.mint_session_keyed(
+            conn, sid, b64u_encode(master), b64u_encode(client_pub),
+            b64u_encode(server_pub), "cli", label, session_ttl_seconds())
+    return {"id": sid, "server_pub": b64u_encode(server_pub),
+            "expires_at": expires}
+
+
+def api_create_cli_session(body):
+    label = (body.get("label") or "")[:80] or None
+    return establish_cli_session(body.get("client_pub"), label)
 
 
 # ------------------------------------------------------------ CLI handoff
 # The xmagic CLI logs in by opening the browser at /cli-auth on this
-# console. After the passkey ceremony, the page asks for a one-time code
-# (bound to a loopback callback the CLI is listening on) and redirects
-# the browser to it; the CLI exchanges the code for a session token over
-# a direct API call, so the long-lived token never appears in a URL.
-
-CLI_CODE_TTL = 120
-
-
-def cli_token_request(body, ):
-    callback = body.get("callback") or ""
-    state = body.get("state") or ""
-    from urllib.parse import urlparse
-    parsed = urlparse(callback)
-    if parsed.scheme != "http" or parsed.hostname not in ("127.0.0.1", "localhost", "::1"):
-        raise ApiError(400, "callback must be an http loopback URL")
-    if not state:
-        raise ApiError(400, "state is required")
-    code = secrets.token_urlsafe(24)
-    with _lock:
-        _cli_codes[code] = time.time() + CLI_CODE_TTL
-    sep = "&" if "?" in callback else "?"
-    return {"redirect": f"{callback}{sep}code={code}&state={state}"}
-
-
-def cli_exchange(body):
-    code = body.get("code") or ""
-    with _lock:
-        expires = _cli_codes.pop(code, None)
-    if expires is None or expires < time.time():
-        raise ApiError(401, "handoff code unknown or expired")
-    token = new_session("cli", (body.get("label") or "")[:80] or None)
-    return {"token": token,
-            "expires_at": int(time.time()) + session_ttl_seconds()}
-
+# console, carrying the CLI's ephemeral ECDH public key. Once the
+# page holds an encrypted web session (an existing one, or one it
+# just established with the passkey ceremony), it asks this server
+# - inside that encrypted channel - to mint a CLI session bound to
+# the CLI's public key (api_create_cli_session), and redirects the
+# browser to the CLI's loopback callback with only public values:
+# the new session id and the server's public key. The CLI derives
+# the session key with its private half; the key itself never
+# travels anywhere.
 
 CLI_REPLACE_TTL = 300
 
 
-def cli_replace_ticket(initiator_token):
+def cli_replace_ticket(initiator_sid):
     """Issue a one-time ticket authorizing a browser ceremony that
     replaces the admin passkey on behalf of the calling (CLI) session.
-    The ticket remembers the initiator's session hash so the ceremony
+    The ticket remembers the initiator's session id so the ceremony
     can keep exactly that session alive while revoking all others -
     the same semantics as a console-side replacement, with the CLI
     session treated as the operator's current one."""
     ticket = secrets.token_urlsafe(24)
-    initiator_hash = users_mod.token_hash(initiator_token)
     with _lock:
         for stale in [t for t, v in _cli_replace_tickets.items()
-                      if v["initiator_hash"] == initiator_hash]:
+                      if v["initiator_sid"] == initiator_sid]:
             del _cli_replace_tickets[stale]
         _cli_replace_tickets[ticket] = {
             "expires": time.time() + CLI_REPLACE_TTL,
-            "initiator_hash": initiator_hash, "done": False}
+            "initiator_sid": initiator_sid, "done": False}
     return {"ticket": ticket, "expires_in": CLI_REPLACE_TTL}
 
 
@@ -392,32 +515,31 @@ def cli_replace_status(ticket):
 
 def cli_replace_verify(ticket, body):
     """Complete a CLI-issued passkey replacement: verify the
-    attestation (registration_verify), swap the credential, mint the
-    browser's fresh session and revoke every other session except
-    that one and the initiating CLI session. Returns
-    (result, fresh_browser_token)."""
+    attestation (registration_verify), swap the credential, establish
+    the browser's fresh key-bound session and revoke every other
+    session except that one and the initiating CLI session."""
     entry = _live_replace_ticket(ticket)
     if entry["done"]:
         raise ApiError(400, "this replace ticket was already used")
-    result = registration_verify(body, allow_replace=True)
-    token = new_session("web", body.get("label"))
+    result, ecdh = registration_verify(body, allow_replace=True)
+    session = establish_session("web", body.get("label"), ecdh)
     with admin_db() as conn:
         conn.execute(
-            "DELETE FROM admin_sessions WHERE token_hash NOT IN (?, ?)",
-            (users_mod.token_hash(token), entry["initiator_hash"]))
+            "DELETE FROM admin_sessions WHERE sid NOT IN (?, ?)",
+            (session["id"], entry["initiator_sid"]))
     with _lock:
         entry["done"] = True
-    return result, token
+    result["session"] = session
+    return result
 
 
-def api_list_sessions(current_token):
+def api_list_sessions(current_sid):
     with admin_db() as conn:
         rows = users_mod.list_session_rows(conn)
-    current_id = users_mod.session_id_of(current_token) if current_token else None
     out = []
     for r in rows:
         entry = users_mod.session_row_dict(r)
-        entry["current"] = entry["id"] == current_id
+        entry["current"] = r["sid"] == current_sid
         out.append(entry)
     return {"sessions": out}
 
@@ -427,19 +549,19 @@ def api_revoke_session(id_prefix):
         row = users_mod.revoke_session_by_id(conn, id_prefix)
     if row is None:
         raise ApiError(404, f"no unique live session with id {id_prefix!r}")
-    return {"revoked": row["token_hash"][:12]}
+    return {"revoked": row["sid"][:12]}
 
 
-def api_revoke_others(current_token):
+def api_revoke_others(current_sid):
     with admin_db() as conn:
-        n = users_mod.revoke_other_sessions(conn, current_token)
+        n = users_mod.revoke_other_sessions(conn, current_sid)
     return {"revoked_others": n}
 
 
-def drop_session(token):
-    if token:
+def drop_session(sid):
+    if sid:
         with admin_db() as conn:
-            users_mod.revoke_token(conn, token)
+            users_mod.revoke_sid(conn, sid)
 
 
 # ------------------------------------------------------------ admin DB
@@ -465,13 +587,14 @@ def store_credential(conn, credential_id: bytes, x: int, y: int, sign_count: int
 
 # ------------------------------------------------------------ ceremonies
 
-def registration_options(allow_replace=False):
+def registration_options(body=None, allow_replace=False):
     with admin_db() as conn:
         if load_credential(conn) is not None and not allow_replace:
             raise ApiError(403, "an admin passkey is already registered; "
                                 "registration is closed (users.py admin-reset reopens it)")
-    challenge = new_challenge("register")
-    return {
+    challenge, ecdh_public = new_challenge(
+        "register", (body or {}).get("ecdh_pub"))
+    out = {
         "challenge": b64u_encode(challenge),
         "rp": {"id": RP_ID, "name": RP_NAME},
         "user": {"id": b64u_encode(secrets.token_bytes(32)),
@@ -482,6 +605,9 @@ def registration_options(allow_replace=False):
         "attestation": "none",
         "timeout": 60000,
     }
+    if ecdh_public:
+        out["ecdh"] = ecdh_public
+    return out
 
 
 def registration_verify(body, allow_replace=False):
@@ -496,7 +622,7 @@ def registration_verify(body, allow_replace=False):
         raw_challenge = b64u_decode(client_json.get("challenge", ""))
     except Exception as exc:
         raise ApiError(400, f"malformed registration response: {exc}")
-    take_challenge(raw_challenge, "register")
+    ecdh = take_challenge(raw_challenge, "register")
     check_client_data(client_data, "webauthn.create", raw_challenge)
     auth = parse_auth_data(attestation["authData"])
     check_auth_data_basics(auth)
@@ -525,22 +651,26 @@ def registration_verify(body, allow_replace=False):
     with admin_db() as conn:
         store_credential(conn, auth["credential_id"], x, y,
                          auth["sign_count"], body.get("label"))
-    return {"status": "registered"}
+    return {"status": "registered"}, ecdh
 
 
-def login_options():
+def login_options(body=None):
     with admin_db() as conn:
         cred = load_credential(conn)
     if cred is None:
         raise ApiError(404, "no admin passkey registered yet")
-    challenge = new_challenge("login")
-    return {
+    challenge, ecdh_public = new_challenge(
+        "login", (body or {}).get("ecdh_pub"))
+    out = {
         "challenge": b64u_encode(challenge),
         "rpId": RP_ID,
         "allowCredentials": [{"type": "public-key", "id": cred["credential_id"]}],
         "userVerification": "required",
         "timeout": 60000,
     }
+    if ecdh_public:
+        out["ecdh"] = ecdh_public
+    return out
 
 
 def login_verify(body):
@@ -559,7 +689,7 @@ def login_verify(body):
         raw_challenge = b64u_decode(client_json.get("challenge", ""))
     except Exception as exc:
         raise ApiError(400, f"malformed assertion: {exc}")
-    take_challenge(raw_challenge, "login")
+    ecdh = take_challenge(raw_challenge, "login")
     check_client_data(client_data, "webauthn.get", raw_challenge)
     auth = parse_auth_data(auth_data)
     check_auth_data_basics(auth)
@@ -573,7 +703,7 @@ def login_verify(body):
     with admin_db() as conn:
         conn.execute("UPDATE admin_credentials SET sign_count = ? WHERE id = 1",
                      (auth["sign_count"],))
-    return {"status": "ok"}
+    return {"status": "ok"}, ecdh
 
 
 # ------------------------------------------------------------ render/apply
@@ -1011,17 +1141,59 @@ class Handler(http.server.BaseHTTPRequestHandler):
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
 
     # -- plumbing
-    def _send_json(self, status, payload, cookie=None):
-        raw = json.dumps(payload).encode()
+    def _send_json(self, status, payload):
+        row = getattr(self, "_session_row", None)
+        if row is not None:
+            wrapped = json.dumps(
+                {"t": int(time.time()), "body": payload}).encode()
+            raw = json.dumps({"e": seal_envelope(
+                b64u_decode(row["key"]), self._aad(), wrapped)}).encode()
+        else:
+            raw = json.dumps(payload).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(raw)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
-        if cookie is not None:
-            self.send_header("Set-Cookie", cookie)
         self.end_headers()
         self.wfile.write(raw)
+
+    def _aad(self):
+        row = getattr(self, "_session_row", None)
+        sid = row["sid"] if row else ""
+        path = self.path.split("?", 1)[0]
+        return f"{sid}\n{self.command}\n{path}".encode()
+
+    def _unwrap(self, blob):
+        """Decrypt one envelope from the request's session and return
+        its body. Enforces the timestamp window and one-use envelopes
+        (a captured request cannot be replayed)."""
+        row = self._session_row
+        plain = open_envelope(b64u_decode(row["key"]), self._aad(), blob)
+        try:
+            wrapped = json.loads(plain)
+            ts, body = int(wrapped["t"]), wrapped["body"]
+        except Exception:
+            raise ApiError(400, "envelope payload is not a wrapped JSON body")
+        if abs(int(time.time()) - ts) > 300:
+            raise ApiError(401, "envelope timestamp outside the accepted window")
+        marker = hashlib.sha256(blob.encode()).hexdigest()
+        now = time.time()
+        with _lock:
+            seen = _seen_envelopes.setdefault(row["sid"], {})
+            for k in [k for k, v in seen.items() if v < now - 600]:
+                del seen[k]
+            if marker in seen:
+                raise ApiError(401, "envelope replay detected")
+            seen[marker] = now
+        return body
+
+    def _load_session_row(self):
+        sid = self.headers.get("X-Session-Id")
+        if not sid:
+            return None
+        with admin_db() as conn:
+            return users_mod.find_session_by_sid(conn, sid)
 
     def _send_html(self, html):
         raw = html.encode()
@@ -1059,36 +1231,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _body(self):
-        length = int(self.headers.get("Content-Length") or 0)
-        if length > 1 << 20:
-            raise ApiError(413, "request body too large")
-        raw = self.rfile.read(length) if length else b"{}"
-        try:
-            return json.loads(raw)
-        except ValueError:
-            raise ApiError(400, "request body is not JSON")
-
-    def _session_token(self):
-        for part in (self.headers.get("Cookie") or "").split(";"):
-            part = part.strip()
-            if part.startswith("xmagic_session="):
-                return part.split("=", 1)[1]
-        return None
-
     def _require_auth(self):
-        if not session_valid(self._session_token()):
+        if getattr(self, "_session_row", None) is None:
             raise ApiError(401, "not logged in")
 
     def _check_origin(self):
         origin = self.headers.get("Origin")
         if origin is not None and origin not in ORIGINS:
             raise ApiError(403, f"origin {origin!r} not allowed")
-
-    @staticmethod
-    def _session_cookie(token):
-        return (f"xmagic_session={token}; HttpOnly; SameSite=Strict; Path=/;"
-                f" Max-Age={session_ttl_seconds()}")
 
     # -- routing
     def do_GET(self):
@@ -1126,19 +1276,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
             with admin_db() as conn:
                 registered = load_credential(conn) is not None
             self._send_json(200, {"registered": registered,
-                                  "authenticated": session_valid(self._session_token()),
                                   "rp_id": RP_ID})
             return
         if path == "/cli/xmagic.py":
             self._send_cli_script()
             return
-        self._require_auth()
+        # Authenticated GETs: the session id names the session, an
+        # encrypted proof envelope (of an empty body, bound to this
+        # method+path) proves the caller holds its key.
+        self._session_row = self._load_session_row()
+        if self._session_row is None:
+            raise ApiError(401, "not logged in")
+        proof = self.headers.get("X-Enc")
+        if not proof:
+            raise ApiError(401, "missing encrypted session proof")
+        self._unwrap(proof)
         if path == "/api/state":
             self._send_json(200, api_state())
         elif path == "/api/settings":
             self._send_json(200, api_get_settings())
         elif path == "/api/sessions":
-            self._send_json(200, api_list_sessions(self._session_token()))
+            self._send_json(200, api_list_sessions(self._session_row["sid"]))
         elif path == "/api/users":
             self._send_json(200, api_list_users())
         elif path == "/api/upstreams":
@@ -1153,65 +1311,91 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _route_post(self):
         path = self.path.split("?", 1)[0]
         self._check_origin()
-        body = self._body() if self.headers.get("Content-Length") else {}
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > 1 << 20:
+            raise ApiError(413, "request body too large")
+        raw = self.rfile.read(length) if length else b""
+        # A request carrying a session id speaks ONLY in envelopes:
+        # decrypt before dispatch; anything else is a bootstrap call
+        # (options/verify ceremonies) whose body is plain JSON.
+        self._session_row = self._load_session_row()
+        body = {}
+        bootstrap = path in ("/api/register/options", "/api/register/verify",
+                             "/api/login/options", "/api/login/verify")
+        if self.headers.get("X-Session-Id") and self._session_row is None \
+                and not bootstrap:
+            # a dead session id on an authenticated call: hard fail.
+            # On a bootstrap call it is simply ignored, so a client
+            # holding a stale id can always sign in again.
+            raise ApiError(401, "session expired or revoked - sign in again")
+        if self._session_row is not None:
+            try:
+                envelope = json.loads(raw) if raw else {}
+            except ValueError:
+                raise ApiError(400, "request body is not JSON")
+            if not isinstance(envelope, dict) or "e" not in envelope:
+                raise ApiError(400, "session requests must be encrypted envelopes")
+            body = self._unwrap(envelope["e"])
+        elif raw:
+            try:
+                body = json.loads(raw)
+            except ValueError:
+                raise ApiError(400, "request body is not JSON")
+        ua_label = (self.headers.get("User-Agent") or "")[:80] or None
         if path == "/api/register/options":
-            allow = session_valid(self._session_token())
-            self._send_json(200, registration_options(allow_replace=allow))
+            allow = self._session_row is not None
+            self._send_json(200, registration_options(body, allow_replace=allow))
             return
         if path == "/api/register/verify":
-            authed = session_valid(self._session_token())
+            authed = self._session_row is not None
             with admin_db() as conn:
                 had_credential = load_credential(conn) is not None
-            result = registration_verify(body, allow_replace=authed)
-            token = new_session("web", (self.headers.get("User-Agent") or "")[:80] or None)
+            result, ecdh = registration_verify(body, allow_replace=authed)
+            session = establish_session("web", ua_label, ecdh)
             if had_credential:
                 # The passkey was replaced: every other session dies here.
                 with admin_db() as conn:
-                    users_mod.revoke_other_sessions(conn, token)
-            self._send_json(200, result, cookie=self._session_cookie(token))
+                    users_mod.revoke_other_sessions(conn, session["id"])
+            result["session"] = session
+            self._send_json(200, result)
             return
         if path == "/api/login/options":
-            self._send_json(200, login_options())
+            self._send_json(200, login_options(body))
             return
         if path == "/api/login/verify":
-            result = login_verify(body)
-            token = new_session("web", (self.headers.get("User-Agent") or "")[:80] or None)
-            self._send_json(200, result, cookie=self._session_cookie(token))
-            return
-        if path == "/api/cli-exchange":
-            self._send_json(200, cli_exchange(body))
+            result, ecdh = login_verify(body)
+            result["session"] = establish_session("web", ua_label, ecdh)
+            self._send_json(200, result)
             return
         self._require_auth()
         if path == "/api/keys/generate":
             self._send_json(200, api_generate_keypair(body))
             return
-        if path == "/api/cli-token":
-            self._send_json(200, cli_token_request(body))
+        if path == "/api/cli/sessions":
+            self._send_json(201, api_create_cli_session(body))
             return
         if path == "/api/cli-replace-ticket":
-            self._send_json(200, cli_replace_ticket(self._session_token()))
+            self._send_json(200, cli_replace_ticket(self._session_row["sid"]))
             return
         if path == "/api/cli-replace-status":
             self._send_json(200, cli_replace_status(body.get("ticket")))
             return
         if path == "/api/cli-replace-options":
             _live_replace_ticket(body.get("ticket"))
-            self._send_json(200, registration_options(allow_replace=True))
+            self._send_json(200, registration_options(body, allow_replace=True))
             return
         if path == "/api/cli-replace-verify":
-            result, fresh = cli_replace_verify(body.get("ticket"), body)
-            self._send_json(200, result, cookie=self._session_cookie(fresh))
+            self._send_json(200, cli_replace_verify(body.get("ticket"), body))
             return
         if path == "/api/logout":
-            drop_session(self._session_token())
-            self._send_json(200, {"status": "logged out"},
-                            cookie="xmagic_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0")
+            drop_session(self._session_row["sid"])
+            self._send_json(200, {"status": "logged out"})
         elif path == "/api/apply":
             self._send_json(200, {"applied": apply_changes()})
         elif path == "/api/settings":
             self._send_json(200, api_set_settings(body))
         elif path == "/api/sessions/revoke-others":
-            self._send_json(200, api_revoke_others(self._session_token()))
+            self._send_json(200, api_revoke_others(self._session_row["sid"]))
         elif path.startswith("/api/sessions/"):
             sid, _, action = path[len("/api/sessions/"):].partition("/")
             if action != "revoke":
@@ -1653,13 +1837,126 @@ const b64uToBuf = s => { s = s.replace(/-/g, "+").replace(/_/g, "/");
 const bufToB64u = buf => { let bin = ""; const b = new Uint8Array(buf);
   for (const c of b) bin += String.fromCharCode(c);
   return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); };
+// ---- session crypto: ECDH (P-256) + HKDF-SHA256 + HMAC envelope.
+// Mirrors the server's session crypto (admin.py). The passkey
+// challenge binds both ECDH public keys
+// (SHA-256(nonce || client_pub || server_pub)); the client checks
+// that binding before letting the authenticator sign. After the
+// ceremony, every API call is an encrypted envelope keyed by the
+// derived session key; the session id alone proves nothing.
+const enc8 = new TextEncoder(), dec8 = new TextDecoder();
+const concatBytes = (...parts) => { let n = 0; for (const p of parts) n += p.length;
+  const out = new Uint8Array(n); let o = 0;
+  for (const p of parts) { out.set(p, o); o += p.length; } return out; };
+const b64uToBytes = s => new Uint8Array(b64uToBuf(s));
+const bytesToB64u = b => bufToB64u(b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength));
+let __sess = null;  // {id, master: Uint8Array, expires_at}
+function sessSave() {
+  if (__sess) sessionStorage.setItem("xmagic_session", JSON.stringify(
+    {id: __sess.id, key: bytesToB64u(__sess.master), expires_at: __sess.expires_at}));
+  else sessionStorage.removeItem("xmagic_session");
+}
+function sessLoad() {
+  __sess = null;
+  try { const s = JSON.parse(sessionStorage.getItem("xmagic_session") || "null");
+    if (s && s.expires_at > Math.floor(Date.now() / 1000))
+      __sess = {id: s.id, master: b64uToBytes(s.key), expires_at: s.expires_at};
+  } catch (e) { __sess = null; }
+  return __sess;
+}
+async function hmacSha(key, data) {
+  const k = await crypto.subtle.importKey("raw", key,
+    {name: "HMAC", hash: "SHA-256"}, false, ["sign"]);
+  return new Uint8Array(await crypto.subtle.sign("HMAC", k, data));
+}
+async function hkdfSha(ikm, salt, info, len) {
+  const prk = await hmacSha(salt, ikm);
+  let out = new Uint8Array(0), prev = new Uint8Array(0);
+  for (let c = 1; out.length < len; c++) {
+    prev = await hmacSha(prk, concatBytes(prev, info, new Uint8Array([c])));
+    out = concatBytes(out, prev);
+  }
+  return out.slice(0, len);
+}
+async function keystreamSha(encKey, nonce, len) {
+  let out = new Uint8Array(0);
+  for (let c = 0; out.length < len; c++) {
+    const ctr = new Uint8Array(4); new DataView(ctr.buffer).setUint32(0, c);
+    out = concatBytes(out, await hmacSha(encKey, concatBytes(nonce, ctr)));
+  }
+  return out.slice(0, len);
+}
+function aadFor(method, path) {
+  return enc8.encode((__sess ? __sess.id : "") + "\n" + method + "\n" + path);
+}
+async function sealEnvelope(method, path, payloadObj) {
+  const ek = await hmacSha(__sess.master, enc8.encode("xmagic enc"));
+  const mk = await hmacSha(__sess.master, enc8.encode("xmagic mac"));
+  const nonce = crypto.getRandomValues(new Uint8Array(16));
+  const plain = enc8.encode(JSON.stringify(
+    {t: Math.floor(Date.now() / 1000), body: payloadObj}));
+  const ks = await keystreamSha(ek, nonce, plain.length);
+  const ct = plain.map((b, i) => b ^ ks[i]);
+  const tag = (await hmacSha(mk, concatBytes(aadFor(method, path), nonce, ct))).slice(0, 16);
+  return bytesToB64u(concatBytes(nonce, tag, ct));
+}
+async function openEnvelope(method, path, blob) {
+  const raw = b64uToBytes(blob);
+  const nonce = raw.slice(0, 16), tag = raw.slice(16, 32), ct = raw.slice(32);
+  const ek = await hmacSha(__sess.master, enc8.encode("xmagic enc"));
+  const mk = await hmacSha(__sess.master, enc8.encode("xmagic mac"));
+  const want = (await hmacSha(mk, concatBytes(aadFor(method, path), nonce, ct))).slice(0, 16);
+  if (want.length !== tag.length || !want.every((b, i) => b === tag[i]))
+    throw new Error("服务器响应解密校验失败");
+  const ks = await keystreamSha(ek, nonce, ct.length);
+  return JSON.parse(dec8.decode(ct.map((b, i) => b ^ ks[i]))).body;
+}
 async function api(path, body) {
-  const r = await fetch(path, {method: body === undefined ? "GET" : "POST",
-    headers: {"Content-Type": "application/json"},
-    body: body === undefined ? undefined : JSON.stringify(body)});
+  const method = body === undefined ? "GET" : "POST";
+  const headers = {"Content-Type": "application/json"};
+  let payload;
+  if (__sess) {
+    headers["X-Session-Id"] = __sess.id;
+    if (method === "GET") headers["X-Enc"] = await sealEnvelope("GET", path, {});
+    else payload = JSON.stringify({e: await sealEnvelope("POST", path, body ?? {})});
+  } else if (body !== undefined) payload = JSON.stringify(body);
+  const r = await fetch(path, {method, headers, body: payload});
   const data = await r.json().catch(() => ({}));
+  if (__sess && data.e) {
+    const plain = await openEnvelope(method, path, data.e);
+    if (!r.ok) throw new Error(plain.error || ("HTTP " + r.status));
+    return plain;
+  }
   if (!r.ok) throw new Error(data.error || ("HTTP " + r.status));
-  return data; }
+  return data;
+}
+async function ecdhGenerate() {
+  return crypto.subtle.generateKey({name: "ECDH", namedCurve: "P-256"}, true, ["deriveBits"]);
+}
+async function ecdhPubBytes(kp) {
+  return new Uint8Array(await crypto.subtle.exportKey("raw", kp.publicKey));
+}
+async function checkChallengeBinding(opts, clientPubBytes) {
+  if (!opts.ecdh) throw new Error("服务器未协商会话密钥");
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256",
+    concatBytes(b64uToBytes(opts.ecdh.nonce), clientPubBytes,
+                b64uToBytes(opts.ecdh.server_pub))));
+  const given = b64uToBytes(opts.challenge);
+  if (digest.length !== given.length || !digest.every((b, i) => b === given[i]))
+    throw new Error("挑战值与 ECDH 公钥的绑定校验失败 - 已拒绝继续");
+}
+async function adoptSession(verifyRes, kp, clientPubBytes) {
+  const s = verifyRes.session;
+  const serverKey = await crypto.subtle.importKey("raw", b64uToBuf(s.server_pub),
+    {name: "ECDH", namedCurve: "P-256"}, false, []);
+  const bits = new Uint8Array(await crypto.subtle.deriveBits(
+    {name: "ECDH", public: serverKey}, kp.privateKey, 256));
+  const master = await hkdfSha(bits,
+    concatBytes(clientPubBytes, b64uToBytes(s.server_pub)),
+    enc8.encode("xmagic session key v1"), 32);
+  __sess = {id: s.id, master, expires_at: s.expires_at};
+  sessSave();
+}
 function appliedText(a) {
   if (!a) return "";
   let t = `已渲染：${a.users} 用户 / ${a.upstreams} 上级 / ${a.ssh_keys} SSH 公钥`;
@@ -1669,13 +1966,16 @@ function appliedText(a) {
   else t += "；已按需重启：" + Object.entries(a.restarted).map(([k, v]) => k + (v ? "✓" : "✗")).join(" ");
   return t; }
 async function refresh() {
+  const authed = !!sessLoad();
   const st = await api("/api/status");
   $("setup").classList.toggle("hidden", st.registered);
-  $("login").classList.toggle("hidden", !st.registered || st.authenticated);
-  $("auth-wrap").classList.toggle("hidden", st.authenticated);
-  $("console").classList.toggle("hidden", !st.authenticated);
-  if (!st.authenticated) return;
-  const s = await api("/api/state");
+  $("login").classList.toggle("hidden", !st.registered || authed);
+  $("auth-wrap").classList.toggle("hidden", authed);
+  $("console").classList.toggle("hidden", !authed);
+  if (!authed) return;
+  let s;
+  try { s = await api("/api/state"); }
+  catch (e) { __sess = null; sessSave(); return refresh(); }
   const restartName = s.restart_via === "container" ? "整容器重启" : s.restart_via === "docker" ? "Docker socket" : "无（仅渲染）";
   $("state-line").textContent =
     `状态：${s.enabled_users} 启用用户 / ${s.enabled_upstreams} 上级 / ${s.enabled_routes} 路由` +
@@ -1764,28 +2064,37 @@ async function refresh() {
       <button class="sm danger" data-act="remove" data-route="${r.id}">删除</button></div></td></tr>`).join("");
 }
 $("btn-register").onclick = async () => { try {
-  const opts = await api("/api/register/options", {});
+  const kp = await ecdhGenerate();
+  const clientPub = await ecdhPubBytes(kp);
+  const opts = await api("/api/register/options", {ecdh_pub: bytesToB64u(clientPub)});
+  await checkChallengeBinding(opts, clientPub);
   opts.challenge = b64uToBuf(opts.challenge); opts.user.id = b64uToBuf(opts.user.id);
   const cred = await navigator.credentials.create({publicKey: opts});
   const res = await api("/api/register/verify", {id: cred.id,
     response: {attestationObject: bufToB64u(cred.response.attestationObject),
                clientDataJSON: bufToB64u(cred.response.clientDataJSON)},
     label: navigator.userAgent.slice(0, 80)});
+  await adoptSession(res, kp, clientPub);
   msg("管理员 Passkey 注册成功：" + res.status, true); refresh();
 } catch (e) { msg(String(e)); } };
 $("btn-login").onclick = async () => { try {
-  const opts = await api("/api/login/options", {});
+  const kp = await ecdhGenerate();
+  const clientPub = await ecdhPubBytes(kp);
+  const opts = await api("/api/login/options", {ecdh_pub: bytesToB64u(clientPub)});
+  await checkChallengeBinding(opts, clientPub);
   opts.challenge = b64uToBuf(opts.challenge);
   opts.allowCredentials = opts.allowCredentials.map(c => ({...c, id: b64uToBuf(c.id)}));
   const cred = await navigator.credentials.get({publicKey: opts});
-  await api("/api/login/verify", {id: cred.id,
+  const res = await api("/api/login/verify", {id: cred.id,
     response: {authenticatorData: bufToB64u(cred.response.authenticatorData),
                clientDataJSON: bufToB64u(cred.response.clientDataJSON),
                signature: bufToB64u(cred.response.signature),
                userHandle: cred.response.userHandle ? bufToB64u(cred.response.userHandle) : null}});
-  msg("登录成功", true); refresh();
+  await adoptSession(res, kp, clientPub);
+  msg("登录成功（会话已加密）", true); refresh();
 } catch (e) { msg(String(e)); } };
-$("btn-logout").onclick = async () => { await api("/api/logout", {}); refresh(); };
+$("btn-logout").onclick = async () => { try { await api("/api/logout", {}); } catch (e) {}
+  __sess = null; sessSave(); refresh(); };
 $("btn-revoke-others").onclick = async () => { try {
   const r = await api("/api/sessions/revoke-others", {});
   msg(`已撤销其它 ${r.revoked_others} 个会话`, true); refresh();
@@ -2182,6 +2491,7 @@ button{padding:.5rem 1rem;cursor:pointer}.err{color:#b00020;white-space:pre-wrap
 <script>
 const params = new URLSearchParams(location.search);
 const callback = params.get("callback"), state = params.get("state");
+const cliPub = params.get("cli_pub");
 const msgEl = document.getElementById("msg"), btn = document.getElementById("btn");
 const b64uToBuf = s => { s = s.replace(/-/g, "+").replace(/_/g, "/");
   s += "=".repeat((4 - s.length % 4) % 4);
@@ -2190,54 +2500,185 @@ const b64uToBuf = s => { s = s.replace(/-/g, "+").replace(/_/g, "/");
 const bufToB64u = buf => { let bin = ""; const b = new Uint8Array(buf);
   for (const c of b) bin += String.fromCharCode(c);
   return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); };
+// ---- session crypto: ECDH (P-256) + HKDF-SHA256 + HMAC envelope.
+// Mirrors the server's session crypto (admin.py). The passkey
+// challenge binds both ECDH public keys
+// (SHA-256(nonce || client_pub || server_pub)); the client checks
+// that binding before letting the authenticator sign. After the
+// ceremony, every API call is an encrypted envelope keyed by the
+// derived session key; the session id alone proves nothing.
+const enc8 = new TextEncoder(), dec8 = new TextDecoder();
+const concatBytes = (...parts) => { let n = 0; for (const p of parts) n += p.length;
+  const out = new Uint8Array(n); let o = 0;
+  for (const p of parts) { out.set(p, o); o += p.length; } return out; };
+const b64uToBytes = s => new Uint8Array(b64uToBuf(s));
+const bytesToB64u = b => bufToB64u(b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength));
+let __sess = null;  // {id, master: Uint8Array, expires_at}
+function sessSave() {
+  if (__sess) sessionStorage.setItem("xmagic_session", JSON.stringify(
+    {id: __sess.id, key: bytesToB64u(__sess.master), expires_at: __sess.expires_at}));
+  else sessionStorage.removeItem("xmagic_session");
+}
+function sessLoad() {
+  __sess = null;
+  try { const s = JSON.parse(sessionStorage.getItem("xmagic_session") || "null");
+    if (s && s.expires_at > Math.floor(Date.now() / 1000))
+      __sess = {id: s.id, master: b64uToBytes(s.key), expires_at: s.expires_at};
+  } catch (e) { __sess = null; }
+  return __sess;
+}
+async function hmacSha(key, data) {
+  const k = await crypto.subtle.importKey("raw", key,
+    {name: "HMAC", hash: "SHA-256"}, false, ["sign"]);
+  return new Uint8Array(await crypto.subtle.sign("HMAC", k, data));
+}
+async function hkdfSha(ikm, salt, info, len) {
+  const prk = await hmacSha(salt, ikm);
+  let out = new Uint8Array(0), prev = new Uint8Array(0);
+  for (let c = 1; out.length < len; c++) {
+    prev = await hmacSha(prk, concatBytes(prev, info, new Uint8Array([c])));
+    out = concatBytes(out, prev);
+  }
+  return out.slice(0, len);
+}
+async function keystreamSha(encKey, nonce, len) {
+  let out = new Uint8Array(0);
+  for (let c = 0; out.length < len; c++) {
+    const ctr = new Uint8Array(4); new DataView(ctr.buffer).setUint32(0, c);
+    out = concatBytes(out, await hmacSha(encKey, concatBytes(nonce, ctr)));
+  }
+  return out.slice(0, len);
+}
+function aadFor(method, path) {
+  return enc8.encode((__sess ? __sess.id : "") + "\n" + method + "\n" + path);
+}
+async function sealEnvelope(method, path, payloadObj) {
+  const ek = await hmacSha(__sess.master, enc8.encode("xmagic enc"));
+  const mk = await hmacSha(__sess.master, enc8.encode("xmagic mac"));
+  const nonce = crypto.getRandomValues(new Uint8Array(16));
+  const plain = enc8.encode(JSON.stringify(
+    {t: Math.floor(Date.now() / 1000), body: payloadObj}));
+  const ks = await keystreamSha(ek, nonce, plain.length);
+  const ct = plain.map((b, i) => b ^ ks[i]);
+  const tag = (await hmacSha(mk, concatBytes(aadFor(method, path), nonce, ct))).slice(0, 16);
+  return bytesToB64u(concatBytes(nonce, tag, ct));
+}
+async function openEnvelope(method, path, blob) {
+  const raw = b64uToBytes(blob);
+  const nonce = raw.slice(0, 16), tag = raw.slice(16, 32), ct = raw.slice(32);
+  const ek = await hmacSha(__sess.master, enc8.encode("xmagic enc"));
+  const mk = await hmacSha(__sess.master, enc8.encode("xmagic mac"));
+  const want = (await hmacSha(mk, concatBytes(aadFor(method, path), nonce, ct))).slice(0, 16);
+  if (want.length !== tag.length || !want.every((b, i) => b === tag[i]))
+    throw new Error("服务器响应解密校验失败");
+  const ks = await keystreamSha(ek, nonce, ct.length);
+  return JSON.parse(dec8.decode(ct.map((b, i) => b ^ ks[i]))).body;
+}
 async function api(path, body) {
-  const r = await fetch(path, {method: body === undefined ? "GET" : "POST",
-    headers: {"Content-Type": "application/json"},
-    body: body === undefined ? undefined : JSON.stringify(body)});
+  const method = body === undefined ? "GET" : "POST";
+  const headers = {"Content-Type": "application/json"};
+  let payload;
+  if (__sess) {
+    headers["X-Session-Id"] = __sess.id;
+    if (method === "GET") headers["X-Enc"] = await sealEnvelope("GET", path, {});
+    else payload = JSON.stringify({e: await sealEnvelope("POST", path, body ?? {})});
+  } else if (body !== undefined) payload = JSON.stringify(body);
+  const r = await fetch(path, {method, headers, body: payload});
   const data = await r.json().catch(() => ({}));
+  if (__sess && data.e) {
+    const plain = await openEnvelope(method, path, data.e);
+    if (!r.ok) throw new Error(plain.error || ("HTTP " + r.status));
+    return plain;
+  }
   if (!r.ok) throw new Error(data.error || ("HTTP " + r.status));
-  return data; }
+  return data;
+}
+async function ecdhGenerate() {
+  return crypto.subtle.generateKey({name: "ECDH", namedCurve: "P-256"}, true, ["deriveBits"]);
+}
+async function ecdhPubBytes(kp) {
+  return new Uint8Array(await crypto.subtle.exportKey("raw", kp.publicKey));
+}
+async function checkChallengeBinding(opts, clientPubBytes) {
+  if (!opts.ecdh) throw new Error("服务器未协商会话密钥");
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256",
+    concatBytes(b64uToBytes(opts.ecdh.nonce), clientPubBytes,
+                b64uToBytes(opts.ecdh.server_pub))));
+  const given = b64uToBytes(opts.challenge);
+  if (digest.length !== given.length || !digest.every((b, i) => b === given[i]))
+    throw new Error("挑战值与 ECDH 公钥的绑定校验失败 - 已拒绝继续");
+}
+async function adoptSession(verifyRes, kp, clientPubBytes) {
+  const s = verifyRes.session;
+  const serverKey = await crypto.subtle.importKey("raw", b64uToBuf(s.server_pub),
+    {name: "ECDH", namedCurve: "P-256"}, false, []);
+  const bits = new Uint8Array(await crypto.subtle.deriveBits(
+    {name: "ECDH", public: serverKey}, kp.privateKey, 256));
+  const master = await hkdfSha(bits,
+    concatBytes(clientPubBytes, b64uToBytes(s.server_pub)),
+    enc8.encode("xmagic session key v1"), 32);
+  __sess = {id: s.id, master, expires_at: s.expires_at};
+  sessSave();
+}
 function fail(e) { msgEl.className = "err"; msgEl.textContent = String(e); }
 async function handoff() {
-  msgEl.textContent = "已通过 Passkey 验证，正在把登录状态交回命令行…";
-  const res = await api("/api/cli-token", {callback, state});
-  location.replace(res.redirect);
+  // Inside this page's encrypted web session, mint a CLI session
+  // bound to the CLI's own ECDH public key; only public values
+  // (session id + server public key) travel back over the loopback
+  // callback - the CLI derives the session key locally.
+  msgEl.textContent = "已在加密通道内为命令行协商独立的会话密钥…";
+  const res = await api("/api/cli/sessions", {client_pub: cliPub,
+    label: "cli " + navigator.userAgent.slice(0, 60)});
+  const q = new URLSearchParams({sid: res.id, spub: res.server_pub, state,
+    exp: res.expires_at});
+  location.replace(callback + (callback.includes("?") ? "&" : "?") + q.toString());
 }
 async function start() {
-  if (!callback || !state) {
-    fail("这个页面需要从 xmagic 命令行发起（缺少 callback/state 参数）。");
+  if (!callback || !state || !cliPub) {
+    fail("这个页面需要从 xmagic 命令行发起（缺少 callback/state/cli_pub 参数）。");
     return;
   }
   try {
     const st = await api("/api/status");
-    if (st.authenticated) { await handoff(); return; }
+    if (sessLoad()) {
+      try { await api("/api/state"); await handoff(); return; }
+      catch (e) { __sess = null; sessSave(); }
+    }
     btn.style.display = "";
     if (!st.registered) {
       msgEl.textContent = "这个节点还没有管理员 Passkey。先注册（第一个注册的即为管理员），随后自动交回命令行。";
       btn.textContent = "注册管理员 Passkey 并继续";
       btn.onclick = async () => { try {
-        const opts = await api("/api/register/options", {});
+        const kp = await ecdhGenerate();
+        const clientPub = await ecdhPubBytes(kp);
+        const opts = await api("/api/register/options", {ecdh_pub: bytesToB64u(clientPub)});
+        await checkChallengeBinding(opts, clientPub);
         opts.challenge = b64uToBuf(opts.challenge); opts.user.id = b64uToBuf(opts.user.id);
         const cred = await navigator.credentials.create({publicKey: opts});
-        await api("/api/register/verify", {id: cred.id,
+        const res = await api("/api/register/verify", {id: cred.id,
           response: {attestationObject: bufToB64u(cred.response.attestationObject),
                      clientDataJSON: bufToB64u(cred.response.clientDataJSON)},
           label: "cli-login " + navigator.userAgent.slice(0, 60)});
+        await adoptSession(res, kp, clientPub);
         await handoff();
       } catch (e) { fail(e); } };
     } else {
       msgEl.textContent = "请用管理员 Passkey 登录，登录后自动交回命令行。";
       btn.textContent = "用 Passkey 登录并继续";
       btn.onclick = async () => { try {
-        const opts = await api("/api/login/options", {});
+        const kp = await ecdhGenerate();
+        const clientPub = await ecdhPubBytes(kp);
+        const opts = await api("/api/login/options", {ecdh_pub: bytesToB64u(clientPub)});
+        await checkChallengeBinding(opts, clientPub);
         opts.challenge = b64uToBuf(opts.challenge);
         opts.allowCredentials = opts.allowCredentials.map(c => ({...c, id: b64uToBuf(c.id)}));
         const cred = await navigator.credentials.get({publicKey: opts});
-        await api("/api/login/verify", {id: cred.id,
+        const res = await api("/api/login/verify", {id: cred.id,
           response: {authenticatorData: bufToB64u(cred.response.authenticatorData),
                      clientDataJSON: bufToB64u(cred.response.clientDataJSON),
                      signature: bufToB64u(cred.response.signature),
                      userHandle: cred.response.userHandle ? bufToB64u(cred.response.userHandle) : null}});
+        await adoptSession(res, kp, clientPub);
         await handoff();
       } catch (e) { fail(e); } };
     }
@@ -2268,13 +2709,126 @@ const b64uToBuf = s => { s = s.replace(/-/g, "+").replace(/_/g, "/");
 const bufToB64u = buf => { let bin = ""; const b = new Uint8Array(buf);
   for (const c of b) bin += String.fromCharCode(c);
   return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); };
+// ---- session crypto: ECDH (P-256) + HKDF-SHA256 + HMAC envelope.
+// Mirrors the server's session crypto (admin.py). The passkey
+// challenge binds both ECDH public keys
+// (SHA-256(nonce || client_pub || server_pub)); the client checks
+// that binding before letting the authenticator sign. After the
+// ceremony, every API call is an encrypted envelope keyed by the
+// derived session key; the session id alone proves nothing.
+const enc8 = new TextEncoder(), dec8 = new TextDecoder();
+const concatBytes = (...parts) => { let n = 0; for (const p of parts) n += p.length;
+  const out = new Uint8Array(n); let o = 0;
+  for (const p of parts) { out.set(p, o); o += p.length; } return out; };
+const b64uToBytes = s => new Uint8Array(b64uToBuf(s));
+const bytesToB64u = b => bufToB64u(b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength));
+let __sess = null;  // {id, master: Uint8Array, expires_at}
+function sessSave() {
+  if (__sess) sessionStorage.setItem("xmagic_session", JSON.stringify(
+    {id: __sess.id, key: bytesToB64u(__sess.master), expires_at: __sess.expires_at}));
+  else sessionStorage.removeItem("xmagic_session");
+}
+function sessLoad() {
+  __sess = null;
+  try { const s = JSON.parse(sessionStorage.getItem("xmagic_session") || "null");
+    if (s && s.expires_at > Math.floor(Date.now() / 1000))
+      __sess = {id: s.id, master: b64uToBytes(s.key), expires_at: s.expires_at};
+  } catch (e) { __sess = null; }
+  return __sess;
+}
+async function hmacSha(key, data) {
+  const k = await crypto.subtle.importKey("raw", key,
+    {name: "HMAC", hash: "SHA-256"}, false, ["sign"]);
+  return new Uint8Array(await crypto.subtle.sign("HMAC", k, data));
+}
+async function hkdfSha(ikm, salt, info, len) {
+  const prk = await hmacSha(salt, ikm);
+  let out = new Uint8Array(0), prev = new Uint8Array(0);
+  for (let c = 1; out.length < len; c++) {
+    prev = await hmacSha(prk, concatBytes(prev, info, new Uint8Array([c])));
+    out = concatBytes(out, prev);
+  }
+  return out.slice(0, len);
+}
+async function keystreamSha(encKey, nonce, len) {
+  let out = new Uint8Array(0);
+  for (let c = 0; out.length < len; c++) {
+    const ctr = new Uint8Array(4); new DataView(ctr.buffer).setUint32(0, c);
+    out = concatBytes(out, await hmacSha(encKey, concatBytes(nonce, ctr)));
+  }
+  return out.slice(0, len);
+}
+function aadFor(method, path) {
+  return enc8.encode((__sess ? __sess.id : "") + "\n" + method + "\n" + path);
+}
+async function sealEnvelope(method, path, payloadObj) {
+  const ek = await hmacSha(__sess.master, enc8.encode("xmagic enc"));
+  const mk = await hmacSha(__sess.master, enc8.encode("xmagic mac"));
+  const nonce = crypto.getRandomValues(new Uint8Array(16));
+  const plain = enc8.encode(JSON.stringify(
+    {t: Math.floor(Date.now() / 1000), body: payloadObj}));
+  const ks = await keystreamSha(ek, nonce, plain.length);
+  const ct = plain.map((b, i) => b ^ ks[i]);
+  const tag = (await hmacSha(mk, concatBytes(aadFor(method, path), nonce, ct))).slice(0, 16);
+  return bytesToB64u(concatBytes(nonce, tag, ct));
+}
+async function openEnvelope(method, path, blob) {
+  const raw = b64uToBytes(blob);
+  const nonce = raw.slice(0, 16), tag = raw.slice(16, 32), ct = raw.slice(32);
+  const ek = await hmacSha(__sess.master, enc8.encode("xmagic enc"));
+  const mk = await hmacSha(__sess.master, enc8.encode("xmagic mac"));
+  const want = (await hmacSha(mk, concatBytes(aadFor(method, path), nonce, ct))).slice(0, 16);
+  if (want.length !== tag.length || !want.every((b, i) => b === tag[i]))
+    throw new Error("服务器响应解密校验失败");
+  const ks = await keystreamSha(ek, nonce, ct.length);
+  return JSON.parse(dec8.decode(ct.map((b, i) => b ^ ks[i]))).body;
+}
 async function api(path, body) {
-  const r = await fetch(path, {method: body === undefined ? "GET" : "POST",
-    headers: {"Content-Type": "application/json"},
-    body: body === undefined ? undefined : JSON.stringify(body)});
+  const method = body === undefined ? "GET" : "POST";
+  const headers = {"Content-Type": "application/json"};
+  let payload;
+  if (__sess) {
+    headers["X-Session-Id"] = __sess.id;
+    if (method === "GET") headers["X-Enc"] = await sealEnvelope("GET", path, {});
+    else payload = JSON.stringify({e: await sealEnvelope("POST", path, body ?? {})});
+  } else if (body !== undefined) payload = JSON.stringify(body);
+  const r = await fetch(path, {method, headers, body: payload});
   const data = await r.json().catch(() => ({}));
+  if (__sess && data.e) {
+    const plain = await openEnvelope(method, path, data.e);
+    if (!r.ok) throw new Error(plain.error || ("HTTP " + r.status));
+    return plain;
+  }
   if (!r.ok) throw new Error(data.error || ("HTTP " + r.status));
-  return data; }
+  return data;
+}
+async function ecdhGenerate() {
+  return crypto.subtle.generateKey({name: "ECDH", namedCurve: "P-256"}, true, ["deriveBits"]);
+}
+async function ecdhPubBytes(kp) {
+  return new Uint8Array(await crypto.subtle.exportKey("raw", kp.publicKey));
+}
+async function checkChallengeBinding(opts, clientPubBytes) {
+  if (!opts.ecdh) throw new Error("服务器未协商会话密钥");
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256",
+    concatBytes(b64uToBytes(opts.ecdh.nonce), clientPubBytes,
+                b64uToBytes(opts.ecdh.server_pub))));
+  const given = b64uToBytes(opts.challenge);
+  if (digest.length !== given.length || !digest.every((b, i) => b === given[i]))
+    throw new Error("挑战值与 ECDH 公钥的绑定校验失败 - 已拒绝继续");
+}
+async function adoptSession(verifyRes, kp, clientPubBytes) {
+  const s = verifyRes.session;
+  const serverKey = await crypto.subtle.importKey("raw", b64uToBuf(s.server_pub),
+    {name: "ECDH", namedCurve: "P-256"}, false, []);
+  const bits = new Uint8Array(await crypto.subtle.deriveBits(
+    {name: "ECDH", public: serverKey}, kp.privateKey, 256));
+  const master = await hkdfSha(bits,
+    concatBytes(clientPubBytes, b64uToBytes(s.server_pub)),
+    enc8.encode("xmagic session key v1"), 32);
+  __sess = {id: s.id, master, expires_at: s.expires_at};
+  sessSave();
+}
 function fail(e) { msgEl.className = "err"; msgEl.textContent = String(e); }
 async function start() {
   if (!ticket) {
@@ -2291,23 +2845,31 @@ async function start() {
     btn.style.display = "";
     btn.textContent = "开始更换 Passkey";
     btn.onclick = async () => { try {
-      const lopts = await api("/api/login/options", {});
+      const lkp = await ecdhGenerate();
+      const lpub = await ecdhPubBytes(lkp);
+      const lopts = await api("/api/login/options", {ecdh_pub: bytesToB64u(lpub)});
+      await checkChallengeBinding(lopts, lpub);
       lopts.challenge = b64uToBuf(lopts.challenge);
       lopts.allowCredentials = lopts.allowCredentials.map(c => ({...c, id: b64uToBuf(c.id)}));
       const assertion = await navigator.credentials.get({publicKey: lopts});
-      await api("/api/login/verify", {id: assertion.id,
+      const lres = await api("/api/login/verify", {id: assertion.id,
         response: {authenticatorData: bufToB64u(assertion.response.authenticatorData),
                    clientDataJSON: bufToB64u(assertion.response.clientDataJSON),
                    signature: bufToB64u(assertion.response.signature),
                    userHandle: assertion.response.userHandle ? bufToB64u(assertion.response.userHandle) : null}});
+      await adoptSession(lres, lkp, lpub);
       msgEl.textContent = "身份已验证，请注册新 Passkey…";
-      const opts = await api("/api/cli-replace-options", {ticket});
+      const rkp = await ecdhGenerate();
+      const rpub = await ecdhPubBytes(rkp);
+      const opts = await api("/api/cli-replace-options", {ticket, ecdh_pub: bytesToB64u(rpub)});
+      await checkChallengeBinding(opts, rpub);
       opts.challenge = b64uToBuf(opts.challenge); opts.user.id = b64uToBuf(opts.user.id);
       const cred = await navigator.credentials.create({publicKey: opts});
-      await api("/api/cli-replace-verify", {ticket, id: cred.id,
+      const vres = await api("/api/cli-replace-verify", {ticket, id: cred.id,
         response: {attestationObject: bufToB64u(cred.response.attestationObject),
                    clientDataJSON: bufToB64u(cred.response.clientDataJSON)},
         label: "cli-replace " + navigator.userAgent.slice(0, 60)});
+      await adoptSession(vres, rkp, rpub);
       btn.style.display = "none";
       msgEl.textContent = "Passkey 已更换。今后请用新 Passkey 登录；可以关闭此页，回到命令行。";
     } catch (e) { fail(e); } };

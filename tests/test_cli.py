@@ -139,9 +139,9 @@ def main():
             except OSError:
                 time.sleep(0.2)
         auth = t.Authenticator()
-        _, opts = client.call("POST", "/api/register/options", {})
-        status, body = client.call("POST", "/api/register/verify",
-                                   auth.attestation(opts["challenge"], "localhost"))
+        _, opts = client.options("register")
+        status, body = client.verify(
+            "register", auth.attestation(opts["challenge"], "localhost"))
         check("console registration on CLI-built DB", status == 200, f"{status} {body}")
         _, body = client.call("GET", "/api/users")
         web_names = sorted(u["username"] for u in body["users"])
