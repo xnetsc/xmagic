@@ -1303,7 +1303,7 @@ td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
       <button data-nav="routes"><span class="dot"></span>目标路由</button>
       <button data-nav="settings"><span class="dot"></span>设置</button>
       <button data-nav="databases"><span class="dot"></span>数据库</button>
-      <button data-nav="sessions"><span class="dot"></span>登录会话</button>
+      <button data-nav="sessions"><span class="dot"></span>管理员会话</button>
     </nav>
     <div class="side-foot">Passkey 管理员会话</div>
   </aside>
@@ -1416,7 +1416,7 @@ td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
           <p class="sub">渲染级配置保存在数据库里，优先于部署时的环境变量；保存后自动重新渲染生效。</p>
           <form id="form-settings">
             <div class="form-grid">
-              <div><label>登录会话有效期（小时）</label>
+              <div><label>管理员会话有效期（小时）</label>
                 <input name="session_ttl_hours" type="number" min="1" max="2160"></div>
               <div><label>上级池策略</label><select name="upstream_strategy"></select></div>
               <div><label>新用户默认 SS 方法</label><select name="ss_method"></select></div>
@@ -1435,7 +1435,7 @@ td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
           <div class="divider">
             <p class="small" style="margin:0 0 .5rem"><span id="admin-line"></span></p>
             <button type="button" id="btn-replace">更换管理员 Passkey</button>
-            <span class="small">更换后，其它所有登录会话立即失效，本页面会切到新签发的会话。</span>
+            <span class="small">更换后，其它所有管理员会话立即失效，本页面会切到新签发的会话。</span>
           </div>
         </div>
       </section>
@@ -1477,7 +1477,7 @@ td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
 
       <section class="view" data-view="sessions">
         <div class="card">
-          <h2>登录会话</h2>
+          <h2>管理员会话</h2>
           <p class="sub">同一管理员可以有多个会话（不同浏览器、不同机器的 CLI）。「当前」是本页面正在用的会话；撤销它会立即退出本页面。</p>
           <div class="tbl-wrap"><table id="sessions-table"></table></div>
           <div class="form-actions">
@@ -1778,7 +1778,7 @@ $("form-settings").onsubmit = async e => { e.preventDefault();
   catch (err) { msg(String(err)); } };
 $("btn-replace").onclick = () => $("btn-register").onclick();
 const VIEW_TITLES = {overview: "概览", users: "代理用户", upstreams: "上级节点",
-  routes: "目标路由", settings: "设置", databases: "数据库", sessions: "登录会话"};
+  routes: "目标路由", settings: "设置", databases: "数据库", sessions: "管理员会话"};
 function switchView(name) {
   document.querySelectorAll(".view").forEach(v =>
     v.classList.toggle("active", v.dataset.view === name));
@@ -1911,7 +1911,7 @@ async function start() {
       fail("这个节点还没有管理员 Passkey，无法更换。");
       return;
     }
-    msgEl.textContent = "更换需要两步：先用当前 Passkey 验证身份，再注册新 Passkey。完成后，除发起更换的命令行会话和本页会话外，其余登录会话都会被撤销。";
+    msgEl.textContent = "更换需要两步：先用当前 Passkey 验证身份，再注册新 Passkey。完成后，除发起更换的命令行会话和本页会话外，其余管理员会话都会被撤销。";
     btn.style.display = "";
     btn.textContent = "开始更换 Passkey";
     btn.onclick = async () => { try {

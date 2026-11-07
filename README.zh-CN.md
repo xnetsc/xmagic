@@ -68,18 +68,18 @@ HTTP 代理（CONNECT）、VLESS-WS、VLESS（裸 TCP）、Trojan-WS、裸 Shado
 - Passkey 丢了没有网页找回通道：在节点上跑 `users.py admin-reset` 清掉凭证
   重新注册——能碰宿主机的人本来就拥有这台机器，这是刻意的破窗设计。
   还在登录状态时也可以在后台直接**更换 Passkey**（设置区）：更换完成的那一刻，
-  其它所有登录会话立即失效，本页面切到新签发的会话。
+  其它所有管理员会话立即失效，本页面切到新签发的会话。
 - **管理范围是全部业务数据，不只是新建**：代理用户（换密码、换 UUID、改 SSH
   公钥 / 分组 / SS 方法 / 备注、启停、删除）、上级（全部字段可编辑，不必删了
-  重加）、目标路由（可编辑）、设置与登录会话——每一项 Web 与两套 CLI 都有，
+  重加）、目标路由（可编辑）、设置与管理员会话——每一项 Web 与两套 CLI 都有，
   功能一一对应。
 
-### 登录会话
+### 管理员会话
 
 - 同一管理员可以同时有多个会话（多浏览器、多台机器的 CLI 登录都算）。
 - **会话默认有效期 1 周**，可在后台设置里改（1–2160 小时），Web / CLI 均可改，
   只影响新签发的会话。
-- 会话以令牌的 SHA-256 存在库里（原文不落库），后台的「登录会话」页能看到
+- 会话以令牌的 SHA-256 存在库里（原文不落库），后台的「管理员会话」页能看到
   每个会话的标识、类型（web/cli）、来源、创建与到期时间，并可**逐个撤销**
   或**撤销其它全部会话**；CLI 同样支持（见下）。
 
@@ -131,7 +131,7 @@ python3 xmagic.py login            # 自动拉起浏览器走 Passkey，登录�
 python3 xmagic.py users add alice
 python3 xmagic.py --node tokyo routes add --kind ip --pattern 1.1.1.1 --to intl
 python3 xmagic.py passkey replace  # 拉起浏览器：先用当前 Passkey 验证，再注册新 Passkey；保留本 CLI 会话，其余会话全部撤销
-python3 xmagic.py sessions list    # 看这个节点上的全部登录会话
+python3 xmagic.py sessions list    # 看这个节点上的全部管理员会话
 python3 xmagic.py sessions revoke <id>
 python3 xmagic.py upstreams edit b1 --port 8443      # 与 Web 编辑同一接口
 python3 xmagic.py users rotate-uuid alice
@@ -153,7 +153,7 @@ python3 xmagic.py settings set --upstream-strategy random --ss-method chacha20-i
 
 ## 数据库
 
-业务数据（用户、上级、路由、设置、管理员凭证、登录会话）默认存 SQLite
+业务数据（用户、上级、路由、设置、管理员凭证、管理员会话）默认存 SQLite
 （`./data/users.db`），也可以跑在 PostgreSQL 或 MySQL 上：
 
 - **多套配置，随时切换**：每个库是一套命名参数（sqlite 是文件路径，
@@ -161,7 +161,7 @@ python3 xmagic.py settings set --upstream-strategy random --ss-method chacha20-i
 - **表自动重建**：切到一个还没有表的空库（或对它执行测试）时，
   全部业务表自动按当前结构建好，不需要手工跑迁移脚本。
 - **跨库迁移**：任意两套配置之间可以整库复制全部业务表
-  （含管理员凭证与登录会话）；目标非空时默认拒绝，显式选覆盖才清表。
+  （含管理员凭证与管理员会话）；目标非空时默认拒绝，显式选覆盖才清表。
 - **配置本身存本地**：数据库配置是引导信息，存在节点本地的 SQLite
   文件里（默认 `./data/local.db`，可用 `XMAGIC_LOCAL_DB` 改位置），
   不进任何业务库——这样无论当前启用的是哪个库，节点总能找回全部配置。
@@ -172,7 +172,7 @@ python3 xmagic.py settings set --upstream-strategy random --ss-method chacha20-i
   （psycopg / PyMySQL）已装进 admin 镜像；脱离 Docker 单独跑 users.py 时
   需自行 `pip install "psycopg[binary]" pymysql`，只用 SQLite 不需要。
 
-注意：登录会话也在业务库里。迁移会把会话一并复制过去；只切换、不迁移
+注意：管理员会话也在业务库里。迁移会把会话一并复制过去；只切换、不迁移
 到一个没有你会话的库时，Web 与远程 CLI 都需要重新登录。
 
 ## WS 多路径
@@ -277,7 +277,7 @@ sshd / 分发器 / 隧道进程，对外仍只有 XRAY_PORT 一个端口，状�
 一个卷里。没有进程监控：**任意关键进程退出，入口脚本就把其余进程全部
 带走、整容器以该进程的状态码退出**，靠运行时的重启策略整体拉回。因此
 必须带重启策略运行；配置变更（apply）也是先渲染、再给网关进程发信号，
-借整容器重启生效（数秒中断，登录会话在库里、不受影响）。
+借整容器重启生效（数秒中断，管理员会话在库里、不受影响）。
 
 ```bash
 docker build -f Dockerfile.single -t xmagic-single .
