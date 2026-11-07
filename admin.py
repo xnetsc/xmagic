@@ -1035,6 +1035,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def _send_cli_script(self):
+        """Serve the remote CLI bundled with THIS deployment, so installs
+        and self-updates always match the running service byte for byte.
+        Public on purpose: installing the CLI is step one (no login can
+        exist yet) and the file is open source carrying no secret."""
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "xmagic.py")
+        try:
+            with open(p, "rb") as f:
+                data = f.read()
+        except OSError:
+            raise ApiError(404, "xmagic.py is not bundled with this deployment")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/x-python; charset=utf-8")
+        self.send_header("Content-Disposition",
+                         'attachment; filename="xmagic.py"')
+        self.send_header("X-Xmagic-Cli-Sha256",
+                         hashlib.sha256(data).hexdigest())
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
     def _body(self):
         length = int(self.headers.get("Content-Length") or 0)
         if length > 1 << 20:
@@ -1104,6 +1127,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send_json(200, {"registered": registered,
                                   "authenticated": session_valid(self._session_token()),
                                   "rp_id": RP_ID})
+            return
+        if path == "/cli/xmagic.py":
+            self._send_cli_script()
             return
         self._require_auth()
         if path == "/api/state":
@@ -1414,7 +1440,7 @@ td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
         <div class="card">
           <h2>远程 CLI</h2>
           <p class="sub">在自己的机器上安装单文件 CLI（纯 Python 标准库，不用 pip），装完把本节点加进去登录即可管理。</p>
-          <div class="cmd-row"><input id="cli-install" readonly value="mkdir -p ~/.local/bin && curl -fsSL https://raw.githubusercontent.com/xnetsc/xmagic/main/xmagic.py -o ~/.local/bin/xmagic && chmod +x ~/.local/bin/xmagic">
+          <div class="cmd-row"><input id="cli-install" readonly value="">
             <button type="button" id="btn-copy-install">复制</button></div>
           <div class="cmd-row"><input id="cli-onboard" readonly value="">
             <button type="button" id="btn-copy-onboard">复制</button></div>
@@ -1761,6 +1787,7 @@ document.addEventListener("click", async e => {
 $("btn-apply").onclick = async () => { try {
   const r = await api("/api/apply", {}); msg(appliedText(r.applied), true); refresh();
 } catch (e) { msg(String(e)); } };
+$("cli-install").value = "mkdir -p ~/.local/bin && curl -fsSL " + location.origin + "/cli/xmagic.py -o ~/.local/bin/xmagic && chmod +x ~/.local/bin/xmagic";
 $("cli-onboard").value = "xmagic node add main --url " + location.origin + " && xmagic login";
 function copyCmd(id, btn) { const el = $(id); el.select();
   const done = () => { btn.textContent = "已复制"; setTimeout(() => btn.textContent = "复制", 1500); };

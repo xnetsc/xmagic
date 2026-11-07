@@ -461,6 +461,23 @@ def main():
         finally:
             httpd.terminate()
 
+        # ---- self-update from the node itself: the installed CLI must
+        # end up byte-identical to the copy the deployment bundles
+        with open(copy_path, "w") as f:
+            f.write(cli_src)  # pristine again (the .bak still holds 1.1.0)
+        rc, out, err = cli_copy("update")
+        check("update from the node: already identical, nothing replaced",
+              rc == 0 and "identical" in out
+              and open(copy_path).read() == cli_src, err + out)
+        with open(copy_path, "a") as f:
+            f.write("\n# local drift\n")
+        rc, out, err = cli_copy("update", "--check")
+        check("update --check from the node reports content drift",
+              rc == 0 and "differs" in out, err + out)
+        rc, out, err = cli_copy("update")
+        check("update from the node re-aligns drifted bytes exactly",
+              rc == 0 and open(copy_path).read() == cli_src, err + out)
+
         rc, out, err = drive_login(cli_home, PORT_A, auth_a)
         saved = json.load(open(session_a))
         ttl = saved["expires_at"] - time.time()

@@ -11,7 +11,7 @@ FROM python:3.12-alpine
 # registry of database configs itself always stays in a local SQLite
 # file on the node.
 RUN pip install --no-cache-dir "psycopg[binary]" "pymysql"
-COPY users.py admin.py /app/
+COPY users.py admin.py xmagic.py /app/
 WORKDIR /app
 ENV PROXY_DB=/data/users.db \
     XMAGIC_ADMIN_BIND=0.0.0.0 \

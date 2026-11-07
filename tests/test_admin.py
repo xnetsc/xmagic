@@ -611,10 +611,23 @@ def main():
         conn.close()
         check("console page carries the copyable CLI install command",
               resp.status == 200
-              and "raw.githubusercontent.com/xnetsc/xmagic/main/xmagic.py" in page
+              and "raw.githubusercontent" not in page
+              and "/cli/xmagic.py" in page
               and 'id="cli-install"' in page
               and 'id="btn-copy-install"' in page
               and 'id="cli-onboard"' in page, f"status {resp.status}")
+
+        conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=10)
+        conn.request("GET", "/cli/xmagic.py")
+        resp = conn.getresponse()
+        served = resp.read()
+        served_sha = resp.getheader("X-Xmagic-Cli-Sha256")
+        conn.close()
+        bundled = open(os.path.join(ROOT, "xmagic.py"), "rb").read()
+        check("node serves its bundled CLI publicly, byte for byte",
+              resp.status == 200 and served == bundled
+              and served_sha == hashlib.sha256(bundled).hexdigest(),
+              f"status {resp.status} bytes {len(served)}/{len(bundled)}")
 
         check("console page carries the keypair-generate buttons and the "
               "interconnect setting",

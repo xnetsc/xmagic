@@ -583,8 +583,7 @@ def _key_upload_content(args):
 # ------------------------------------------------------------ self-update
 
 VERSION = "1.1.0"
-UPDATE_URL = ("https://raw.githubusercontent.com/xnetsc/xmagic"
-              "/main/xmagic.py")
+CLI_DOWNLOAD_PATH = "/cli/xmagic.py"  # served by every deployed node
 
 
 def _vkey(v):
@@ -596,14 +595,27 @@ def _vkey(v):
 
 
 def cmd_update(args):
-    """Replace this file with the latest xmagic.py from the repo.
+    """Sync this file with the CLI copy bundled in the deployed node.
 
+    The default source is the selected node itself: it serves the exact
+    xmagic.py it was deployed with, so an installed CLI can never drift
+    from the service it manages (comparison is by content hash, not by
+    version number alone). --from / XMAGIC_UPDATE_URL still allow an
+    arbitrary source; a downgrade from those needs --force, while the
+    node's own copy is authoritative and aligning to it never does.
     The download must carry a VERSION, compile, and pass a --version
     probe before anything is replaced; the old file stays as .bak.
-    Purely local - no node, no session."""
+    No session is needed - the node serves the file publicly."""
     target = os.path.realpath(__file__)
-    url = (getattr(args, "update_url", None)
-           or os.environ.get("XMAGIC_UPDATE_URL") or UPDATE_URL)
+    custom = (getattr(args, "update_url", None)
+              or os.environ.get("XMAGIC_UPDATE_URL"))
+    if custom:
+        url, from_node = custom, False
+    else:
+        cfg, _ = load_config(args)
+        _name, node_url = resolve_node(args, cfg)
+        url = node_url.rstrip("/") + CLI_DOWNLOAD_PATH
+        from_node = True
     try:
         req = urllib.request.Request(
             url, headers={"User-Agent": f"xmagic/{VERSION}"})
@@ -620,18 +632,27 @@ def cmd_update(args):
         die(1, "downloaded file does not look like xmagic.py"
                " - refusing to install")
     remote = m.group(1)
-    if remote == VERSION:
-        emit(args, {"updated": False, "version": VERSION},
-             f"already up to date (xmagic {VERSION})")
+    with open(target, "rb") as f:
+        own = f.read()
+    if hashlib.sha256(data).digest() == hashlib.sha256(own).digest():
+        emit(args, {"updated": False, "version": VERSION, "identical": True},
+             f"already identical to the {'node' if from_node else 'source'}"
+             f" copy (xmagic {VERSION})")
         return
-    if _vkey(remote) < _vkey(VERSION) and not getattr(args, "force", False):
+    if (_vkey(remote) < _vkey(VERSION) and not from_node
+            and not getattr(args, "force", False)):
         die(1, f"remote version {remote} is older than this {VERSION}"
                " - pass --force to downgrade")
     if getattr(args, "check", False):
+        if remote == VERSION:
+            msg = (f"same version {VERSION}, but the content differs from"
+                   f" the {'node' if from_node else 'source'} copy"
+                   " - run: xmagic update, to match it exactly")
+        else:
+            msg = (f"update available: {VERSION} -> {remote}"
+                   " (run: xmagic update)")
         emit(args, {"updated": False, "version": VERSION,
-                    "available": remote},
-             f"update available: {VERSION} -> {remote}"
-             f" (run: xmagic update)")
+                    "available": remote}, msg)
         return
     directory = os.path.dirname(target) or "."
     fd, tmp = tempfile.mkstemp(dir=directory, prefix=".xmagic-update-",
@@ -1141,13 +1162,14 @@ def main():
     a.set_defaults(fn=cmd_settings_set)
 
     a = sub.add_parser("update", parents=C,
-                       help="update this CLI to the latest repo version")
+                       help="sync this CLI with the deployed node's"
+                            " bundled copy")
     a.add_argument("--check", action="store_true",
                    help="only report whether an update is available")
     a.add_argument("--force", action="store_true",
-                   help="install even if the remote version is not newer")
+                   help="allow a downgrade from a custom --from source")
     a.add_argument("--from", dest="update_url", metavar="URL",
-                   help="download from this URL instead of the repository")
+                   help="download from this URL instead of the node")
     a.set_defaults(fn=cmd_update)
 
     k = sub.add_parser("keys", parents=C,

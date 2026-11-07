@@ -41,7 +41,7 @@ RUN apk add --no-cache openssh-server openssh-client \
 # database drivers (SQLite is in the standard library).
 RUN pip install --no-cache-dir "psycopg[binary]" "pymysql"
 COPY --from=xray-core /usr/local/bin/xray /usr/local/bin/xray
-COPY users.py admin.py sniff.py /app/
+COPY users.py admin.py sniff.py xmagic.py /app/
 COPY sshd_config /etc/ssh/sshd_config
 COPY single-entrypoint.sh single-tunnels.sh /app/
 RUN chmod +x /app/single-entrypoint.sh /app/single-tunnels.sh

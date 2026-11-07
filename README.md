@@ -165,12 +165,17 @@ docker compose run --rm admin python3 users.py --json list   # machine-readable 
 
 ### On your own machine: xmagic.py (remote CLI, manages many nodes)
 
-Install the single-file CLI (Python standard library only, no pip) — the
-same command is shown, with a copy button, in the web console:
+Install the single-file CLI (Python standard library only, no pip) from
+any deployed node: the node serves the exact CLI copy it was deployed
+with, so the CLI always matches the service. The same command, already
+pointing at that node, is shown with a copy button in its web console:
 
 ```bash
-mkdir -p ~/.local/bin && curl -fsSL https://raw.githubusercontent.com/xnetsc/xmagic/main/xmagic.py -o ~/.local/bin/xmagic && chmod +x ~/.local/bin/xmagic
+mkdir -p ~/.local/bin && curl -fsSL https://<node-address>/cli/xmagic.py -o ~/.local/bin/xmagic && chmod +x ~/.local/bin/xmagic
 ```
+
+`xmagic update` likewise syncs the installed CLI with the selected
+node's bundled copy (byte for byte), never with a separate source.
 
 ```bash
 python3 xmagic.py node add tokyo --url http://<node-address>:8080   # console and proxy share the public port

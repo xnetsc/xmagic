@@ -130,11 +130,13 @@ docker compose run --rm admin python3 users.py --json list   # 机器可读输�
 
 ### 自己机器上：xmagic.py（远程 CLI，批量管节点）
 
-安装单文件 CLI（纯 Python 标准库，不用 pip）——Web 后台里也有同一条命令，带一键复制按钮：
+安装单文件 CLI（纯 Python 标准库，不用 pip）——从任意一个已部署的节点下载：节点提供的就是它部署时打包的那一份 CLI，装下来必然与服务一致；该节点的 Web 后台里也有同一条命令（已填好节点地址），带一键复制按钮：
 
 ```bash
-mkdir -p ~/.local/bin && curl -fsSL https://raw.githubusercontent.com/xnetsc/xmagic/main/xmagic.py -o ~/.local/bin/xmagic && chmod +x ~/.local/bin/xmagic
+mkdir -p ~/.local/bin && curl -fsSL https://<节点地址>/cli/xmagic.py -o ~/.local/bin/xmagic && chmod +x ~/.local/bin/xmagic
 ```
+
+`xmagic update` 同理：与所选节点打包的副本按字节对齐，不从任何其它来源取。
 
 ```bash
 python3 xmagic.py node add tokyo --url http://<节点地址>:8080   # 后台与代理共用公网端口，直连即可
