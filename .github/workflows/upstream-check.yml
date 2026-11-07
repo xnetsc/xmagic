@@ -1,0 +1,51 @@
+name: upstream-check
+
+# Poll the upstream dependency (XTLS/Xray-core) daily. When a new
+# release appears, bump the XRAY_VERSION pin in versions.env, commit it
+# as the Actions bot, and dispatch the build workflow so fresh images
+# are published (and watchtower-equipped nodes roll over on their own).
+# The explicit dispatch matters: a commit pushed by GITHUB_TOKEN does
+# not trigger push workflows, but workflow_dispatch is exempt.
+
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare pinned version with the latest upstream release
+        id: cmp
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          latest=$(gh api repos/XTLS/Xray-core/releases/latest --jq .tag_name)
+          latest=${latest#v}
+          pinned=$(grep -E '^XRAY_VERSION=' versions.env | cut -d= -f2)
+          echo "pinned=$pinned latest=$latest"
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          if [ "$latest" != "$pinned" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Bump the pin and commit
+        if: steps.cmp.outputs.changed == 'true'
+        run: |
+          sed -i "s/^XRAY_VERSION=.*/XRAY_VERSION=${{ steps.cmp.outputs.latest }}/" versions.env
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "Bump Xray to ${{ steps.cmp.outputs.latest }}"
+          git push
+      - name: Trigger the image build
+        if: steps.cmp.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run build.yml --ref main
