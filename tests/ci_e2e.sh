@@ -231,6 +231,21 @@ out=$(fetch_retry --socks5-hostname "127.0.0.1:$SSH_D_PORT" "$TARGET")
 check "ssh -D (alice key) -> target" "$?"
 kill "$SSH_PID" 2>/dev/null; SSH_PID=""
 
+# The proxy account is forwarding-only: a key must never yield a shell
+# or a remote command (ForceCommand + /bin/false shell in the images).
+out=$(ssh -i "$WORK/alice_key" -p "$PUB" \
+  -o BatchMode=yes -o StrictHostKeyChecking=no \
+  -o UserKnownHostsFile=/dev/null proxy@127.0.0.1 \
+  "echo SHOULD_NOT_PRINT" 2>/dev/null)
+[ -z "$out" ]
+check "ssh exec is refused (forwarding-only account)" "$?"
+out=$(ssh -i "$WORK/alice_key" -p "$PUB" \
+  -o BatchMode=yes -o StrictHostKeyChecking=no \
+  -o UserKnownHostsFile=/dev/null proxy@127.0.0.1 \
+  </dev/null 2>/dev/null)
+[ -z "$out" ]
+check "ssh interactive shell is refused" "$?"
+
 add_user bob
 check "add bob" "$?"
 apply_and_wait

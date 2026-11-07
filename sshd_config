@@ -1,4 +1,8 @@
-# Gateway SSH entry - key-only, forwarding-only by intent.
+# Gateway SSH entry - key-only, forwarding only. The proxy account has
+# no usable shell (/bin/false in the images) and ForceCommand below
+# makes every session channel run /bin/false, so neither an interactive
+# shell nor a remote command can ever execute; only port forwarding
+# (-D/-L/-R) is available to key holders.
 HostKey /etc/ssh/keys/ssh_host_rsa_key
 HostKey /etc/ssh/keys/ssh_host_ecdsa_key
 HostKey /etc/ssh/keys/ssh_host_ed25519_key
@@ -9,6 +13,7 @@ PubkeyAuthentication yes
 AllowUsers proxy
 AuthorizedKeysFile .ssh/authorized_keys
 AllowTcpForwarding yes
+ForceCommand /bin/false
 GatewayPorts no
 PermitTunnel no
 X11Forwarding no

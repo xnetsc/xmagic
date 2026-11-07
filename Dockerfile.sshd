@@ -9,7 +9,7 @@
 # a directory on first up, which sshd then refuses as not-a-file.)
 FROM alpine:3.20
 RUN apk add --no-cache openssh-server \
- && adduser -D -s /bin/sh proxy \
+ && adduser -D -s /bin/false proxy \
  && passwd -u proxy \
  && mkdir -p /home/proxy/.ssh /etc/ssh/keys \
  && chown proxy:proxy /home/proxy/.ssh && chmod 700 /home/proxy/.ssh
