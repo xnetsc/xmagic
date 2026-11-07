@@ -44,6 +44,7 @@ dump_logs() {
   [ -f "$WORK/client.log" ] && tail -20 "$WORK/client.log"
 }
 cleanup() {
+  local rc=$?
   [ -n "${STUB_PID:-}" ] && kill "$STUB_PID" 2>/dev/null
   [ -n "${CLIENT_PID:-}" ] && kill "$CLIENT_PID" 2>/dev/null
   [ -n "${SSH_PID:-}" ] && kill "$SSH_PID" 2>/dev/null
@@ -52,7 +53,20 @@ cleanup() {
   else
     docker rm -f xmagic-e2e-single >/dev/null 2>&1
   fi
-  [ "${E2E_KEEP:-}" = 1 ] || rm -rf "$WORK"
+  # The single-form container runs as root and leaves root-owned files
+  # (SSH host keys, the database) in the bind-mounted work dir, which
+  # the invoking user cannot unlink. Fall back to sudo, then to a
+  # root container wiping the contents. Cleanup must never change the
+  # run's result, hence the saved rc and the || true chain.
+  if [ "${E2E_KEEP:-}" != 1 ]; then
+    rm -rf "$WORK" 2>/dev/null \
+      || sudo -n rm -rf "$WORK" 2>/dev/null \
+      || { docker run --rm -v "$WORK:/w" alpine \
+             sh -c 'rm -rf /w/* /w/.[!.]*' >/dev/null 2>&1; \
+           rm -rf "$WORK" 2>/dev/null; } \
+      || true
+  fi
+  exit "$rc"
 }
 trap cleanup EXIT
 
