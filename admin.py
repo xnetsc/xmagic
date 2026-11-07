@@ -39,6 +39,10 @@ Environment:
                          and restarts are skipped, renders still happen)
   XMAGIC_XRAY_CONTAINER  container restarted after a render (proxy-xray)
   XMAGIC_SSHD_CONTAINER  container restarted after a render (proxy-sshd)
+  XMAGIC_PID_DIR         pidfile directory (single-container form);
+                         when set, apply restarts the gateway by
+                         signalling the recorded processes, which
+                         restarts the container as a whole
 """
 import base64
 import hashlib
@@ -867,6 +871,7 @@ def api_state():
             "enabled_users": n_users, "enabled_upstreams": n_up,
             "enabled_routes": n_routes,
             "docker_socket": os.path.exists(DOCKER_SOCK),
+            "restart_via": users_mod.restart_channel(),
             "public_port": users_mod.PUBLIC_PORT}
 
 
@@ -1240,7 +1245,7 @@ async function refresh() {
   const s = await api("/api/state");
   $("state-line").textContent =
     `状态：${s.enabled_users} 启用用户 / ${s.enabled_upstreams} 上级 / ${s.enabled_routes} 路由` +
-    `，公共端口 ${s.public_port}，Docker socket ${s.docker_socket ? "可用" : "不可用"}。`;
+    `，公共端口 ${s.public_port}，重启通道 ${s.restart_via === "container" ? "整容器重启" : s.restart_via === "docker" ? "Docker socket" : "无（仅渲染）"}。`;
   const users = (await api("/api/users")).users;
   $("users-table").innerHTML = "<tr><th>用户</th><th>分组</th><th>启用</th><th>凭证</th><th>操作</th></tr>" +
     users.map(u => `<tr><td>${u.username}</td><td>${u.group}</td><td>${u.enabled}</td>

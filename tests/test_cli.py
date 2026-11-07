@@ -156,6 +156,46 @@ def main():
     check("settings disable direct_allow_private via CLI",
           rc == 0 and "False" in out, out)
 
+    # Pidfile restart channel (single-container form): the pidfiles
+    # point at live stand-in processes; apply must SIGTERM all three
+    # (their exit is what restarts that container form as a whole).
+    pid_dir = os.path.join(workdir, "pids")
+    os.makedirs(pid_dir)
+    standins = {}
+    for name in ("xray", "sshd", "tunnels"):
+        proc = subprocess.Popen(["sleep", "60"])
+        standins[name] = proc
+        with open(os.path.join(pid_dir, name + ".pid"), "w") as f:
+            f.write(str(proc.pid))
+    env_pid = dict(env, XMAGIC_PID_DIR=pid_dir)
+    proc = subprocess.run([sys.executable, users_py, "--json", "apply"],
+                          env=env_pid, capture_output=True, text=True)
+    try:
+        applied = json.loads(proc.stdout)
+    except ValueError:
+        applied = {}
+    check("apply signals the gateway processes in pidfile mode",
+          proc.returncode == 0 and applied.get("restart_skipped") is False
+          and applied.get("restarted") == {"xray": True, "sshd": True,
+                                           "tunnels": True},
+          proc.stdout + proc.stderr)
+    exited = []
+    for p in standins.values():
+        try:
+            exited.append(p.wait(timeout=10) == -15)
+        except subprocess.TimeoutExpired:
+            exited.append(False)
+            p.kill()
+    check("signalled processes actually exited (SIGTERM)", all(exited))
+    proc = subprocess.run([sys.executable, users_py, "--json", "status"],
+                          env=env_pid, capture_output=True, text=True)
+    check("status restart_via is 'container' in pidfile mode",
+          json.loads(proc.stdout)["restart_via"] == "container",
+          proc.stdout)
+    rc, out, _ = cli("--json", "status")
+    check("status restart_via is null without a channel",
+          json.loads(out)["restart_via"] is None, out)
+
     rc, out, _ = cli("--json", "status")
     check("status shows registered admin", json.loads(out)["admin_registered"] is True)
     rc, out, _ = cli("--json", "sessions")

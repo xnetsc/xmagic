@@ -255,6 +255,26 @@ docker compose up -d                 # admin 首次启动会先渲染一份空�
 自更新：watchtower 每天检查，只自动更新带 label 的 xray 与 dispatcher 镜像；
 sshd / admin 随 `docker compose pull` 手动更新（管理面不自己重启自己）。
 
+### 单容器形态（不支持 docker compose 的环境）
+
+`Dockerfile.single` 把全部进程打进一个镜像：入口脚本拉起 admin / xray /
+sshd / 分发器 / 隧道进程，对外仍只有 XRAY_PORT 一个端口，状态全在 /data
+一个卷里。没有进程监控：**任意关键进程退出，入口脚本就把其余进程全部
+带走、整容器以该进程的状态码退出**，靠运行时的重启策略整体拉回。因此
+必须带重启策略运行；配置变更（apply）也是先渲染、再给网关进程发信号，
+借整容器重启生效（数秒中断，登录会话在库里、不受影响）。
+
+```bash
+docker build -f Dockerfile.single -t xmagic-single .
+docker run -d --name xmagic --restart unless-stopped \
+  -p 8080:8080 -v xmagic-data:/data xmagic-single
+# 浏览器打开 http://<节点地址>:8080 注册管理员 Passkey → 加用户
+```
+
+compose 形态仍是推荐部署方式（各容器独立的更新节奏与重启边界）；
+单容器只是给只能跑单个镜像 / 裸 `docker run` 的环境用的兼容形态。
+配置项与 compose 相同（见 .env.example），在 `docker run -e` 里给。
+
 ## 注意事项
 
 - Xray 26.x 已把 WebSocket 传输、Trojan、Shadowsocks 标注为 deprecated（"might be
@@ -277,6 +297,7 @@ sshd / admin 随 `docker compose pull` 手动更新（管理面不自己重启�
 - `sniff.py` — 首字节协议分发器（纯标准库）
 - `docker-compose.yml` — xray / dispatcher / sshd / admin / tunnels（可选）/ watchtower
 - `Dockerfile.xray`、`Dockerfile.dispatcher`、`Dockerfile.sshd`、`Dockerfile.admin`、`sshd_config`
+- `Dockerfile.single`、`single-entrypoint.sh`、`single-tunnels.sh` — 单容器形态（无 compose 时用；任一关键进程退出即整容器退出）
 - `versions.env` — 上游钉版（Xray 版本，upstream-check 工作流自动维护）
 - `.github/workflows/` — `build.yml`（测试 + 构建推 GHCR）、`upstream-check.yml`（上游新版自动跟进）
 - `tests/` — test_admin.py（后台协议与会话）、test_cli.py（双界面一致性）、test_client.py（远程 CLI 全流程）、test_dispatch.py（分发器分流）、test_databases.py（多数据库：注册表/切换/迁移/方言）

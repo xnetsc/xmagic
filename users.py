@@ -44,6 +44,10 @@ Environment:
   PROXY_DB        default sqlite database path (default ./data/users.db)
   XMAGIC_LOCAL_DB local registry of database configs
                   (default: local.db next to PROXY_DB)
+  XMAGIC_PID_DIR  directory of <name>.pid files for the gateway
+                  processes (single-container form); when set, apply
+                  restarts by signalling them, which restarts the
+                  container as a whole
   DIRECT_ALLOW_PRIVATE  1 allows direct egress to private/LAN addresses
                   (default off; a DB setting wins over the env)
   XRAY_PORT       public listen port (the dispatcher binds this; 8080)
@@ -98,6 +102,7 @@ import re
 import secrets
 import socket
 import sqlite3
+import signal
 import string
 import sys
 import time
@@ -1602,6 +1607,12 @@ def cmd_render_keys(args):
 DOCKER_SOCK = os.environ.get("XMAGIC_DOCKER_SOCK", "/var/run/docker.sock")
 XRAY_CONTAINER = os.environ.get("XMAGIC_XRAY_CONTAINER", "proxy-xray")
 SSHD_CONTAINER = os.environ.get("XMAGIC_SSHD_CONTAINER", "proxy-sshd")
+# Single-container form: when set, this directory holds one <name>.pid
+# file per gateway process (written by the container entrypoint), and
+# apply restarts the gateway by signalling those processes - in that
+# form any critical process exiting takes the whole container down,
+# so the container comes back up on the new config as a whole.
+PID_DIR = os.environ.get("XMAGIC_PID_DIR", "")
 
 # ------------------------------------------------------------ settings
 # Console settings live in the same DB (admin_settings key/value table)
@@ -1781,7 +1792,11 @@ def render_all(out_dir):
                 key = f"{key} {r['username']}"
             f.write(key + "\n")
     os.replace(tmp, keys_path)
-    os.chmod(keys_path, 0o600)
+    # 0644, not 0600: sshd opens authorized_keys as the login user
+    # (temporarily_use_uid), so a root-owned 0600 file is unreadable
+    # to it and every SSH login is refused. Root-owned 0644 passes
+    # StrictModes (owner is root, not group/world-writable).
+    os.chmod(keys_path, 0o644)
     return {"users": n_users, "upstreams": n_up, "ssh_keys": len(rows),
             "ssh_tunnels": len(tunnels)}
 
@@ -1803,14 +1818,49 @@ def docker_restart(name):
         return False
 
 
+def pidfile_restart(name):
+    """SIGTERM the process recorded in <PID_DIR>/<name>.pid.
+
+    None = pidfile channel not configured. In the single-container
+    form the entrypoint treats any critical process exiting as fatal
+    to the whole container, so signalling xray / sshd / tunnels makes
+    the container restart as a whole on the freshly rendered config.
+    """
+    if not PID_DIR:
+        return None
+    try:
+        with open(os.path.join(PID_DIR, name + ".pid")) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, signal.SIGTERM)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def restart_channel():
+    """How apply restarts the gateway: 'container', 'docker' or None."""
+    if PID_DIR:
+        return "container"
+    if os.path.exists(DOCKER_SOCK):
+        return "docker"
+    return None
+
+
 def apply_changes():
     out_dir = os.path.dirname(os.path.abspath(DB_PATH))
     result = render_all(out_dir)
     restarted = {}
-    for label, container in (("xray", XRAY_CONTAINER), ("sshd", SSHD_CONTAINER)):
-        outcome = docker_restart(container)
-        if outcome is not None:
-            restarted[label] = outcome
+    if PID_DIR:
+        for name in ("xray", "sshd", "tunnels"):
+            outcome = pidfile_restart(name)
+            if outcome is not None:
+                restarted[name] = outcome
+    else:
+        for label, container in (("xray", XRAY_CONTAINER),
+                                 ("sshd", SSHD_CONTAINER)):
+            outcome = docker_restart(container)
+            if outcome is not None:
+                restarted[label] = outcome
     result["restarted"] = restarted
     result["restart_skipped"] = not restarted
     return result
@@ -1937,6 +1987,7 @@ def cmd_status(_):
     info["admin_created_at"] = cred["created_at"] if cred else None
     info["admin_label"] = cred["label"] if cred else None
     info["docker_socket"] = os.path.exists(DOCKER_SOCK)
+    info["restart_via"] = restart_channel()
     info["public_port"] = PUBLIC_PORT
     _cfg = active_db_config()
     info["db"] = mask_target(_cfg["type"], _cfg["target"])
