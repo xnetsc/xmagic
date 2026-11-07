@@ -26,7 +26,8 @@ HTTP 代理（CONNECT）、VLESS-WS、VLESS（裸 TCP）、Trojan-WS、裸 Shado
                         出口：直连，或上级池（按用户分组、负载均衡）
 ```
 
-- 所有后端只听 127.0.0.1，对外只有分发器一个端口。
+- 网关的所有后端只听 127.0.0.1，对外只有分发器一个端口；admin 后台是
+  独立发布的一个端口（见下）。
 - 身份只有一个事实源：**SQLite 数据库**（`data/users.db`）。Xray 的
   `config.json`、sshd 的 `authorized_keys` 都是从库里渲染出来的产物。
 - 后端回环端口全部可由 env 覆盖（同机跑多个节点做测试时必须错开）。
@@ -56,9 +57,10 @@ HTTP 代理（CONNECT）、VLESS-WS、VLESS（裸 TCP）、Trojan-WS、裸 Shado
   重启 xray / sshd 生效（没挂 socket 时只渲染，界面会如实提示）。
 - **只支持一个管理员账号，且只能用 Passkey**：第一个注册的 Passkey 即管理员，
   注册随即永久关闭；不支持密码或其它登录方式。用户验证（UV）强制开启。
-- 默认只绑宿主机 127.0.0.1，经 SSH 隧道访问（`ssh -L 8090:127.0.0.1:8090 节点`，
-  浏览器里是 localhost，属 WebAuthn 安全上下文）；要挂域名走 HTTPS 时改
-  `XMAGIC_ADMIN_RPID` / `XMAGIC_ADMIN_ORIGINS`。
+- 后台端口发布在宿主机上（默认 8090，`XMAGIC_ADMIN_PORT`），公网可直接
+  访问；`.env` 里设 `XMAGIC_ADMIN_BIND=127.0.0.1` 可以收回为仅本机。
+  若前面挂了域名 + HTTPS，把 `XMAGIC_ADMIN_RPID` / `XMAGIC_ADMIN_ORIGINS`
+  改成该域名，Passkey 按该域名签发。
 - Passkey 丢了没有网页找回通道：在节点上跑 `users.py admin-reset` 清掉凭证
   重新注册——能碰宿主机的人本来就拥有这台机器，这是刻意的破窗设计。
   还在登录状态时也可以在后台直接**更换 Passkey**（设置区）：更换完成的那一刻，
@@ -108,7 +110,7 @@ docker compose run --rm admin python3 users.py --json list   # 机器可读输�
 ### 自己机器上：xmagic.py（远程 CLI，批量管节点）
 
 ```bash
-python3 xmagic.py node add tokyo --url http://127.0.0.1:8090   # 先经 SSH 隧道把节点后台映射到本地
+python3 xmagic.py node add tokyo --url http://<节点地址>:8090   # 后台公网可达，直连即可
 python3 xmagic.py login            # 自动拉起浏览器走 Passkey，登录态存回本地
 python3 xmagic.py users add alice
 python3 xmagic.py --node tokyo routes add --kind ip --pattern 1.1.1.1 --to intl
@@ -214,9 +216,9 @@ SSH/SOCKS/SS 这些裸 TCP 进不来，文件系统还是临时的；Vercel 是�
 git clone https://github.com/xnetsc/xmagic && cd xmagic
 cp .env.example .env                 # 至少设 XRAY_PORT、WS 路径
 docker compose up -d                 # admin 首次启动会先渲染一份空配置顶住
-# 浏览器打开 http://127.0.0.1:8090（或先 ssh -L 8090:127.0.0.1:8090 过来）
-# 注册管理员 Passkey → 在后台加用户（每次修改自动渲染 + 重启生效）
-# 云控制台防火墙只放行 XRAY_PORT 一个端口
+# 浏览器打开 http://<节点地址>:8090 注册管理员 Passkey → 加用户
+# （每次修改自动渲染 + 重启生效）
+# 云控制台防火墙放行两个端口：XRAY_PORT（代理）与 8090（后台）
 ```
 
 自更新：watchtower 每天检查，只自动更新带 label 的 xray 与 dispatcher 镜像；

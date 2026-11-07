@@ -10,8 +10,9 @@
 #     rendered from the same DB.
 #   admin                  Passkey-only web console + the users.py CLI.
 #     Shares ./data, renders config after every change and restarts the
-#     xray/sshd containers over the Docker socket. Bound to 127.0.0.1 on
-#     the host - reach it there or through an SSH tunnel.
+#     xray/sshd containers over the Docker socket. Published on the host
+#     (XMAGIC_ADMIN_PORT, default 8090) so the console is reachable from
+#     anywhere; set XMAGIC_ADMIN_BIND=127.0.0.1 to lock it to loopback.
 #   watchtower             daily auto-update of the labeled images (xray,
 #     dispatcher) - new builds land here from CI, including Xray version
 #     bumps made by the upstream-check workflow.
@@ -100,7 +101,7 @@ services:
     container_name: proxy-admin
     restart: unless-stopped
     ports:
-      - "127.0.0.1:${XMAGIC_ADMIN_PORT:-8090}:8090"
+      - "${XMAGIC_ADMIN_BIND:-0.0.0.0}:${XMAGIC_ADMIN_PORT:-8090}:8090"
     environment:
       <<: *gateway-env
       XMAGIC_ADMIN_RPID: "${XMAGIC_ADMIN_RPID:-localhost}"
