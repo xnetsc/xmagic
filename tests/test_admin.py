@@ -14,6 +14,7 @@ import http.client
 import json
 import os
 import secrets
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -700,6 +701,76 @@ def main():
               status == 200 and body["direct_allow_private"] is False,
               f"{status} {body}")
 
+        status, body = client.call("GET", "/api/settings")
+        check("settings: reality on by default with client parameters",
+              status == 200 and body["reality_enabled"] is True
+              and body["reality_dest"] == "www.microsoft.com:443"
+              and body["reality_server_names"] == ["www.microsoft.com"]
+              and len(body["reality_short_ids"]) == 1
+              and len(body["reality_short_ids"][0]) == 8
+              and len(body["reality_public_key"]) == 43,
+              f"{status} {body}")
+        with sqlite3.connect(db_path) as raw:
+            priv = raw.execute("SELECT value FROM admin_settings"
+                               " WHERE key = 'reality_private_key'"
+                               ).fetchone()[0]
+        check("settings: reality private key never leaves the node",
+              len(priv) == 43 and priv not in json.dumps(body)
+              and "reality_private_key" not in json.dumps(body),
+              "private key leaked into the settings response")
+        status, body = client.call("POST", "/api/settings",
+                                   {"reality_dest": "www.apple.com:443",
+                                    "reality_server_names": "www.apple.com",
+                                    "reality_short_ids": "0123abcd,eeff"})
+        check("settings: reality dest/names/short ids stored",
+              status == 200 and body["reality_dest"] == "www.apple.com:443"
+              and body["reality_server_names"] == ["www.apple.com"]
+              and body["reality_short_ids"] == ["0123abcd", "eeff"],
+              f"{status} {body}")
+        status, _ = client.call("POST", "/api/settings",
+                                {"reality_dest": "no-port-here"})
+        check("settings rejects a reality dest without a port",
+              status == 400, f"got {status}")
+        status, _ = client.call("POST", "/api/settings",
+                                {"reality_short_ids": "xyz"})
+        check("settings rejects a non-hex reality short id",
+              status == 400, f"got {status}")
+        status, _ = client.call("POST", "/api/settings",
+                                {"reality_enabled": "yes"})
+        check("settings rejects a non-boolean reality_enabled",
+              status == 400, f"got {status}")
+        status, before = client.call("GET", "/api/settings")
+        old_pub = before["reality_public_key"]
+        status, body = client.call("POST", "/api/settings",
+                                   {"reality_rotate_key": True})
+        check("settings: reality key rotation returns a fresh public key",
+              status == 200 and len(body["reality_public_key"]) == 43
+              and body["reality_public_key"] != old_pub,
+              f"{status} {body}")
+        with sqlite3.connect(db_path) as raw:
+            priv2 = raw.execute("SELECT value FROM admin_settings"
+                                " WHERE key = 'reality_private_key'"
+                                ).fetchone()[0]
+        check("settings: rotated private key stays off the wire too",
+              priv2 != priv and priv2 not in json.dumps(body),
+              "rotated private key leaked into the settings response")
+        status, body = client.call("POST", "/api/settings",
+                                   {"reality_enabled": False})
+        check("settings: reality can be switched off",
+              status == 200 and body["reality_enabled"] is False,
+              f"{status} {body}")
+        status, body = client.call("POST", "/api/settings",
+                                   {"reality_enabled": True,
+                                    "reality_dest": "",
+                                    "reality_server_names": "",
+                                    "reality_short_ids": ""})
+        check("settings: reality restored, overrides cleared to defaults",
+              status == 200 and body["reality_enabled"] is True
+              and body["reality_dest"] == "www.microsoft.com:443"
+              and body["reality_server_names"] == ["www.microsoft.com"]
+              and len(body["reality_short_ids"]) == 1,
+              f"{status} {body}")
+
         status, body = client.call("POST", "/api/apply", {})
         check("standalone apply endpoint (nothing pending)",
               status == 200 and body["applied"]["changed"] == []
@@ -737,6 +808,12 @@ def main():
               and 'id="btn-gen-upkey"' in page
               and 'name="interconnect_off_groups"' in page
               and 'name="vless_enabled"' in page
+              and 'name="reality_enabled"' in page
+              and 'name="reality_dest"' in page
+              and 'name="reality_server_names"' in page
+              and 'name="reality_short_ids"' in page
+              and 'name="reality_public_key"' in page
+              and 'id="btn-reality-rotate"' in page
               and "组内互访端口" in page
               and "公网 SOCKS5 默认关闭" in page
               and '<select name="method"' in page

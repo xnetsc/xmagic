@@ -595,6 +595,15 @@ def cmd_settings_show(args):
         f"({src[payload['ss_method_from_db']]})",
         f"vless_enabled: {payload['vless_enabled']} "
         f"({src[payload['vless_enabled_from_db']]})",
+        f"reality_enabled: {payload['reality_enabled']} "
+        f"({src[payload['reality_enabled_from_db']]})",
+        f"reality_dest: {payload['reality_dest']} "
+        f"({src[payload['reality_dest_from_db']]})",
+        f"reality_server_names: {','.join(payload['reality_server_names'])} "
+        f"({src[payload['reality_server_names_from_db']]})",
+        f"reality_short_ids: {','.join(payload['reality_short_ids'])} "
+        f"({src[payload['reality_short_ids_from_db']]})",
+        f"reality_public_key: {payload['reality_public_key']}",
         f"direct_allow_private: {payload['direct_allow_private']} "
         f"({src[payload['direct_allow_private_from_db']]})",
         f"interconnect_off_groups: "
@@ -634,11 +643,16 @@ def cmd_settings_set(args):
     api, _, _ = authed_api(args)
     body = {}
     for key in ("session_ttl_hours", "vless_ws_paths", "trojan_ws_paths",
-                "upstream_strategy", "ss_method", "interconnect_off_groups"):
-        if getattr(args, key) is not None:
+                "upstream_strategy", "ss_method", "interconnect_off_groups",
+                "reality_dest", "reality_server_names", "reality_short_ids"):
+        if getattr(args, key, None) is not None:
             body[key] = getattr(args, key)
     if getattr(args, "vless_enabled", None) is not None:
         body["vless_enabled"] = args.vless_enabled
+    if getattr(args, "reality_enabled", None) is not None:
+        body["reality_enabled"] = args.reality_enabled
+    if getattr(args, "reality_rotate_key", False):
+        body["reality_rotate_key"] = True
     if getattr(args, "direct_allow_private", None) is not None:
         body["direct_allow_private"] = args.direct_allow_private
     if not body:
@@ -650,7 +664,10 @@ def cmd_settings_set(args):
          f"strategy={payload['upstream_strategy']}, "
          f"ss_method={payload['ss_method']}, "
          f"interconnect_off_groups="
-         f"{','.join(payload['interconnect_off_groups']) or '(none)'}\n"
+         f"{','.join(payload['interconnect_off_groups']) or '(none)'}, "
+         f"reality_enabled={payload['reality_enabled']}, "
+         f"reality_dest={payload['reality_dest']}, "
+         f"reality_public_key={payload['reality_public_key']}\n"
          + applied_line(payload.get("applied")))
 
 
@@ -1329,6 +1346,24 @@ def main():
     a.add_argument("--no-vless-enabled", dest="vless_enabled",
                    action="store_false",
                    help="do not render the VLESS inbounds")
+    a.add_argument("--reality-enabled", dest="reality_enabled",
+                   action="store_true", default=None,
+                   help="render the REALITY inbound (on by default)")
+    a.add_argument("--no-reality-enabled", dest="reality_enabled",
+                   action="store_false",
+                   help="do not render the REALITY inbound")
+    a.add_argument("--reality-dest",
+                   help="REALITY target site host:port; empty string ="
+                        " env default")
+    a.add_argument("--reality-server-names",
+                   help="comma-separated REALITY serverNames; empty"
+                        " string = env default")
+    a.add_argument("--reality-short-ids",
+                   help="comma-separated REALITY shortIds (even-length"
+                        " hex); empty string = env default")
+    a.add_argument("--reality-rotate-key", action="store_true",
+                   help="generate a fresh REALITY keypair (the new"
+                        " public key is in the returned settings)")
     a.set_defaults(fn=cmd_settings_set)
 
     a = sub.add_parser("update", parents=C,

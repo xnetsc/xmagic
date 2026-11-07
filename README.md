@@ -3,7 +3,8 @@
 [中文](README.zh-CN.md) | **English**
 
 In one line: **one public port, dispatched by the first bytes of each
-connection**, serving SSH, HTTP proxy (CONNECT), Trojan-WS and bare
+connection**, serving SSH, HTTP proxy (CONNECT), Trojan-WS,
+VLESS+REALITY and bare
 Shadowsocks at the same time. Protocols with no encryption of their
 own are off by default: VLESS-WS / bare VLESS (enable in Settings)
 and public SOCKS5 (`XMAGIC_ENABLE_SOCKS5=1`); HTTP stays because it
@@ -33,6 +34,7 @@ identity engine, so a change made in one shows up in the others.
     (key auth)  inbound   inbound    |- path hit -> VLESS-WS backends (multi-path, opt-in)
                                      |- path hit -> Trojan-WS backends (multi-path)
                                      +- default fallback -> bare Shadowsocks
+    TLS ClientHello (0x16 0x03) ---> VLESS+REALITY backend (on by default)
                                    |
               egress: direct, or an upstream pool (per-user groups, balancing)
 ```
@@ -58,11 +60,13 @@ identity engine, so a change made in one shows up in the others.
 | HTTP proxy | Xray http inbound (CONNECT) | Xray http outbound | Basic (may be empty) |
 | VLESS-WS | WS path dispatch -> backend (**off by default**: VLESS has no encryption of its own; enable in Settings) | same | uuid |
 | VLESS (bare TCP) | dispatcher -> mux main inbound (**off by default**) | same | uuid |
+| VLESS+REALITY | TLS ClientHello dispatch -> REALITY backend (**on by default**, independent of the VLESS switch) | - (inbound only) | uuid |
 | Trojan-WS | WS path dispatch -> backend | same | password |
 | Shadowsocks | default fallback -> backend | same | per-user password + method |
 
 Each user holds one credential set in the database: a VLESS uuid
-(used when VLESS is enabled), one shared password (Trojan / HTTP /
+(used by the VLESS inbounds when enabled, and by the REALITY
+inbound), one shared password (Trojan / HTTP /
 SOCKS), a separate Shadowsocks
 password, and an optional SSH public key. Upstreams are stored with
 the credentials the upstream node issued under the same model -
@@ -127,6 +131,7 @@ and upstream records to keep them distinct upstream.
 Besides the session lifetime, Settings holds the render-level options
 that otherwise only exist in `.env`: the VLESS / Trojan WS path lists,
 the upstream pool strategy, the default SS method for new users,
+the REALITY switch and camouflage parameters (next section),
 whether direct egress to private addresses is allowed, and the
 group opt-out list for same-group interconnect (on by default - see
 "Same-group interconnect" below). A value stored
@@ -148,6 +153,62 @@ or LAN addresses when going direct (Xray freedom's default blocking
 rule, an anti-SSRF measure). Turn it on when the node must reach its
 own LAN services; the rendered freedom outbound then carries an allow
 finalRule for the private ranges.
+
+### VLESS+REALITY inbound (on by default)
+
+REALITY gives the gateway an inbound whose wire looks like an ordinary
+TLS 1.3 session to a real website: the handshake borrows the
+camouflage target site's certificate and parameters, and a connection
+that does not authenticate as REALITY is forwarded to that real site,
+so probing the port yields the genuine site. Unlike the bare VLESS
+inbounds, REALITY carries its own encryption and camouflage, so it is
+**on by default and independent of the VLESS switch** - turning
+VLESS off does not turn REALITY off, and vice versa. Clients use
+their existing per-user UUID with flow `xtls-rprx-vision`.
+
+Settings (web console, `users.py settings`, remote CLI
+`settings set` - the database value wins over the `REALITY_*` env):
+the on/off switch, the camouflage target `dest` (default
+`www.microsoft.com:443`), the `serverNames` clients may present, and
+the `shortIds`. The node's REALITY keypair is generated once and kept
+in the database; Settings shows the **public key** (clients need it;
+the private key never leaves the node) and can rotate the pair -
+rotation invalidates every client configuration still using the old
+public key.
+
+Picking a target: any ordinary, high-traffic HTTPS site outside the
+node that supports **TLS 1.3** and is reachable from the node; the
+default `www.microsoft.com:443` works. The names in `serverNames`
+must be names the target's certificate covers.
+
+Client configuration (Xray) - address/port are the node's public
+endpoint, the rest comes from Settings plus the user's UUID:
+
+```json
+{
+  "protocol": "vless",
+  "settings": {"vnext": [{"address": "<node>", "port": 8080,
+    "users": [{"id": "<user uuid>", "encryption": "none",
+               "flow": "xtls-rprx-vision"}]}]},
+  "streamSettings": {"network": "tcp", "security": "reality",
+    "realitySettings": {"serverName": "www.microsoft.com",
+      "fingerprint": "chrome",
+      "publicKey": "<reality_public_key from Settings>",
+      "shortId": "<one of reality_short_ids>", "spiderX": ""}}
+}
+```
+
+The same as a share link:
+
+```
+vless://<user uuid>@<node>:8080?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=chrome&pbk=<reality_public_key>&sid=<shortId>#xmagic-reality
+```
+
+REALITY is raw TLS to the public port: it needs **direct TCP
+reachability** of `XRAY_PORT` (a VPS port, or a raw TCP forward). It
+cannot pass through a TLS-terminating edge - for example a platform
+HTTPS domain that terminates TLS and forwards HTTP - because the
+client's TLS handshake must reach the REALITY inbound untouched.
 
 ## Management interface 2: command line (identical to web)
 

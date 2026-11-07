@@ -22,6 +22,8 @@ A first-byte dispatcher (sniff.py) owns the single public port and routes
 each connection by its opening bytes: "SSH-" banner -> sshd; a
 well-formed SOCKS5 greeting -> SOCKS5 inbound (only when
 XMAGIC_ENABLE_SOCKS5=1 - SOCKS5 is plaintext and off by default);
+a TLS ClientHello (0x16 0x03) -> the VLESS+REALITY inbound (on by
+default - REALITY carries its own encryption and camouflage);
 HTTP CONNECT / absolute-form -> HTTP-proxy inbound; HTTP with a
 WebSocket Upgrade -> the Xray fallback mux (WS paths, then bare
 Shadowsocks as the default); origin-form HTTP -> the admin console;
@@ -56,6 +58,14 @@ Environment:
   XRAY_MUX_PORT   loopback port of the Xray fallback mux (default 18080)
   BE_HTTP_PORT    loopback HTTP-proxy inbound   (default 18081)
   BE_SOCKS_PORT   loopback SOCKS5 inbound       (default 18082)
+  XRAY_REALITY_PORT loopback REALITY inbound    (default 18083)
+  REALITY_ENABLED render the REALITY inbound (default on; a DB setting wins)
+  REALITY_DEST    REALITY camouflage target host:port
+                  (default www.microsoft.com:443; a DB setting wins)
+  REALITY_SERVER_NAMES  comma-separated REALITY server names
+                  (default www.microsoft.com; a DB setting wins)
+  REALITY_SHORT_IDS     comma-separated REALITY short ids (hex; default:
+                  one auto-generated id persisted in the DB)
   SS_BE_PORT      loopback Shadowsocks backend  (default 12003)
   VLESS_BE_BASE   first loopback VLESS-WS backend port  (default 12100)
   TROJAN_BE_BASE  first loopback Trojan-WS backend port (default 12200)
@@ -130,6 +140,7 @@ BE_SOCKS = int(os.environ.get("BE_SOCKS_PORT", "18082"))
 BE_SS = int(os.environ.get("SS_BE_PORT", "12003"))
 BE_VLESS_BASE = int(os.environ.get("VLESS_BE_BASE", "12100"))
 BE_TROJAN_BASE = int(os.environ.get("TROJAN_BE_BASE", "12200"))
+BE_REALITY = int(os.environ.get("XRAY_REALITY_PORT", "18083"))
 SSH_TUNNEL_BASE = int(os.environ.get("SSH_TUNNEL_BASE", "13000"))
 
 
@@ -836,6 +847,22 @@ def migrate_db_config(src_name, dst_name, replace=False):
         dst_counts = {t: dst.execute(
             f"SELECT COUNT(*) FROM {t}").fetchone()[0]
             for t in BUSINESS_TABLES}
+        if dst_counts["admin_settings"]:
+            # A target whose only settings rows are the auto-generated
+            # REALITY identity holds no operator data: any render (e.g.
+            # the apply a db-switch performs) materialises those two
+            # keys, and both are regenerated on demand. They neither
+            # block a migration nor survive one - the source's identity,
+            # if any, is what gets copied.
+            operator_settings = dst.execute(
+                "SELECT COUNT(*) FROM admin_settings"
+                " WHERE key NOT IN (?, ?)",
+                ("reality_private_key", "reality_short_ids")).fetchone()[0]
+            if not operator_settings:
+                dst.execute(
+                    "DELETE FROM admin_settings WHERE key IN (?, ?)",
+                    ("reality_private_key", "reality_short_ids"))
+                dst_counts["admin_settings"] = 0
         nonempty = {t: c for t, c in dst_counts.items() if c}
         if nonempty and not replace:
             raise DBError(
@@ -1844,6 +1871,30 @@ def render_config(conn):
             },
             "streamSettings": {"network": "ws", "wsSettings": {"path": p}},
         })
+    if reality_enabled(conn):
+        # REALITY is independent of vless_enabled: it supplies its own
+        # transport encryption, so its clients are ALL enabled users
+        # even while the bare VLESS inbounds stay off.
+        private_key, _ = reality_keypair(conn)
+        inbounds.append({
+            "tag": "reality", "listen": "127.0.0.1", "port": BE_REALITY,
+            "protocol": "vless",
+            "settings": {
+                "clients": [{"id": u["vless_uuid"],
+                             "flow": "xtls-rprx-vision",
+                             "email": u["username"]} for u in users],
+                "decryption": "none",
+            },
+            "streamSettings": {
+                "network": "tcp", "security": "reality",
+                "realitySettings": {
+                    "show": False, "target": reality_dest(conn), "xver": 0,
+                    "serverNames": reality_server_names(conn),
+                    "privateKey": private_key,
+                    "shortIds": reality_short_ids(conn),
+                },
+            },
+        })
     inbounds.append({
         "tag": "ss", "listen": "127.0.0.1", "port": BE_SS,
         "protocol": "shadowsocks",
@@ -2150,6 +2201,180 @@ def allow_private_direct(conn=None):
     return DIRECT_ALLOW_PRIVATE.lower() in ("1", "true", "yes", "on")
 
 
+# ------------------------------------------------------------ REALITY
+# VLESS+REALITY is on by default: unlike the bare VLESS inbounds,
+# REALITY brings its own encryption and camouflage (it borrows a real
+# site's TLS handshake), so it does not fall under the
+# plaintext-protocols-off policy. The node holds an X25519 keypair for
+# it; the private key is node-internal (stored in admin_settings,
+# never printed), the public key is a client configuration parameter
+# and is shown in the settings output like the other client-facing
+# values (dest / server names / short ids).
+
+REALITY_ENABLED = os.environ.get("REALITY_ENABLED", "")
+REALITY_DEST = os.environ.get("REALITY_DEST", "")
+REALITY_SERVER_NAMES = os.environ.get("REALITY_SERVER_NAMES", "")
+REALITY_SHORT_IDS = os.environ.get("REALITY_SHORT_IDS", "")
+REALITY_DEST_DEFAULT = "www.microsoft.com:443"
+REALITY_SERVER_NAME_DEFAULT = "www.microsoft.com"
+
+_X25519_P = 2 ** 255 - 19
+_X25519_A24 = 121665
+_X25519_BASE = (9).to_bytes(32, "little")
+
+
+def _b64u_encode(raw):
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _b64u_decode(text):
+    text = str(text).strip()
+    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+
+
+def x25519(scalar, point):
+    """RFC 7748 X25519: pure-Python Montgomery ladder."""
+    k = bytearray(scalar)
+    k[0] &= 248
+    k[31] &= 127
+    k[31] |= 64
+    e = int.from_bytes(k, "little")
+    x1 = int.from_bytes(point, "little") & ((1 << 255) - 1)
+    x2, z2, x3, z3, swap = 1, 0, x1, 1, 0
+    p = _X25519_P
+    for t in range(254, -1, -1):
+        bit = (e >> t) & 1
+        swap ^= bit
+        if swap:
+            x2, x3, z2, z3 = x3, x2, z3, z2
+        swap = bit
+        a = (x2 + z2) % p
+        aa = a * a % p
+        b = (x2 - z2) % p
+        bb = b * b % p
+        ee = (aa - bb) % p
+        c = (x3 + z3) % p
+        d = (x3 - z3) % p
+        da = d * a % p
+        cb = c * b % p
+        x3 = (da + cb) ** 2 % p
+        z3 = x1 * ((da - cb) ** 2 % p) % p
+        x2 = aa * bb % p
+        z2 = ee * (aa + _X25519_A24 * ee % p) % p
+    if swap:
+        x2, x3, z2, z3 = x3, x2, z3, z2
+    return (x2 * pow(z2, p - 2, p) % p).to_bytes(32, "little")
+
+
+def x25519_public_key(private_b64):
+    """Public key (Xray's 43-char base64url form) for a private key."""
+    return _b64u_encode(x25519(_b64u_decode(private_b64), _X25519_BASE))
+
+
+def generate_reality_keypair():
+    """-> (private_b64, public_b64) in Xray's base64url format."""
+    private = _b64u_encode(os.urandom(32))
+    return private, x25519_public_key(private)
+
+
+def reality_enabled(conn=None):
+    """Whether the REALITY inbound is rendered (on by default)."""
+    if conn is not None:
+        raw = get_setting(conn, "reality_enabled")
+        if raw is not None:
+            return raw == "1"
+    if REALITY_ENABLED:
+        return REALITY_ENABLED.lower() in ("1", "true", "yes", "on")
+    return True
+
+
+def validate_reality_dest(raw):
+    """A REALITY target must be host:port. -> canonical string."""
+    raw = str(raw or "").strip()
+    host, sep, port = raw.rpartition(":")
+    if not sep or not host or not port.isdigit() \
+            or not (1 <= int(port) <= 65535) or " " in host:
+        raise ValueError("reality dest must be host:port")
+    return f"{host}:{int(port)}"
+
+
+def reality_dest(conn=None):
+    if conn is not None:
+        raw = get_setting(conn, "reality_dest")
+        if raw:
+            return raw
+    return REALITY_DEST or REALITY_DEST_DEFAULT
+
+
+def parse_reality_names(raw):
+    names = [n.strip() for n in str(raw or "").split(",") if n.strip()]
+    if not names:
+        raise ValueError("reality server names must not be empty")
+    return names
+
+
+def reality_server_names(conn=None):
+    if conn is not None:
+        raw = get_setting(conn, "reality_server_names")
+        if raw:
+            return parse_reality_names(raw)
+    if REALITY_SERVER_NAMES:
+        return parse_reality_names(REALITY_SERVER_NAMES)
+    return [REALITY_SERVER_NAME_DEFAULT]
+
+
+def parse_reality_short_ids(raw):
+    ids = []
+    for part in str(raw or "").split(","):
+        part = part.strip().lower()
+        if not part:
+            continue
+        if len(part) > 16 or len(part) % 2 \
+                or any(c not in "0123456789abcdef" for c in part):
+            raise ValueError("reality short ids must be even-length"
+                             " hex of at most 16 characters")
+        ids.append(part)
+    if not ids:
+        raise ValueError("reality short ids must not be empty")
+    return ids
+
+
+def reality_short_ids(conn):
+    """Configured short ids; the default (one random 8-hex id) is
+    generated once and persisted, so every render and every settings
+    read agrees on it until the operator sets or clears it."""
+    raw = get_setting(conn, "reality_short_ids")
+    if raw:
+        return parse_reality_short_ids(raw)
+    if REALITY_SHORT_IDS:
+        return parse_reality_short_ids(REALITY_SHORT_IDS)
+    ids = [secrets.token_hex(4)]
+    set_setting(conn, "reality_short_ids", ids[0])
+    return ids
+
+
+def reality_keypair(conn):
+    """(private_b64, public_b64); generates and persists the pair on
+    first need. The private key never leaves this function except into
+    the rendered Xray config."""
+    private = get_setting(conn, "reality_private_key")
+    if private:
+        try:
+            return private, x25519_public_key(private)
+        except Exception:
+            pass  # a hand-edited value must not break rendering
+    private, public = generate_reality_keypair()
+    set_setting(conn, "reality_private_key", private)
+    return private, public
+
+
+def rotate_reality_key(conn):
+    """Replace the REALITY keypair; -> the new public key."""
+    private, public = generate_reality_keypair()
+    set_setting(conn, "reality_private_key", private)
+    return public
+
+
 def settings_info(conn):
     return {
         "session_ttl_hours": session_ttl_hours(conn),
@@ -2164,6 +2389,19 @@ def settings_info(conn):
         "vless_enabled": vless_enabled(conn),
         "vless_enabled_from_db":
             get_setting(conn, "vless_enabled") is not None,
+        "reality_enabled": reality_enabled(conn),
+        "reality_enabled_from_db":
+            get_setting(conn, "reality_enabled") is not None,
+        "reality_dest": reality_dest(conn),
+        "reality_dest_from_db":
+            get_setting(conn, "reality_dest") is not None,
+        "reality_server_names": reality_server_names(conn),
+        "reality_server_names_from_db":
+            get_setting(conn, "reality_server_names") is not None,
+        "reality_short_ids": reality_short_ids(conn),
+        "reality_short_ids_from_db":
+            get_setting(conn, "reality_short_ids") is not None,
+        "reality_public_key": reality_keypair(conn)[1],
         "direct_allow_private": allow_private_direct(conn),
         "direct_allow_private_from_db":
             get_setting(conn, "direct_allow_private") is not None,
@@ -2225,6 +2463,32 @@ def cmd_settings(args):
             else:
                 set_setting(conn, "vless_enabled",
                             "1" if args.vless == "on" else "0")
+        if getattr(args, "reality", None) is not None:
+            if args.reality == "":
+                delete_setting(conn, "reality_enabled")
+            else:
+                set_setting(conn, "reality_enabled",
+                            "1" if args.reality == "on" else "0")
+        for key, value, parse in (
+                ("reality_dest", getattr(args, "reality_dest", None),
+                 validate_reality_dest),
+                ("reality_server_names",
+                 getattr(args, "reality_server_names", None),
+                 lambda v: ",".join(parse_reality_names(v))),
+                ("reality_short_ids",
+                 getattr(args, "reality_short_ids", None),
+                 lambda v: ",".join(parse_reality_short_ids(v)))):
+            if value is None:
+                continue
+            if value == "":  # empty string clears back to the env default
+                delete_setting(conn, key)
+                continue
+            try:
+                set_setting(conn, key, parse(value))
+            except ValueError as exc:
+                sys.exit(str(exc))
+        if getattr(args, "reality_rotate_key", False):
+            rotate_reality_key(conn)
         if args.direct_allow_private is not None:
             if args.direct_allow_private == "":
                 delete_setting(conn, "direct_allow_private")
@@ -2249,6 +2513,15 @@ def cmd_settings(args):
           f"({src[info['ss_method_from_db']]})")
     print(f"vless_enabled: {info['vless_enabled']} "
           f"({src[info['vless_enabled_from_db']]})")
+    print(f"reality_enabled: {info['reality_enabled']} "
+          f"({src[info['reality_enabled_from_db']]})")
+    print(f"reality_dest: {info['reality_dest']} "
+          f"({src[info['reality_dest_from_db']]})")
+    print(f"reality_server_names: {','.join(info['reality_server_names'])} "
+          f"({src[info['reality_server_names_from_db']]})")
+    print(f"reality_short_ids: {','.join(info['reality_short_ids'])} "
+          f"({src[info['reality_short_ids_from_db']]})")
+    print(f"reality_public_key: {info['reality_public_key']}")
     print(f"direct_allow_private: {info['direct_allow_private']} "
           f"({src[info['direct_allow_private_from_db']]})")
     print(f"interconnect_off_groups: "
@@ -2801,6 +3074,22 @@ def main():
                    help="render the VLESS inbounds (off by default:"
                         " VLESS has no encryption of its own);"
                         " empty string = back to env")
+    a.add_argument("--reality", choices=("on", "off", ""),
+                   help="render the VLESS+REALITY inbound (on by default:"
+                        " REALITY carries its own encryption);"
+                        " empty string = back to env")
+    a.add_argument("--reality-dest",
+                   help="REALITY camouflage target host:port;"
+                        " empty string = back to env")
+    a.add_argument("--reality-server-names",
+                   help="comma-separated REALITY server names;"
+                        " empty string = back to env")
+    a.add_argument("--reality-short-ids",
+                   help="comma-separated REALITY short ids (hex);"
+                        " empty string = back to env / auto-generated")
+    a.add_argument("--reality-rotate-key", action="store_true",
+                   help="generate a fresh REALITY keypair (the new"
+                        " public key is in the printed settings)")
     a.add_argument("--direct-allow-private", choices=("on", "off", ""),
                    help="allow direct egress to private/LAN addresses;"
                         " empty string = back to env")

@@ -180,6 +180,32 @@ def main():
           all(i["tag"] != "vless-ws-0" for i in vcfg["inbounds"])
           and vcfg["inbounds"][0]["settings"]["clients"] == [],
           json.dumps([i["tag"] for i in vcfg["inbounds"]]))
+    # Policy pin: REALITY is an independent inbound with its own
+    # switch - it must never drag the plaintext protocols back on.
+    # With reality on (the default) and vless off (the default), the
+    # render holds a reality inbound and NO vless-ws inbound, and the
+    # mux still authenticates nobody.
+    reality_in = next((i for i in vcfg["inbounds"] if i["tag"] == "reality"),
+                      None)
+    rc, out, _ = cli("--json", "settings")
+    st0 = json.loads(out) if rc == 0 else {}
+    check("reality on + vless off: reality inbound present, no vless-ws,"
+          " mux clients empty (independent switches)",
+          reality_in is not None
+          and all(not i["tag"].startswith("vless-ws")
+                  for i in vcfg["inbounds"])
+          and vcfg["inbounds"][0]["settings"]["clients"] == []
+          and st0.get("reality_enabled") is True
+          and st0.get("vless_enabled") is False,
+          json.dumps([i["tag"] for i in vcfg["inbounds"]]) + out)
+    check("reality inbound clients are the users, with vision flow",
+          reality_in is not None
+          and {c["id"] for c in reality_in["settings"]["clients"]}
+              == {u["vless_uuid"] for u in json.loads(
+                      cli("--json", "list")[1])}
+          and all(c["flow"] == "xtls-rprx-vision"
+                  for c in reality_in["settings"]["clients"]),
+          json.dumps(reality_in))
     rc, out, err = cli("upstream-add", "upv", "--proto", "vless-ws",
                        "--addr", "10.0.0.9", "--port", "443",
                        "--uuid", "11111111-2222-3333-4444-555555555555")

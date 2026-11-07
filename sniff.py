@@ -5,6 +5,7 @@ Every protocol this node serves is client-speaks-first, so the opening
 bytes identify the protocol unambiguously:
 
   "SSH-" banner                      -> sshd            (SSH_BE_PORT)
+  TLS ClientHello (0x16 0x03 ...)    -> REALITY inbound (XRAY_REALITY_PORT)
   well-formed SOCKS5 greeting        -> SOCKS5 inbound  (BE_SOCKS_PORT;
                                         only with XMAGIC_ENABLE_SOCKS5=1,
                                         off by default: SOCKS5 is plaintext)
@@ -28,6 +29,7 @@ Environment:
   XRAY_MUX_PORT  Xray fallback mux       (default 18080)
   BE_HTTP_PORT   Xray http inbound       (default 18081)
   BE_SOCKS_PORT  Xray socks inbound      (default 18082)
+  XRAY_REALITY_PORT  Xray REALITY inbound (default 18083)
   SSH_BE_PORT    sshd port               (default 12222)
   ADMIN_BE_PORT  admin console backend   (default 18090)
   SNIFF_PEEK_TIMEOUT  seconds to wait for the client's first bytes (5)
@@ -46,6 +48,7 @@ TARGETS = {
     "mux": ("127.0.0.1", int(os.environ.get("XRAY_MUX_PORT", "18080"))),
     "http": ("127.0.0.1", int(os.environ.get("BE_HTTP_PORT", "18081"))),
     "socks": ("127.0.0.1", int(os.environ.get("BE_SOCKS_PORT", "18082"))),
+    "reality": ("127.0.0.1", int(os.environ.get("XRAY_REALITY_PORT", "18083"))),
     "ssh": ("127.0.0.1", int(os.environ.get("SSH_BE_PORT", "12222"))),
     "admin": ("127.0.0.1", int(os.environ.get("ADMIN_BE_PORT", "18090"))),
 }
@@ -83,6 +86,11 @@ def _looks_socks(data: bytes) -> bool:
 def classify(data: bytes) -> str:
     if data.startswith(b"SSH-"):
         return "ssh"
+    if len(data) >= 2 and data[0] == 0x16 and data[1] == 0x03:
+        # A TLS record opening a handshake: the REALITY inbound (a
+        # bare-Shadowsocks stream hitting both bytes at random is
+        # ~1/65536 and just fails its REALITY handshake).
+        return "reality"
     if SOCKS_PUBLIC and _looks_socks(data):
         return "socks"
     if data.startswith(b"CONNECT "):
@@ -134,6 +142,9 @@ def _decidable(data: bytes) -> bool:
     """
     if not data:
         return False
+    if data[0] == 0x16:
+        # TLS classification needs the record version byte too.
+        return len(data) >= 2
     if data[0] == 0x05 and SOCKS_PUBLIC:
         if len(data) < 2:
             return False

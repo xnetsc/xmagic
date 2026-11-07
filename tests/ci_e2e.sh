@@ -10,8 +10,9 @@
 # (default latest), E2E_KEEP=1 keeps the temp dir and containers for
 # debugging. The checks, identical for both forms: admin console on
 # the one public port, add-user + apply taking effect, HTTP CONNECT,
-# SOCKS5, VLESS-WS, bare Shadowsocks and VLESS-TCP through a client
-# Xray, SSH key login + `ssh -D`, and a second user added afterwards.
+# SOCKS5, VLESS-WS, bare Shadowsocks, VLESS-TCP and VLESS+REALITY
+# through a client Xray, SSH key login + `ssh -D`, and a second user
+# added afterwards.
 set -u
 
 # No ambient proxy may leak into the checks: the proxied fetches pass
@@ -154,6 +155,48 @@ check_via_client() { # check_via_client <proto>
   check "client xray $proto -> target" "$rc"
 }
 
+reality_client_config() { # -> config path (params from the node itself)
+  gw --json settings > "$WORK/settings.json" 2>"$WORK/settings.err"
+  python3 - "$WORK/settings.json" "$WORK/alice.json" "$PUB" "$CLI_PORT" \
+    "$WORK" <<'EOF'
+import json, sys
+settings = json.load(open(sys.argv[1]))
+creds = json.load(open(sys.argv[2]))
+pub, cli, work = int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
+out = {"protocol": "vless",
+       "settings": {"vnext": [{"address": "127.0.0.1", "port": pub,
+                    "users": [{"id": creds["vless_uuid"],
+                               "encryption": "none",
+                               "flow": "xtls-rprx-vision"}]}]},
+       "streamSettings": {"network": "tcp", "security": "reality",
+                          "realitySettings": {
+                              "serverName":
+                                  settings["reality_server_names"][0],
+                              "fingerprint": "chrome",
+                              "publicKey": settings["reality_public_key"],
+                              "shortId": settings["reality_short_ids"][0],
+                              "spiderX": ""}}}
+cfg = {"log": {"loglevel": "warning"},
+       "inbounds": [{"listen": "127.0.0.1", "port": cli,
+                     "protocol": "socks",
+                     "settings": {"auth": "noauth", "udp": False}}],
+       "outbounds": [out]}
+path = f"{work}/client-reality.json"
+json.dump(cfg, open(path, "w"), indent=1)
+print(path)
+EOF
+}
+check_reality() {
+  local cfg out rc
+  cfg=$(reality_client_config)
+  "$WORK/xray" run -c "$cfg" > "$WORK/client-reality.log" 2>&1 &
+  CLIENT_PID=$!
+  sleep 2
+  out=$(fetch_retry --socks5-hostname "127.0.0.1:$CLI_PORT" "$TARGET"); rc=$?
+  kill "$CLIENT_PID" 2>/dev/null; CLIENT_PID=""
+  check "client xray vless+reality -> target" "$rc"
+}
+
 # ------------------------------------------------------------ setup
 
 mkdir -p "$WORK/stub"
@@ -220,6 +263,7 @@ check "SOCKS5 (alice) -> target" "$?"
 check_via_client vless-ws
 check_via_client ss
 check_via_client vless-tcp
+check_reality
 
 ssh -D "$SSH_D_PORT" -N -i "$WORK/alice_key" -p "$PUB" \
   -o BatchMode=yes -o StrictHostKeyChecking=no \

@@ -2,10 +2,12 @@
 """Dispatcher routing tests: stub backends + the real sniff.py.
 
 One public port must split traffic by content: SSH banner -> sshd,
-0x05 -> SOCKS, CONNECT / absolute-form HTTP -> HTTP proxy inbound,
-WebSocket upgrade -> Xray mux, origin-form HTTP (a browser) -> the
-admin console, anything else -> mux. Each stub backend answers with
-its own name, so the client's received bytes prove the routing.
+TLS ClientHello -> the REALITY backend, 0x05 -> SOCKS (only when the
+public SOCKS5 branch is enabled; off by default it falls to the mux),
+CONNECT / absolute-form HTTP -> HTTP proxy inbound, WebSocket upgrade
+-> Xray mux, origin-form HTTP (a browser) -> the admin console,
+anything else -> mux. Each stub backend answers with its own name, so
+the client's received bytes prove the routing.
 """
 import os
 import socket
@@ -25,7 +27,7 @@ def check(name, cond, extra=""):
 
 BASE = 19100
 PORTS = {"mux": BASE, "http": BASE + 1, "socks": BASE + 2,
-         "ssh": BASE + 3, "admin": BASE + 4}
+         "ssh": BASE + 3, "admin": BASE + 4, "reality": BASE + 5}
 PUBLIC = BASE + 9
 
 
@@ -72,7 +74,8 @@ def main():
     env = dict(os.environ, XRAY_PORT=str(PUBLIC),
                XRAY_MUX_PORT=str(PORTS["mux"]), BE_HTTP_PORT=str(PORTS["http"]),
                BE_SOCKS_PORT=str(PORTS["socks"]), SSH_BE_PORT=str(PORTS["ssh"]),
-               ADMIN_BE_PORT=str(PORTS["admin"]))
+               ADMIN_BE_PORT=str(PORTS["admin"]),
+               XRAY_REALITY_PORT=str(PORTS["reality"]))
     proc = subprocess.Popen([sys.executable, os.path.join(ROOT, "sniff.py")],
                             env=env, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True)
@@ -96,7 +99,8 @@ def main():
             ("browser GET / -> admin", b"GET / HTTP/1.1\r\nHost: h\r\n\r\n", b"admin"),
             ("console API POST -> admin",
              b"POST /api/users HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\n\r\n{}", b"admin"),
-            ("binary protocol bytes -> mux", b"\x16\x03\x01\x00\x80\x01\x03", b"mux"),
+            ("TLS ClientHello bytes -> reality",
+             b"\x16\x03\x01\x00\x80\x01\x03", b"reality"),
         ]
         for name, payload, want in cases:
             got = probe(payload)
@@ -110,6 +114,8 @@ def main():
               b"rade: websocket\r\n\r\n"], b"mux"),
             ("fragmented SSH banner -> sshd",
              [b"SS", b"H-2.0-probe\r\n"], b"ssh"),
+            ("fragmented TLS ClientHello -> reality",
+             [b"\x16", b"\x03\x01\x00\x80\x01\x03"], b"reality"),
             ("fragmented SOCKS greeting -> mux (off by default)",
              [b"\x05", b"\x01\x00"], b"mux"),
             ("SS salt starting 0x05, bogus greeting -> mux",

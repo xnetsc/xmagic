@@ -985,7 +985,8 @@ def api_get_settings():
         info["db_values"] = {
             k: users_mod.get_setting(conn, k) for k in
             ("vless_ws_paths", "trojan_ws_paths", "upstream_strategy", "ss_method",
-             "interconnect_off_groups")}
+             "interconnect_off_groups", "reality_dest", "reality_server_names",
+             "reality_short_ids")}
     info.update({
         "session_ttl_default": users_mod.SESSION_TTL_HOURS_DEFAULT,
         "session_ttl_min": users_mod.SESSION_TTL_HOURS_MIN,
@@ -1040,6 +1041,38 @@ def api_set_settings(body):
                                       "1" if value else "0")
             else:
                 raise ApiError(400, "vless_enabled must be a boolean")
+        if "reality_enabled" in body:
+            render_relevant = True
+            value = body["reality_enabled"]
+            if value is None:
+                users_mod.delete_setting(conn, "reality_enabled")
+            elif isinstance(value, bool):
+                users_mod.set_setting(conn, "reality_enabled",
+                                      "1" if value else "0")
+            else:
+                raise ApiError(400, "reality_enabled must be a boolean")
+        for key, parse in (("reality_dest", users_mod.validate_reality_dest),
+                           ("reality_server_names",
+                            lambda v: ",".join(
+                                users_mod.parse_reality_names(v))),
+                           ("reality_short_ids",
+                            lambda v: ",".join(
+                                users_mod.parse_reality_short_ids(v)))):
+            if key in body:
+                render_relevant = True
+                value = body[key]
+                if value is None or value == "" or value == []:
+                    users_mod.delete_setting(conn, key)
+                else:
+                    if isinstance(value, list):
+                        value = ",".join(str(v) for v in value)
+                    try:
+                        users_mod.set_setting(conn, key, parse(str(value)))
+                    except ValueError as exc:
+                        raise ApiError(400, str(exc))
+        if body.get("reality_rotate_key"):
+            render_relevant = True
+            users_mod.rotate_reality_key(conn)
         if "direct_allow_private" in body:
             render_relevant = True
             value = body["direct_allow_private"]
@@ -1750,11 +1783,17 @@ td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
               <div><label>新用户默认 SS 方法</label><select name="ss_method"></select></div>
               <div class="wide" id="row-vless-paths"><label>VLESS WS 路径（逗号分隔）</label><input name="vless_ws_paths"></div>
               <div class="wide"><label>Trojan WS 路径（逗号分隔）</label><input name="trojan_ws_paths"></div>
+              <div class="wide"><label>REALITY 目标站点 dest（host:port，TLS 1.3 站点）</label><input name="reality_dest"></div>
+              <div class="wide"><label>REALITY serverNames（逗号分隔）</label><input name="reality_server_names"></div>
+              <div class="wide"><label>REALITY shortIds（逗号分隔，偶数长度 hex，最长 16）</label><input name="reality_short_ids"></div>
+              <div class="wide"><label>REALITY 公钥（客户端 pbk，只读）</label><input name="reality_public_key" readonly></div>
               <div class="wide"><label>关闭组内互访的分组（逗号分隔，空 = 全部组互访）</label><input name="interconnect_off_groups" placeholder="例如 team"></div>
             </div>
             <div class="form-actions">
               <span class="check"><input type="checkbox" name="direct_allow_private" id="set-dap"><label for="set-dap">允许直连内网地址</label></span>
               <span class="check"><input type="checkbox" name="vless_enabled" id="set-vless"><label for="set-vless">启用 VLESS 入站（默认关：协议自身不加密）</label></span>
+              <span class="check"><input type="checkbox" name="reality_enabled" id="set-reality"><label for="set-reality">启用 REALITY 入站（默认开：VLESS + REALITY，与 VLESS 开关无关）</label></span>
+              <button type="button" id="btn-reality-rotate">轮换 REALITY 密钥</button>
               <button class="primary">保存</button>
             </div>
           </form>
@@ -1767,7 +1806,11 @@ td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
           互访，如同在同一局域网；不想互访的分组填到上面即关闭该组互访。非同组成员拨回环一律拦截。<br>
           默认不加密的协议不开：VLESS 入站默认关闭（协议自身不加密，需要时勾选上面的开关开启）；
           公网 SOCKS5 默认关闭（明文且不能借道 HTTPS，靠部署环境变量 XMAGIC_ENABLE_SOCKS5=1 开启）。
-          Trojan（设计上强制 TLS）、Shadowsocks（自带加密）、HTTP 代理（借道外层 HTTPS）不受影响。</p>
+          Trojan（设计上强制 TLS）、Shadowsocks（自带加密）、HTTP 代理（借道外层 HTTPS）不受影响。<br>
+          REALITY 入站默认开启且与 VLESS 开关独立：客户端以 VLESS + REALITY（flow xtls-rprx-vision、
+          fingerprint chrome）直连公网口，参数取上面的 dest / serverNames / shortIds 与公钥加上用户自己的 UUID；
+          轮换密钥后旧公钥立即失效，客户端需同步更新。REALITY 需要裸 TCP 直达公网口，
+          经 TLS 终结型边缘（如平台的 HTTPS 域名）无法透传。</p>
           <div class="divider">
             <p class="small" style="margin:0 0 .5rem"><span id="admin-line"></span></p>
             <button type="button" id="btn-replace">更换管理员 Passkey</button>
@@ -2029,6 +2072,21 @@ async function refresh() {
   sf.querySelector("[name=vless_enabled]").checked =
     !!settings.vless_enabled;
   window.__vlessOn = !!settings.vless_enabled;
+  sf.querySelector("[name=reality_enabled]").checked =
+    !!settings.reality_enabled;
+  sf.querySelector("[name=reality_dest]").value =
+    settings.db_values.reality_dest || "";
+  sf.querySelector("[name=reality_dest]").placeholder = settings.reality_dest;
+  sf.querySelector("[name=reality_server_names]").value =
+    settings.db_values.reality_server_names || "";
+  sf.querySelector("[name=reality_server_names]").placeholder =
+    settings.reality_server_names.join(",");
+  sf.querySelector("[name=reality_short_ids]").value =
+    settings.db_values.reality_short_ids || "";
+  sf.querySelector("[name=reality_short_ids]").placeholder =
+    settings.reality_short_ids.join(",");
+  sf.querySelector("[name=reality_public_key]").value =
+    settings.reality_public_key;
   buildUpProtoOptions(); buildUpAddBtns(); syncUpProto(); syncVlessPaths();
   sf.querySelector("[name=interconnect_off_groups]").value =
     settings.db_values.interconnect_off_groups || "";
@@ -2458,9 +2516,18 @@ $("form-settings").onsubmit = async e => { e.preventDefault();
       upstream_strategy: f.querySelector("[name=upstream_strategy]").value,
       direct_allow_private: f.querySelector("[name=direct_allow_private]").checked,
       vless_enabled: f.querySelector("[name=vless_enabled]").checked,
+      reality_enabled: f.querySelector("[name=reality_enabled]").checked,
+      reality_dest: f.querySelector("[name=reality_dest]").value,
+      reality_server_names: f.querySelector("[name=reality_server_names]").value,
+      reality_short_ids: f.querySelector("[name=reality_short_ids]").value,
       interconnect_off_groups: f.querySelector("[name=interconnect_off_groups]").value,
       ss_method: f.querySelector("[name=ss_method]").value});
     msg("设置已保存。" + (r.applied ? appliedText(r.applied) : ""), true); refresh(); }
+  catch (err) { msg(String(err)); } };
+$("btn-reality-rotate").onclick = async () => {
+  try { const r = await api("/api/settings", {reality_rotate_key: true});
+    msg("REALITY 密钥已轮换，新公钥：" + r.reality_public_key + "。"
+      + (r.applied ? appliedText(r.applied) : ""), true); refresh(); }
   catch (err) { msg(String(err)); } };
 $("btn-replace").onclick = () => $("btn-register").onclick();
 const VIEW_TITLES = {overview: "概览", users: "代理用户", upstreams: "上级节点",

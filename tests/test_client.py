@@ -15,6 +15,7 @@ Run: python3 tests/test_client.py
 import http.client
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -370,6 +371,61 @@ def main():
         rc, out, err = cli("--json", "settings", "set", "--no-vless-enabled")
         check("settings set --no-vless-enabled via remote CLI",
               rc == 0 and json.loads(out)["vless_enabled"] is False,
+              err + out)
+        rc, out, err = cli("--json", "settings", "show")
+        st = json.loads(out)
+        check("settings show carries the reality client parameters",
+              rc == 0 and st["reality_enabled"] is True
+              and st["reality_dest"] == "www.microsoft.com:443"
+              and st["reality_server_names"] == ["www.microsoft.com"]
+              and len(st["reality_short_ids"]) == 1
+              and len(st["reality_public_key"]) == 43,
+              err + out)
+        with sqlite3.connect(os.path.join(
+                workdir, "a", "data", "users.db")) as raw:
+            priv = raw.execute("SELECT value FROM admin_settings"
+                               " WHERE key = 'reality_private_key'"
+                               ).fetchone()[0]
+        check("reality private key never reaches the remote CLI",
+              priv not in out and "reality_private_key" not in out, out)
+        rc, out, err = cli("--json", "settings", "set",
+                           "--reality-dest", "www.apple.com:443",
+                           "--reality-server-names", "www.apple.com",
+                           "--reality-short-ids", "0123abcd,eeff")
+        st = json.loads(out) if rc == 0 else {}
+        check("settings set reality dest/names/short ids via remote CLI",
+              rc == 0 and st["reality_dest"] == "www.apple.com:443"
+              and st["reality_server_names"] == ["www.apple.com"]
+              and st["reality_short_ids"] == ["0123abcd", "eeff"],
+              err + out)
+        pub_before_rotate = st.get("reality_public_key")
+        rc, out, err = cli("--json", "settings", "set",
+                           "--reality-rotate-key")
+        st = json.loads(out) if rc == 0 else {}
+        check("settings set --reality-rotate-key via remote CLI",
+              rc == 0 and len(st.get("reality_public_key", "")) == 43
+              and st["reality_public_key"] != pub_before_rotate,
+              err + out)
+        pub_rotated = st.get("reality_public_key")
+        rc, out, err = cli("--json", "settings", "show")
+        check("rotated reality public key persists on the node",
+              rc == 0
+              and json.loads(out)["reality_public_key"] == pub_rotated,
+              err + out)
+        rc, out, err = cli("settings", "set", "--no-reality-enabled")
+        check("settings set --no-reality-enabled (human output)",
+              rc == 0 and "reality_enabled=False" in out, err + out)
+        rc, out, err = cli("--json", "settings", "set",
+                           "--reality-enabled",
+                           "--reality-dest", "",
+                           "--reality-server-names", "",
+                           "--reality-short-ids", "")
+        st = json.loads(out) if rc == 0 else {}
+        check("settings reality restored and cleared to defaults",
+              rc == 0 and st["reality_enabled"] is True
+              and st["reality_dest"] == "www.microsoft.com:443"
+              and st["reality_server_names"] == ["www.microsoft.com"]
+              and len(st["reality_short_ids"]) == 1,
               err + out)
         rc, out, err = cli("settings", "set", "--interconnect-off-groups",
                            "team")

@@ -3,7 +3,7 @@
 [English](README.md) | **中文**
 
 一句话：**一个公共端口，凭协议首字节自动分发**，同时提供 SSH、
-HTTP 代理（CONNECT）、Trojan-WS、裸 Shadowsocks；
+HTTP 代理（CONNECT）、Trojan-WS、VLESS+REALITY、裸 Shadowsocks；
 自身不带加密的协议默认不开：VLESS-WS、VLESS（裸 TCP）（在设置里
 开启）与公网 SOCKS5（`XMAGIC_ENABLE_SOCKS5=1`）；HTTP 留着是因为
 它借道外层 HTTPS，Trojan 设计上强制 TLS，Shadowsocks 自带加密。
@@ -27,6 +27,7 @@ HTTP 代理（CONNECT）、Trojan-WS、裸 Shadowsocks；
     (公钥认证)   (默认关)  (用户+密码)   ├ 路径命中 → VLESS-WS 后端（可多路径，默认关）
                                             ├ 路径命中 → Trojan-WS 后端（可多路径）
                                             └ 默认回落 → 裸 Shadowsocks 后端
+     TLS ClientHello（0x16 0x03）───────────→ VLESS+REALITY 后端（默认开）
                                    │
                         出口：直连，或上级池（按用户分组、负载均衡）
 ```
@@ -48,10 +49,12 @@ HTTP 代理（CONNECT）、Trojan-WS、裸 Shadowsocks；
 | HTTP 代理 | Xray http 入站（CONNECT） | Xray http 出站 | Basic（可空） |
 | VLESS-WS | WS 路径分发 → 后端（**默认关闭**：VLESS 自身不加密，在设置里开启） | 同左 | uuid |
 | VLESS（裸 TCP） | 分发器 → 复用器主入站直达（**默认关闭**） | 同左 | uuid |
+| VLESS+REALITY | TLS ClientHello 分发 → REALITY 后端（**默认开启**，与 VLESS 开关无关） | —（仅入站） | uuid |
 | Trojan-WS | WS 路径分发 → 后端 | 同左 | 密码 |
 | Shadowsocks | 默认回落 → 后端 | 同左 | 每用户独立密码+method |
 
-每个用户在库里是一套凭证：VLESS uuid、一个共享密码（Trojan / HTTP / SOCKS 共用）、
+每个用户在库里是一套凭证：VLESS uuid（VLESS 入站开启时用，REALITY 入站也用它）、
+一个共享密码（Trojan / HTTP / SOCKS 共用）、
 独立的 SS 密码、可选的 SSH 公钥。连上级时存的也是对方按同一模型签发的凭证——
 **两段认证各管一段**：用户连本节点用本节点签发的凭证（在本节点终结）；本节点连
 上级用上级签发的凭证（存在本节点的上级记录里）。同组用户在上级侧呈现为同一身份，
@@ -95,9 +98,10 @@ HTTP 代理（CONNECT）、Trojan-WS、裸 Shadowsocks；
 
 后台「设置」里除了会话有效期，还管几项原本只能写在 .env 里的渲染级配置，
 以及组内互访的分组退出名单（互访默认开启，见下文「组内互访」）：
-VLESS / Trojan 的 WS 路径列表、上级池策略、新用户的默认 SS 方法、是否允许
-直连内网地址。存进库里的值优先生效，清空即回退到 .env 的部署默认值；保存
-后自动重新渲染生效。端口类配置不在此列——它们绑在分发器 / sshd 进程上，
+VLESS / Trojan 的 WS 路径列表、上级池策略、新用户的默认 SS 方法、REALITY
+开关与伪装参数（见下一节）、是否允许直连内网地址。存进库里的值优先生效，
+清空即回退到 .env 的部署默认值；保存
+后自动重新渲染生效。端口类配置不在此列——端口绑在分发器 / sshd 进程上，
 仍是 .env + compose 的事。
 
 两个默认不加密的协议不开，除非运维显式选择加入：VLESS 入站
@@ -110,6 +114,54 @@ HTTP、借不了外层 HTTPS 的道）。
 直连时不能访问节点本机与内网地址（Xray freedom 出站的默认拦截规则，
 防 SSRF）；节点需要访问自家局域网服务时才打开，打开后渲染出的 freedom
 出站会带一条放行内网段的 finalRule。
+
+### VLESS+REALITY 入站（默认开）
+
+REALITY 让网关多一条外观与真实网站 TLS 1.3 会话无异的入站：握手借用
+伪装目标站点的证书与参数，未能通过 REALITY 认证的连接会被直接转发到
+该真站——拿探测打这个端口，看到的就是真站本身。与裸 VLESS 不同，
+REALITY 自带加密与伪装，因此**默认开启，且与 VLESS 开关相互独立**：
+关掉 VLESS 不会关掉 REALITY，反之亦然。客户端用各用户已有的 UUID，
+flow 为 `xtls-rprx-vision`。
+
+设置项（Web 后台、`users.py settings`、远程 CLI `settings set` 三面
+一致，库里的值胜过 `REALITY_*` 环境变量）：开关、伪装目标 `dest`
+（默认 `www.microsoft.com:443`）、客户端可用的 `serverNames`、
+`shortIds`。节点的 REALITY 密钥对生成一次后存库；设置里展示**公钥**
+（客户端配置要用，私钥永不离开节点），并可轮换——轮换后仍用旧公钥
+的客户端配置立即失效。
+
+目标站点怎么选：节点能直达的、支持 **TLS 1.3** 的普通高流量境外
+HTTPS 站点即可，默认的 `www.microsoft.com:443` 就可用；`serverNames`
+里填的名字必须在其证书覆盖范围内。
+
+客户端配置（Xray）：地址/端口是节点的公网入口，其余参数取自设置页
+与用户自己的 UUID：
+
+```json
+{
+  "protocol": "vless",
+  "settings": {"vnext": [{"address": "<节点>", "port": 8080,
+    "users": [{"id": "<用户 uuid>", "encryption": "none",
+               "flow": "xtls-rprx-vision"}]}]},
+  "streamSettings": {"network": "tcp", "security": "reality",
+    "realitySettings": {"serverName": "www.microsoft.com",
+      "fingerprint": "chrome",
+      "publicKey": "<设置里的 reality_public_key>",
+      "shortId": "<reality_short_ids 之一>", "spiderX": ""}}
+}
+```
+
+同样的配置写成分享链接：
+
+```
+vless://<用户 uuid>@<节点>:8080?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=chrome&pbk=<reality_public_key>&sid=<shortId>#xmagic-reality
+```
+
+REALITY 是裸 TLS 直达公网口：需要 `XRAY_PORT` 的 **TCP 直达**
+（VPS 直连端口，或裸 TCP 转发）。它无法穿过 TLS 终结型边缘——例如
+平台的 HTTPS 域名（在边缘终结 TLS 后转发 HTTP）——因为客户端的
+TLS 握手必须原封不动地到达 REALITY 入站。
 
 ## 管理界面二：命令行（与 Web 功能完全一致）
 
