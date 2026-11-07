@@ -307,17 +307,6 @@ python3 users.py route-add --kind full --pattern example.com --to intl --user ca
 
 ## 部署
 
-平台现实先说清：**不要部署在 Railway**——其 AUP 明文禁止运营代理/匿名化
-服务，官方对同类自用需求明确回复不允许且有自动检测；同工作区里的其它
-项目不要连带冒险，本项目不提供 Railway 部署入口。**Vercel 跑不了**：
-它只有函数式运行时，没有常驻容器、也没有裸 TCP 入口，因此同样没有
-部署按钮。**Heroku 只能跑单容器形态的降级版**（见「一键部署」）：
-它的路由只放 HTTP(S) 进来，裸 TCP 协议用不了。完整功能请用 VPS 或
-Oracle 免费机 + compose。
-
-首选 Oracle Cloud Always Free（ARM 2 OCPU / 12 GB 现行额度；注册须本人用真实卡
-验证、home region 选定后不可改）。任意允许自用代理的 VPS 也可以。
-
 ```bash
 git clone https://github.com/xnetsc/xmagic && cd xmagic
 cp .env.example .env                 # 至少设 XRAY_PORT、WS 路径
