@@ -172,6 +172,66 @@ def drive_replace(cli_home, port, current_auth, new_auth):
     return proc.returncode, out, err
 
 
+def spawn_login(cli_home):
+    """Start `xmagic login --no-browser`; return (proc, callback, state)
+    parsed from the printed auth URL."""
+    env = dict(os.environ, XMAGIC_HOME=cli_home)
+    proc = subprocess.Popen(
+        [sys.executable, os.path.join(ROOT, "xmagic.py"), "login",
+         "--no-browser"],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    url = None
+    while True:
+        line = proc.stdout.readline()
+        if not line:
+            break
+        if line.startswith("http"):
+            url = line.strip()
+            break
+    if url is None:
+        out, err = proc.communicate()
+        raise RuntimeError(f"login printed no URL: {out} {err}")
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+    return proc, query["callback"][0], query["state"][0]
+
+
+def hit_listener(callback, path):
+    p = urllib.parse.urlparse(callback)
+    conn = http.client.HTTPConnection(p.hostname, p.port, timeout=10)
+    conn.request("GET", path)
+    resp = conn.getresponse()
+    resp.read()
+    conn.close()
+    return resp.status
+
+
+def drive_login_stray(cli_home, port, auth):
+    """Login while stray requests (favicon, bare /) hit the loopback
+    listener before the real callback - they must be ignored, not
+    mistaken for a failed handoff."""
+    proc, callback, state = spawn_login(cli_home)
+    hit_listener(callback, "/favicon.ico")
+    hit_listener(callback, "/")
+    browser = Browser(port)
+    status, _ = browser.call("GET", f"/cli-auth?callback="
+                             f"{urllib.parse.quote(callback)}&state={state}")
+    assert status == 200, status
+    origin = f"http://localhost:{port}"
+    _, opts = browser.call("POST", "/api/login/options", {})
+    status, body = browser.call(
+        "POST", "/api/login/verify",
+        auth.assertion(opts["challenge"], "localhost", origin))
+    assert status == 200, body
+    status, body = browser.call("POST", "/api/cli-token",
+                                {"callback": callback, "state": state})
+    assert status == 200, body
+    hit_listener(body["redirect"], urllib.parse.urlparse(
+        body["redirect"]).path + "?" + urllib.parse.urlparse(
+            body["redirect"]).query)
+    out, err = proc.communicate(timeout=30)
+    return proc.returncode, out, err
+
+
 def main():
     workdir = tempfile.mkdtemp(prefix="xmagic-client-test-")
     cli_home = os.path.join(workdir, "home")
@@ -198,6 +258,18 @@ def main():
         session_a = os.path.join(cli_home, "sessions", "a.json")
         check("browser login to A succeeds", rc == 0, err)
         check("session file stored per node", os.path.exists(session_a))
+
+        # Stray requests to the loopback listener (favicon, probes)
+        # must not poison the login; a callback carrying a genuinely
+        # wrong state must still abort it.
+        rc, out, err = drive_login_stray(cli_home, PORT_A, auth_a)
+        check("login tolerates stray listener hits before the callback",
+              rc == 0 and "logged in" in out, err + out)
+        proc, callback, _state = spawn_login(cli_home)
+        hit_listener(callback, "/callback?code=fake&state=wrong-state")
+        out, err = proc.communicate(timeout=30)
+        check("callback with a wrong state still aborts the login",
+              proc.returncode == 3 and "state mismatch" in err, err + out)
         if os.path.exists(session_a):
             mode = os.stat(session_a).st_mode & 0o777
             check("session file is 0600", mode == 0o600, oct(mode))

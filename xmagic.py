@@ -203,8 +203,20 @@ class _CallbackHandler(http.server.BaseHTTPRequestHandler):
     result = None
 
     def do_GET(self):
-        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-        _CallbackHandler.result = {k: v[0] for k, v in query.items()}
+        parsed = urllib.parse.urlparse(self.path)
+        query = {k: v[0] for k, v in
+                 urllib.parse.parse_qs(parsed.query).items()}
+        if parsed.path != "/callback" or "code" not in query \
+                or "state" not in query:
+            # Not the handoff: a favicon fetch, a browser probe, a
+            # restored completion tab re-requesting its page. Answer
+            # and keep waiting - a stray request must not pose as the
+            # callback and abort the login as a "state mismatch".
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        _CallbackHandler.result = query
         body = ("<!DOCTYPE html><meta charset=utf-8><title>xmagic</title>"
                 "<p>登录完成，可以关闭这个页面，回到命令行。</p>").encode()
         self.send_response(200)
@@ -221,6 +233,7 @@ def cmd_login(args):
     cfg, _ = load_config(args)
     name, url = resolve_node(args, cfg)
     state = secrets.token_urlsafe(16)
+    _CallbackHandler.result = None
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _CallbackHandler)
     port = server.server_address[1]
     callback = f"http://127.0.0.1:{port}/callback"
