@@ -1,0 +1,76 @@
+name: build
+
+# Build and publish all gateway images to GHCR.
+# Runs on code changes and on demand; the upstream-check workflow also
+# dispatches it after bumping the pinned Xray version. The test job is
+# the gate: images are only built when the admin console + CLI suites
+# pass.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile.*"
+      - "*.py"
+      - "sshd_config"
+      - "versions.env"
+      - "tests/**"
+      - ".github/workflows/build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Admin console + CLI parity tests
+        run: |
+          python3 tests/test_admin.py
+          python3 tests/test_cli.py
+          python3 tests/test_client.py
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: xray, dockerfile: Dockerfile.xray }
+          - { name: dispatcher, dockerfile: Dockerfile.dispatcher }
+          - { name: sshd, dockerfile: Dockerfile.sshd }
+          - { name: admin, dockerfile: Dockerfile.admin }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read pinned versions
+        id: pins
+        run: |
+          set -a; . ./versions.env; set +a
+          echo "xray_version=$XRAY_VERSION" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            XRAY_VERSION=${{ steps.pins.outputs.xray_version }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/xmagic-${{ matrix.name }}:latest
+            ghcr.io/${{ github.repository_owner }}/xmagic-${{ matrix.name }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
