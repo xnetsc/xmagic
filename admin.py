@@ -604,13 +604,14 @@ def api_list_users():
     with users_mod.db() as conn:
         rows = conn.execute("SELECT * FROM users ORDER BY username").fetchall()
         members = users_mod.interconnect_members(conn)
+        v_on = users_mod.vless_enabled(conn)
     users = []
     for r in rows:
         d = _user_dict(r, with_secrets=True)
         if r["username"] in members:
             d["interconnect"] = list(members[r["username"]])
         users.append(d)
-    return {"users": users}
+    return {"users": users, "vless_enabled": v_on}
 
 
 def api_add_user(body):
@@ -633,8 +634,10 @@ def api_add_user(body):
         except users_mod.IntegrityError:
             raise ApiError(409, f"user already exists: {username}")
         row = users_mod.get_user(conn, username)
+        v_on = users_mod.vless_enabled(conn)
     applied = apply_changes()
-    return {"user": _user_dict(row, with_secrets=True), "applied": applied}
+    return {"user": _user_dict(row, with_secrets=True), "applied": applied,
+            "vless_enabled": v_on}
 
 
 def api_user_action(username, action, body):
@@ -670,8 +673,9 @@ def api_user_action(username, action, body):
             raise ApiError(404, f"unknown user action {action}")
         row = conn.execute("SELECT * FROM users WHERE username = ?",
                            (username,)).fetchone() if action != "remove" else None
+        v_on = users_mod.vless_enabled(conn)
     applied = apply_changes()
-    return {"applied": applied,
+    return {"applied": applied, "vless_enabled": v_on,
             "user": _user_dict(row, with_secrets=True) if row else None}
 
 
@@ -889,6 +893,16 @@ def api_set_settings(body):
                     raise ApiError(400, f"{key} must be one of {choices}")
                 else:
                     users_mod.set_setting(conn, key, value)
+        if "vless_enabled" in body:
+            render_relevant = True
+            value = body["vless_enabled"]
+            if value is None:
+                users_mod.delete_setting(conn, "vless_enabled")
+            elif isinstance(value, bool):
+                users_mod.set_setting(conn, "vless_enabled",
+                                      "1" if value else "0")
+            else:
+                raise ApiError(400, "vless_enabled must be a boolean")
         if "direct_allow_private" in body:
             render_relevant = True
             value = body["direct_allow_private"]
@@ -1397,7 +1411,7 @@ td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
       <section class="view" data-view="users">
         <div class="card">
           <h2>代理用户</h2>
-          <p class="sub">每个用户有一套 VLESS / Trojan / HTTP / SOCKS 凭证与独立的 Shadowsocks 密码，可选登记 SSH 公钥。</p>
+          <p class="sub">每个用户有一套 Trojan / HTTP 凭证与独立的 Shadowsocks 密码，可选登记 SSH 公钥。VLESS 默认关闭（在「设置」里开启后凭 UUID 接入），公网 SOCKS5 默认关闭。</p>
           <div class="tbl-wrap"><table id="users-table"></table></div>
           <form id="form-user">
             <div class="form-grid">
@@ -1491,6 +1505,7 @@ td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
             </div>
             <div class="form-actions">
               <span class="check"><input type="checkbox" name="direct_allow_private" id="set-dap"><label for="set-dap">允许直连内网地址</label></span>
+              <span class="check"><input type="checkbox" name="vless_enabled" id="set-vless"><label for="set-vless">启用 VLESS 入站（默认关：协议自身不加密）</label></span>
               <button class="primary">保存</button>
             </div>
           </form>
@@ -1500,7 +1515,10 @@ td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
           （Xray 的防 SSRF 默认规则）；节点需要访问自家局域网服务时再打开。<br>
           组内互访默认开启：同一分组的成员可用 <code>ssh -R</code> 把自己机器上的服务暴露到网关回环的
           专属端口段（每人 16 个端口，见用户列表），同组成员经代理拨 <code>127.0.0.1:端口</code> 即可
-          互访，如同在同一局域网；不想互访的分组填到上面即关闭该组互访。非同组成员拨回环一律拦截。</p>
+          互访，如同在同一局域网；不想互访的分组填到上面即关闭该组互访。非同组成员拨回环一律拦截。<br>
+          默认不加密的协议不开：VLESS 入站默认关闭（协议自身不加密，需要时勾选上面的开关开启）；
+          公网 SOCKS5 默认关闭（明文且不能借道 HTTPS，靠部署环境变量 XMAGIC_ENABLE_SOCKS5=1 开启）。
+          Trojan（设计上强制 TLS）、Shadowsocks（自带加密）、HTTP 代理（借道外层 HTTPS）不受影响。</p>
           <div class="divider">
             <p class="small" style="margin:0 0 .5rem"><span id="admin-line"></span></p>
             <button type="button" id="btn-replace">更换管理员 Passkey</button>
@@ -1603,11 +1621,13 @@ async function refresh() {
   $("stat-routes").textContent = s.enabled_routes;
   $("stat-port").textContent = s.public_port;
   $("stat-restart").textContent = restartName;
-  const users = (await api("/api/users")).users;
+  const usersResp = await api("/api/users");
+  const users = usersResp.users;
+  window.__vlessOn = !!usersResp.vless_enabled;
   $("users-table").innerHTML = "<tr><th>用户</th><th>分组</th><th>启用</th><th>凭证</th><th>操作</th></tr>" +
     users.map(u => `<tr><td><strong>${u.username}</strong>${u.note ? `<br><span class="small">${u.note}</span>` : ""}</td><td>${u.group}</td>
       <td><span class="badge ${u.enabled ? "on" : "off"}">${u.enabled ? "启用" : "停用"}</span></td>
-      <td><code>uuid ${u.vless_uuid}<br>密码 ${u.password}<br>ss ${u.ss_method} / ${u.ss_password}` +
+      <td><code>vless uuid ${u.vless_uuid}${window.__vlessOn ? "" : "（未启用）"}<br>密码 ${u.password}<br>ss ${u.ss_method} / ${u.ss_password}` +
       `${u.ssh_key ? "<br>SSH 公钥已登记<br>ssh -D 1080 -N -i xmagic-" + u.username + ".key -p " + s.public_port + " proxy@" + location.hostname : ""}${u.interconnect ? "<br>组内互访端口 " + u.interconnect[0] + "-" + u.interconnect[1] : ""}</code></td>
       <td><div class="row-actions"><button class="sm" data-act="passwd" data-u="${u.username}">换密码</button>
       <button class="sm" data-act="rotate-uuid" data-u="${u.username}">换UUID</button>
@@ -1641,6 +1661,8 @@ async function refresh() {
     `<option ${x === settings.ss_method ? "selected" : ""}>${x}</option>`).join("");
   sf.querySelector("[name=direct_allow_private]").checked =
     !!settings.direct_allow_private;
+  sf.querySelector("[name=vless_enabled]").checked =
+    !!settings.vless_enabled;
   sf.querySelector("[name=interconnect_off_groups]").value =
     settings.db_values.interconnect_off_groups || "";
   $("admin-line").textContent = s.admin_registered
@@ -1883,6 +1905,7 @@ $("form-settings").onsubmit = async e => { e.preventDefault();
       trojan_ws_paths: f.querySelector("[name=trojan_ws_paths]").value,
       upstream_strategy: f.querySelector("[name=upstream_strategy]").value,
       direct_allow_private: f.querySelector("[name=direct_allow_private]").checked,
+      vless_enabled: f.querySelector("[name=vless_enabled]").checked,
       interconnect_off_groups: f.querySelector("[name=interconnect_off_groups]").value,
       ss_method: f.querySelector("[name=ss_method]").value});
     msg("设置已保存。" + (r.applied ? appliedText(r.applied) : ""), true); refresh(); }

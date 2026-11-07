@@ -20,11 +20,13 @@ likewise. Credential model per user (one identity, several protocol secrets):
 
 A first-byte dispatcher (sniff.py) owns the single public port and routes
 each connection by its opening bytes: "SSH-" banner -> sshd; a
-well-formed SOCKS5 greeting -> SOCKS5 inbound; HTTP CONNECT /
-absolute-form -> HTTP-proxy inbound; HTTP with a WebSocket Upgrade ->
-the Xray fallback mux (WS paths, then bare Shadowsocks as the default);
-origin-form HTTP -> the admin console; anything else -> the mux as well
-(VLESS-TCP direct, bare Shadowsocks).
+well-formed SOCKS5 greeting -> SOCKS5 inbound (only when
+XMAGIC_ENABLE_SOCKS5=1 - SOCKS5 is plaintext and off by default);
+HTTP CONNECT / absolute-form -> HTTP-proxy inbound; HTTP with a
+WebSocket Upgrade -> the Xray fallback mux (WS paths, then bare
+Shadowsocks as the default); origin-form HTTP -> the admin console;
+anything else -> the mux as well (bare Shadowsocks, and VLESS-TCP
+direct only when VLESS is enabled - it is off by default).
 
 Usage:
   users.py init
@@ -1728,6 +1730,14 @@ def build_egress(conn, users):
 def render_config(conn):
     users = enabled_users(conn)
     vpaths, tpaths = vless_paths(conn), trojan_paths(conn)
+    v_on = vless_enabled(conn)
+    if not v_on:
+        # VLESS off: no WS paths routed, and the mux keeps an empty
+        # client list - fallbacks (Trojan-WS, bare SS) still work,
+        # VLESS itself authenticates nobody (verified against xray).
+        vpaths = []
+    vless_clients = ([{"id": u["vless_uuid"], "email": u["username"]}
+                      for u in users] if v_on else [])
     fallbacks = ([{"path": p, "dest": BE_VLESS_BASE + i} for i, p in enumerate(vpaths)]
                  + [{"path": p, "dest": BE_TROJAN_BASE + i} for i, p in enumerate(tpaths)]
                  + [{"dest": BE_SS}])
@@ -1737,7 +1747,7 @@ def render_config(conn):
             "tag": "main", "listen": "127.0.0.1", "port": MUX_PORT,
             "protocol": "vless",
             "settings": {
-                "clients": [{"id": u["vless_uuid"], "email": u["username"]} for u in users],
+                "clients": vless_clients,
                 "decryption": "none", "fallbacks": fallbacks},
             "streamSettings": {"network": "tcp", "security": "none"},
         },
@@ -1757,7 +1767,7 @@ def render_config(conn):
             "tag": f"vless-ws-{i}", "listen": "127.0.0.1", "port": BE_VLESS_BASE + i,
             "protocol": "vless",
             "settings": {
-                "clients": [{"id": u["vless_uuid"], "email": u["username"]} for u in users],
+                "clients": vless_clients,
                 "decryption": "none",
             },
             "streamSettings": {"network": "ws", "wsSettings": {"path": p}},
@@ -1954,6 +1964,7 @@ PRIVATE_CIDRS = ("127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12",
                  "192.168.0.0/16", "169.254.0.0/16", "100.64.0.0/10",
                  "::1/128", "fc00::/7", "fe80::/10")
 DIRECT_ALLOW_PRIVATE = os.environ.get("DIRECT_ALLOW_PRIVATE", "")
+VLESS_ENABLED = os.environ.get("VLESS_ENABLED", "")
 
 
 # ------------------------------------------------------------ interconnect
@@ -2032,6 +2043,21 @@ def interconnect_members(conn):
     return out
 
 
+def vless_enabled(conn=None):
+    """Whether the VLESS inbounds are rendered at all.
+
+    VLESS carries no encryption of its own (its design delegates that
+    to a TLS layer this gateway does not terminate), so the VLESS-WS
+    and VLESS-TCP inbounds are OFF by default; Trojan (TLS by design),
+    Shadowsocks (built-in cipher) and the HTTP proxy (rides the outer
+    HTTPS) stay. A DB setting wins over the VLESS_ENABLED env."""
+    if conn is not None:
+        raw = get_setting(conn, "vless_enabled")
+        if raw is not None:
+            return raw == "1"
+    return VLESS_ENABLED.lower() in ("1", "true", "yes", "on")
+
+
 def allow_private_direct(conn=None):
     """Whether direct egress may reach private / LAN addresses.
 
@@ -2058,6 +2084,9 @@ def settings_info(conn):
         "upstream_strategy_from_db": get_setting(conn, "upstream_strategy") is not None,
         "ss_method": default_ss_method(conn),
         "ss_method_from_db": get_setting(conn, "ss_method") is not None,
+        "vless_enabled": vless_enabled(conn),
+        "vless_enabled_from_db":
+            get_setting(conn, "vless_enabled") is not None,
         "direct_allow_private": allow_private_direct(conn),
         "direct_allow_private_from_db":
             get_setting(conn, "direct_allow_private") is not None,
@@ -2113,6 +2142,12 @@ def cmd_settings(args):
                                     args.interconnect_off_groups))
                 except ValueError as exc:
                     sys.exit(str(exc))
+        if getattr(args, "vless", None) is not None:
+            if args.vless == "":
+                delete_setting(conn, "vless_enabled")
+            else:
+                set_setting(conn, "vless_enabled",
+                            "1" if args.vless == "on" else "0")
         if args.direct_allow_private is not None:
             if args.direct_allow_private == "":
                 delete_setting(conn, "direct_allow_private")
@@ -2135,6 +2170,8 @@ def cmd_settings(args):
           f"({src[info['upstream_strategy_from_db']]})")
     print(f"ss_method (new users): {info['ss_method']} "
           f"({src[info['ss_method_from_db']]})")
+    print(f"vless_enabled: {info['vless_enabled']} "
+          f"({src[info['vless_enabled_from_db']]})")
     print(f"direct_allow_private: {info['direct_allow_private']} "
           f"({src[info['direct_allow_private_from_db']]})")
     print(f"interconnect_off_groups: "
@@ -2656,6 +2693,10 @@ def main():
                    help="comma-separated user groups whose members may NOT"
                         " interconnect (interconnect is on by default);"
                         " empty string = nobody opted out")
+    a.add_argument("--vless", choices=("on", "off", ""),
+                   help="render the VLESS inbounds (off by default:"
+                        " VLESS has no encryption of its own);"
+                        " empty string = back to env")
     a.add_argument("--direct-allow-private", choices=("on", "off", ""),
                    help="allow direct egress to private/LAN addresses;"
                         " empty string = back to env")

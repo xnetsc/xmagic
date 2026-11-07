@@ -48,6 +48,8 @@ x-gateway-env: &gateway-env
   SS_METHOD: "${SS_METHOD:-aes-256-gcm}"
   UPSTREAM_STRATEGY: "${UPSTREAM_STRATEGY:-roundRobin}"
   DIRECT_ALLOW_PRIVATE: "${DIRECT_ALLOW_PRIVATE:-}"
+  VLESS_ENABLED: "${VLESS_ENABLED:-}"
+  XMAGIC_ENABLE_SOCKS5: "${XMAGIC_ENABLE_SOCKS5:-}"
 
 services:
   xray:

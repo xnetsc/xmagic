@@ -3,8 +3,12 @@
 [中文](README.zh-CN.md) | **English**
 
 In one line: **one public port, dispatched by the first bytes of each
-connection**, serving SSH, SOCKS5, HTTP proxy (CONNECT), VLESS-WS,
-bare VLESS (TCP), Trojan-WS and bare Shadowsocks at the same time.
+connection**, serving SSH, HTTP proxy (CONNECT), Trojan-WS and bare
+Shadowsocks at the same time. Protocols with no encryption of their
+own are off by default: VLESS-WS / bare VLESS (enable in Settings)
+and public SOCKS5 (`XMAGIC_ENABLE_SOCKS5=1`); HTTP stays because it
+rides the outer HTTPS, Trojan mandates TLS by design, and
+Shadowsocks carries its own cipher.
 A node can also cascade to multiple upstreams: whatever protocol it
 accepts inbound, it can also speak outbound. The upstream for a
 connection is chosen by user group, or by destination domain/IP via
@@ -23,10 +27,10 @@ identity engine, so a change made in one shows up in the others.
                      sniff.py first-byte dispatcher (routes by content)
         +----------+--------+-----------+-------------+---------------+
     "SSH-"      0x05    CONNECT /     WebSocket    origin-form HTTP  anything
-     banner             absolute-form   Upgrade      (a browser)      else
+     banner    (opt-in)  absolute-form   Upgrade      (a browser)      else
         |          |       HTTP            |              |             |
        sshd    SOCKS5     HTTP      Xray fallback mux -----+        admin
-    (key auth)  inbound   inbound    |- path hit -> VLESS-WS backends (multi-path)
+    (key auth)  inbound   inbound    |- path hit -> VLESS-WS backends (multi-path, opt-in)
                                      |- path hit -> Trojan-WS backends (multi-path)
                                      +- default fallback -> bare Shadowsocks
                                    |
@@ -50,15 +54,16 @@ identity engine, so a change made in one shows up in the others.
 | Protocol | Client -> this node (inbound) | This node -> upstream (outbound) | Auth |
 | --- | --- | --- | --- |
 | SSH | sshd; `ssh -D` gives SOCKS5 | `ssh -N -D` tunnel mapped to a local SOCKS outbound | public key (both directions) |
-| SOCKS5 | Xray socks inbound | Xray socks outbound | username + password (may be empty) |
+| SOCKS5 | Xray socks inbound (public branch **off by default**: plaintext, `XMAGIC_ENABLE_SOCKS5=1` to enable) | Xray socks outbound | username + password (may be empty) |
 | HTTP proxy | Xray http inbound (CONNECT) | Xray http outbound | Basic (may be empty) |
-| VLESS-WS | WS path dispatch -> backend | same | uuid |
-| VLESS (bare TCP) | dispatcher -> mux main inbound | same | uuid |
+| VLESS-WS | WS path dispatch -> backend (**off by default**: VLESS has no encryption of its own; enable in Settings) | same | uuid |
+| VLESS (bare TCP) | dispatcher -> mux main inbound (**off by default**) | same | uuid |
 | Trojan-WS | WS path dispatch -> backend | same | password |
 | Shadowsocks | default fallback -> backend | same | per-user password + method |
 
-Each user holds one credential set in the database: a VLESS uuid, one
-shared password (Trojan / HTTP / SOCKS), a separate Shadowsocks
+Each user holds one credential set in the database: a VLESS uuid
+(used when VLESS is enabled), one shared password (Trojan / HTTP /
+SOCKS), a separate Shadowsocks
 password, and an optional SSH public key. Upstreams are stored with
 the credentials the upstream node issued under the same model -
 **two independent auth legs**: users authenticate to this node with
@@ -122,6 +127,13 @@ in the database wins; clearing it falls back to the `.env` deployment
 default; saving re-renders and applies at once. Port configuration is
 not here - ports belong to the dispatcher / sshd processes and stay in
 `.env` + compose.
+
+Two plaintext-by-default protocols are off unless the operator
+opts in: the VLESS inbounds (Settings -> "Enable VLESS inbounds",
+or `VLESS_ENABLED=1`; VLESS delegates encryption to a TLS layer
+this gateway does not terminate) and the dispatcher's public
+SOCKS5 branch (env `XMAGIC_ENABLE_SOCKS5=1`; SOCKS5 is plaintext
+and, not being HTTP, cannot ride the outer HTTPS either).
 
 "Allow direct egress to private addresses" is off by default: traffic
 arriving over VLESS / Trojan / Shadowsocks cannot reach the node's own

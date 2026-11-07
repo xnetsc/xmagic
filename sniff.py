@@ -5,7 +5,9 @@ Every protocol this node serves is client-speaks-first, so the opening
 bytes identify the protocol unambiguously:
 
   "SSH-" banner                      -> sshd            (SSH_BE_PORT)
-  well-formed SOCKS5 greeting        -> SOCKS5 inbound  (BE_SOCKS_PORT)
+  well-formed SOCKS5 greeting        -> SOCKS5 inbound  (BE_SOCKS_PORT;
+                                        only with XMAGIC_ENABLE_SOCKS5=1,
+                                        off by default: SOCKS5 is plaintext)
   "CONNECT ..."                      -> HTTP inbound    (BE_HTTP_PORT)
   other HTTP + "Upgrade: websocket"  -> Xray mux        (XRAY_MUX_PORT)
   other HTTP, absolute-form target   -> HTTP inbound    (BE_HTTP_PORT)
@@ -48,6 +50,11 @@ TARGETS = {
     "admin": ("127.0.0.1", int(os.environ.get("ADMIN_BE_PORT", "18090"))),
 }
 PEEK_TIMEOUT = float(os.environ.get("SNIFF_PEEK_TIMEOUT", "5"))
+# SOCKS5 has no encryption of its own and, not being HTTP, cannot ride
+# the outer HTTPS endpoint either - the public SOCKS5 branch stays off
+# unless the operator explicitly enables it.
+SOCKS_PUBLIC = os.environ.get(
+    "XMAGIC_ENABLE_SOCKS5", "").lower() in ("1", "true", "yes", "on")
 HTTP_METHODS = (b"GET ", b"POST ", b"PUT ", b"DELETE ", b"HEAD ",
                 b"OPTIONS ", b"PATCH ", b"TRACE ")
 
@@ -76,7 +83,7 @@ def _looks_socks(data: bytes) -> bool:
 def classify(data: bytes) -> str:
     if data.startswith(b"SSH-"):
         return "ssh"
-    if _looks_socks(data):
+    if SOCKS_PUBLIC and _looks_socks(data):
         return "socks"
     if data.startswith(b"CONNECT "):
         return "http"
@@ -127,7 +134,7 @@ def _decidable(data: bytes) -> bool:
     """
     if not data:
         return False
-    if data[0] == 0x05:
+    if data[0] == 0x05 and SOCKS_PUBLIC:
         if len(data) < 2:
             return False
         return data[1] > 16 or len(data) >= 2 + data[1]

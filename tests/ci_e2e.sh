@@ -172,6 +172,10 @@ curl -fsSL -o "$WORK/xray.zip" \
 (cd "$WORK" && unzip -o -q xray.zip xray && chmod +x xray)
 
 export DIRECT_ALLOW_PRIVATE=1
+# VLESS and public SOCKS5 are opt-in now (plaintext-by-default
+# protocols); the e2e enables both to keep exercising their paths.
+export VLESS_ENABLED=1
+export XMAGIC_ENABLE_SOCKS5=1
 if [ "$FORM" = compose ]; then
   export XRAY_PORT=$PUB
   for img in xray dispatcher sshd admin; do
@@ -191,6 +195,8 @@ else
     --add-host host.docker.internal:host-gateway \
     -p "$PUB:8080" -v "$WORK/single-data:/data" \
     -e DIRECT_ALLOW_PRIVATE=1 \
+    -e VLESS_ENABLED=1 \
+    -e XMAGIC_ENABLE_SOCKS5=1 \
     "$PREFIX/xmagic-single:$TAG" > "$WORK/up.log" 2>&1
   check "single container starts" "$?"
 fi

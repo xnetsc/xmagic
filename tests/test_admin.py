@@ -207,6 +207,11 @@ def main():
         check("second registration refused for strangers", status == 403,
               f"got {status}")
 
+        status, body = client.call("POST", "/api/settings",
+                                   {"vless_enabled": True})
+        check("settings: vless opt-in (render checks below need it)",
+              status == 200 and body["vless_enabled"] is True,
+              f"{status} {body}")
         status, body = client.call("POST", "/api/users", {"username": "alice"})
         check("admin adds a gateway user", status == 201, f"{status} {body}")
         config_path = os.path.join(workdir, "data", "config.json")
@@ -329,6 +334,21 @@ def main():
               isinstance(gina.get("interconnect"), list)
               and gina["interconnect"][1] - gina["interconnect"][0] == 15,
               f"{gina}")
+        status, body = client.call("POST", "/api/settings",
+                                   {"vless_enabled": True})
+        check("settings: vless_enabled can be switched on",
+              status == 200 and body["vless_enabled"] is True,
+              f"{status} {body}")
+        status, body = client.call("POST", "/api/settings",
+                                   {"vless_enabled": False})
+        check("settings: vless_enabled back off (the default)",
+              status == 200 and body["vless_enabled"] is False,
+              f"{status} {body}")
+        status, body = client.call("POST", "/api/settings",
+                                   {"vless_enabled": True})
+        check("settings: vless restored on for the render checks below",
+              status == 200 and body["vless_enabled"] is True,
+              f"{status} {body}")
         status, body = client.call("POST", "/api/settings",
                                    {"interconnect_off_groups": "team"})
         check("settings: interconnect opt-out stored",
@@ -587,7 +607,10 @@ def main():
               'id="btn-gen-userkey"' in page
               and 'id="btn-gen-upkey"' in page
               and 'name="interconnect_off_groups"' in page
-              and "组内互访端口" in page,
+              and 'name="vless_enabled"' in page
+              and "组内互访端口" in page
+              and "公网 SOCKS5 默认关闭" in page
+              and "（未启用）" in page,
               f"status {resp.status}")
 
         # --- CLI-issued passkey replacement (ticket flow): the ticket

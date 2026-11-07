@@ -388,6 +388,14 @@ def main():
               and os.path.exists(os.path.join(
                   workdir, "a", "data", "ssh_client_keys", "upgen.key")),
               err + out)
+        rc, out, err = cli("--json", "settings", "set", "--vless-enabled")
+        check("settings set --vless-enabled via remote CLI",
+              rc == 0 and json.loads(out)["vless_enabled"] is True,
+              err + out)
+        rc, out, err = cli("--json", "settings", "set", "--no-vless-enabled")
+        check("settings set --no-vless-enabled via remote CLI",
+              rc == 0 and json.loads(out)["vless_enabled"] is False,
+              err + out)
         rc, out, err = cli("settings", "set", "--interconnect-off-groups",
                            "team")
         check("settings opt a group out of interconnect via remote CLI",

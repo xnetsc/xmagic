@@ -86,7 +86,8 @@ def main():
 
         cases = [
             ("SSH banner -> sshd", b"SSH-2.0-probe\r\n", b"ssh"),
-            ("SOCKS5 greeting -> socks", b"\x05\x01\x00", b"socks"),
+            ("SOCKS5 greeting -> mux (public SOCKS off by default)",
+             b"\x05\x01\x00", b"mux"),
             ("CONNECT -> http proxy", b"CONNECT example.com:443 HTTP/1.1\r\n\r\n", b"http"),
             ("absolute-form GET -> http proxy",
              b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n", b"http"),
@@ -109,8 +110,8 @@ def main():
               b"rade: websocket\r\n\r\n"], b"mux"),
             ("fragmented SSH banner -> sshd",
              [b"SS", b"H-2.0-probe\r\n"], b"ssh"),
-            ("fragmented SOCKS greeting -> socks",
-             [b"\x05", b"\x01\x00"], b"socks"),
+            ("fragmented SOCKS greeting -> mux (off by default)",
+             [b"\x05", b"\x01\x00"], b"mux"),
             ("SS salt starting 0x05, bogus greeting -> mux",
              [b"\x05\x40" + bytes(range(64))], b"mux"),
             ("SS salt 0x05 + junk method bytes -> mux",
@@ -127,6 +128,31 @@ def main():
                 except socket.timeout:
                     got = b""
             check(name, got == want, f"got {got!r} want {want!r}")
+
+        # phase 2: with XMAGIC_ENABLE_SOCKS5=1 the branch comes back
+        proc.terminate()
+        proc.wait(timeout=5)
+        for _ in range(50):  # wait until the old listener is really gone
+            try:
+                socket.create_connection(("127.0.0.1", PUBLIC),
+                                         timeout=0.3).close()
+                time.sleep(0.1)
+            except OSError:
+                break
+        proc = subprocess.Popen(
+            [sys.executable, os.path.join(ROOT, "sniff.py")],
+            env=dict(env, XMAGIC_ENABLE_SOCKS5="1"),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        for _ in range(50):
+            try:
+                socket.create_connection(("127.0.0.1", PUBLIC),
+                                         timeout=0.3).close()
+                break
+            except OSError:
+                time.sleep(0.1)
+        got = probe(b"\x05\x01\x00")
+        check("SOCKS5 greeting -> socks (XMAGIC_ENABLE_SOCKS5=1)",
+              got == b"socks", f"got {got!r}")
     finally:
         proc.terminate()
         stop.set()

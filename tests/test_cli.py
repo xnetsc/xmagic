@@ -64,6 +64,16 @@ def main():
     rc, out, _ = cli("--json", "status")
     st = json.loads(out)
     check("--json status", st["users_enabled"] == 2 and st["admin_registered"] is False)
+    voff_path = os.path.join(workdir, "voff.json")
+    rc, out, _ = cli("render", "--out", voff_path)
+    vcfg = json.load(open(voff_path))
+    check("VLESS off by default: no vless-ws inbound, mux clients empty",
+          all(i["tag"] != "vless-ws-0" for i in vcfg["inbounds"])
+          and vcfg["inbounds"][0]["settings"]["clients"] == [],
+          json.dumps([i["tag"] for i in vcfg["inbounds"]]))
+    rc, out, _ = cli("settings", "--vless", "on")
+    check("settings --vless on (VLESS is opt-in)",
+          rc == 0 and "vless_enabled: True" in out, out)
     rc, out, err = cli("apply")
     config_path = os.path.join(workdir, "data", "config.json")
     flat = open(config_path).read() if os.path.exists(config_path) else ""

@@ -424,6 +424,8 @@ def cmd_settings_show(args):
         f"({src[payload['upstream_strategy_from_db']]})",
         f"ss_method (new users): {payload['ss_method']} "
         f"({src[payload['ss_method_from_db']]})",
+        f"vless_enabled: {payload['vless_enabled']} "
+        f"({src[payload['vless_enabled_from_db']]})",
         f"direct_allow_private: {payload['direct_allow_private']} "
         f"({src[payload['direct_allow_private_from_db']]})",
         f"interconnect_off_groups: "
@@ -466,6 +468,8 @@ def cmd_settings_set(args):
                 "upstream_strategy", "ss_method", "interconnect_off_groups"):
         if getattr(args, key) is not None:
             body[key] = getattr(args, key)
+    if getattr(args, "vless_enabled", None) is not None:
+        body["vless_enabled"] = args.vless_enabled
     if getattr(args, "direct_allow_private", None) is not None:
         body["direct_allow_private"] = args.direct_allow_private
     if not body:
@@ -504,11 +508,12 @@ def _read_key(args):
 def cmd_users_list(args):
     api, _, _ = authed_api(args)
     payload = api.call("GET", "/api/users")
+    off = "" if payload.get("vless_enabled") else " (off)"
     lines = []
     for u in payload["users"]:
         lines.append(
             f"{u['username']:<16} group={u['group']:<10} "
-            f"enabled={u['enabled']!s:<5} uuid={u['vless_uuid']}\n"
+            f"enabled={u['enabled']!s:<5} vless uuid={u['vless_uuid']}{off}\n"
             f"{'':<16} password={u['password']}  ss={u['ss_method']}/{u['ss_password']}"
             + ("  ssh-key=yes" if u["ssh_key"] else ""))
     emit(args, payload, "\n".join(lines) if lines else "(no users)")
@@ -520,8 +525,9 @@ def cmd_users_add(args):
         "username": args.user, "group": args.group,
         "ssh_pubkey": _read_key(args), "note": args.note})
     u = payload["user"]
+    off = "" if payload.get("vless_enabled") else " (VLESS inbounds off)"
     human = (f"user:            {u['username']}\n"
-             f"vless uuid:      {u['vless_uuid']}\n"
+             f"vless uuid:      {u['vless_uuid']}{off}\n"
              f"password (trojan/http/socks): {u['password']}\n"
              f"ss:              {u['ss_method']} / {u['ss_password']}\n"
              + applied_line(payload.get("applied")))
@@ -546,7 +552,8 @@ def cmd_users_action(args):
         human = (f"password (trojan/http/socks): {u['password']}\n"
                  f"ss password:     {u['ss_password']}\n" + human)
     if args.action == "rotate-uuid" and payload.get("user"):
-        human = f"vless uuid:      {payload['user']['vless_uuid']}\n" + human
+        off = "" if payload.get("vless_enabled") else " (VLESS inbounds off)"
+        human = f"vless uuid:      {payload['user']['vless_uuid']}{off}\n" + human
     emit(args, payload, human)
 
 
@@ -1125,6 +1132,12 @@ def main():
     a.add_argument("--no-direct-allow-private", dest="direct_allow_private",
                    action="store_false",
                    help="disallow direct egress to private/LAN addresses")
+    a.add_argument("--vless-enabled", dest="vless_enabled",
+                   action="store_true", default=None,
+                   help="render the VLESS inbounds (off by default)")
+    a.add_argument("--no-vless-enabled", dest="vless_enabled",
+                   action="store_false",
+                   help="do not render the VLESS inbounds")
     a.set_defaults(fn=cmd_settings_set)
 
     a = sub.add_parser("update", parents=C,

@@ -2,8 +2,11 @@
 
 [English](README.md) | **中文**
 
-一句话：**一个公共端口，凭协议首字节自动分发**，同时提供 SSH、SOCKS5、
-HTTP 代理（CONNECT）、VLESS-WS、VLESS（裸 TCP）、Trojan-WS、裸 Shadowsocks；
+一句话：**一个公共端口，凭协议首字节自动分发**，同时提供 SSH、
+HTTP 代理（CONNECT）、Trojan-WS、裸 Shadowsocks；
+自身不带加密的协议默认不开：VLESS-WS、VLESS（裸 TCP）（在设置里
+开启）与公网 SOCKS5（`XMAGIC_ENABLE_SOCKS5=1`）；HTTP 留着是因为
+它借道外层 HTTPS，Trojan 设计上强制 TLS，Shadowsocks 自带加密。
 节点自身还能作为下级节点去连多个上级（级联），入站会什么协议、出站就支持
 什么协议；选哪个上级既可按用户分组，也可按目标域名/IP 用路由规则指定。
 
@@ -21,7 +24,7 @@ HTTP 代理（CONNECT）、VLESS-WS、VLESS（裸 TCP）、Trojan-WS、裸 Shado
      "SSH-" 横幅   0x05    CONNECT /    WebSocket     源形式 HTTP     其余字节
         │          │       绝对形式 HTTP   Upgrade      （浏览器）        │
        sshd      SOCKS5 入站   HTTP 入站   Xray fallback 复用器 ──┤   admin 后台
-    (公钥认证)   (用户+密码)  (用户+密码)   ├ 路径命中 → VLESS-WS 后端（可多路径）
+    (公钥认证)   (默认关)  (用户+密码)   ├ 路径命中 → VLESS-WS 后端（可多路径，默认关）
                                             ├ 路径命中 → Trojan-WS 后端（可多路径）
                                             └ 默认回落 → 裸 Shadowsocks 后端
                                    │
@@ -41,10 +44,10 @@ HTTP 代理（CONNECT）、VLESS-WS、VLESS（裸 TCP）、Trojan-WS、裸 Shado
 | 协议 | 客户端连入（入站） | 本节点连上级（出站） | 认证 |
 | --- | --- | --- | --- |
 | SSH | sshd，`ssh -D` 得 SOCKS5 | `ssh -N -D` 隧道映射为本地 SOCKS 出站 | 公钥（双向都是） |
-| SOCKS5 | Xray socks 入站 | Xray socks 出站 | 用户名+密码（可空） |
+| SOCKS5 | Xray socks 入站（公网分支**默认关闭**：明文协议，`XMAGIC_ENABLE_SOCKS5=1` 开启） | Xray socks 出站 | 用户名+密码（可空） |
 | HTTP 代理 | Xray http 入站（CONNECT） | Xray http 出站 | Basic（可空） |
-| VLESS-WS | WS 路径分发 → 后端 | 同左 | uuid |
-| VLESS（裸 TCP） | 分发器 → 复用器主入站直达 | 同左 | uuid |
+| VLESS-WS | WS 路径分发 → 后端（**默认关闭**：VLESS 自身不加密，在设置里开启） | 同左 | uuid |
+| VLESS（裸 TCP） | 分发器 → 复用器主入站直达（**默认关闭**） | 同左 | uuid |
 | Trojan-WS | WS 路径分发 → 后端 | 同左 | 密码 |
 | Shadowsocks | 默认回落 → 后端 | 同左 | 每用户独立密码+method |
 
@@ -92,6 +95,12 @@ VLESS / Trojan 的 WS 路径列表、上级池策略、新用户的默认 SS 方
 直连内网地址。存进库里的值优先生效，清空即回退到 .env 的部署默认值；保存
 后自动重新渲染生效。端口类配置不在此列——它们绑在分发器 / sshd 进程上，
 仍是 .env + compose 的事。
+
+两个默认不加密的协议不开，除非运维显式选择加入：VLESS 入站
+（设置里勾选「启用 VLESS 入站」，或 `VLESS_ENABLED=1`；VLESS 把
+加密交给 TLS 层，而本网关不终结 TLS）与 dispatcher 的公网 SOCKS5
+分支（环境变量 `XMAGIC_ENABLE_SOCKS5=1`；SOCKS5 是明文，且不是
+HTTP、借不了外层 HTTPS 的道）。
 
 「允许直连内网地址」默认关：经 VLESS / Trojan / Shadowsocks 进来的流量，
 直连时不能访问节点本机与内网地址（Xray freedom 出站的默认拦截规则，
