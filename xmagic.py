@@ -352,6 +352,8 @@ def cmd_settings_show(args):
         f"({src[payload['upstream_strategy_from_db']]})",
         f"ss_method (new users): {payload['ss_method']} "
         f"({src[payload['ss_method_from_db']]})",
+        f"direct_allow_private: {payload['direct_allow_private']} "
+        f"({src[payload['direct_allow_private_from_db']]})",
     ]))
 
 
@@ -389,6 +391,8 @@ def cmd_settings_set(args):
                 "upstream_strategy", "ss_method"):
         if getattr(args, key) is not None:
             body[key] = getattr(args, key)
+    if getattr(args, "direct_allow_private", None) is not None:
+        body["direct_allow_private"] = args.direct_allow_private
     if not body:
         die(2, "nothing to set: pass at least one --option (empty string "
             "clears a value back to the env default)")
@@ -551,6 +555,69 @@ def cmd_routes_edit(args):
 
 # ------------------------------------------------------------ main
 
+
+def _db_line(d):
+    return (f"{'*' if d['active'] else ' '} {d['name']:<16} {d['type']:<9} "
+            f"{d['target']}" + (f"  ({d['note']})" if d.get("note") else ""))
+
+
+def cmd_db_list(args):
+    api, _, _ = authed_api(args)
+    payload = api.call("GET", "/api/databases")
+    lines = [_db_line(d) for d in payload["databases"]]
+    emit(args, payload, "\n".join(lines) if lines else "(no database configs)")
+
+
+def cmd_db_add(args):
+    api, _, _ = authed_api(args)
+    payload = api.call("POST", "/api/databases", {
+        "name": args.name, "type": args.type,
+        "target": args.target or args.dsn or args.path, "note": args.note})
+    d = payload["database"]
+    emit(args, payload,
+         f"database config {d['name']} added: {d['type']} {d['target']}")
+
+
+def cmd_db_edit(args):
+    api, _, _ = authed_api(args)
+    body = {}
+    target = args.target or args.dsn or args.path
+    if target is not None:
+        body["target"] = target
+    if args.note is not None:
+        body["note"] = args.note
+    if not body:
+        die(2, "nothing to edit: pass --target/--dsn/--path or --note")
+    payload = api.call("POST", f"/api/databases/{args.name}/edit", body)
+    d = payload["database"]
+    emit(args, payload,
+         f"database config {d['name']} updated: {d['type']} {d['target']}")
+
+
+def cmd_db_action(args):
+    api, _, _ = authed_api(args)
+    payload = api.call("POST", f"/api/databases/{args.name}/{args.action}", {})
+    if args.action == "test":
+        t = payload["test"]
+        counts = ", ".join(f"{k}={v}" for k, v in t["tables"].items())
+        human = (f"{t['name']}: reachable ({t['type']}: {t['target']});"
+                 f" tables: {counts}")
+    elif args.action == "switch":
+        human = (f"active database: {payload['database']['name']}\n"
+                 + applied_line(payload.get("applied")))
+    else:  # remove
+        human = f"database config {args.name} removed"
+    emit(args, payload, human)
+
+
+def cmd_db_migrate(args):
+    api, _, _ = authed_api(args)
+    payload = api.call("POST", "/api/databases/migrate", {
+        "from": args.src, "to": args.dst, "replace": args.replace})
+    m = payload["migration"]
+    counts = ", ".join(f"{k}={v}" for k, v in m["tables"].items())
+    emit(args, payload, f"migrated {m['from']} -> {m['to']}: {counts}")
+
 def main():
     # Global options exist on the main parser AND (with SUPPRESS
     # defaults, so they never clobber an earlier value) on every
@@ -611,6 +678,12 @@ def main():
     a.add_argument("--trojan-ws-paths", help="comma-separated; empty string = env default")
     a.add_argument("--upstream-strategy")
     a.add_argument("--ss-method")
+    a.add_argument("--direct-allow-private", dest="direct_allow_private",
+                   action="store_true", default=None,
+                   help="allow direct egress to private/LAN addresses")
+    a.add_argument("--no-direct-allow-private", dest="direct_allow_private",
+                   action="store_false",
+                   help="disallow direct egress to private/LAN addresses")
     a.set_defaults(fn=cmd_settings_set)
 
     u = sub.add_parser("users", parents=C, help="gateway users")
@@ -671,6 +744,27 @@ def main():
     a.add_argument("--kind", choices=("domain", "full", "keyword", "regexp", "ip"))
     a.add_argument("--pattern"); a.add_argument("--to"); a.add_argument("--user")
     a.add_argument("--note"); a.set_defaults(fn=cmd_routes_edit)
+
+    d = sub.add_parser("db", parents=C, help="database configs on the node")
+    dsub = d.add_subparsers(dest="db_cmd", required=True)
+    dsub.add_parser("list", parents=C).set_defaults(fn=cmd_db_list)
+    a = dsub.add_parser("add", parents=C); a.add_argument("name")
+    a.add_argument("--type", required=True, choices=("sqlite", "postgres", "mysql"))
+    a.add_argument("--target", help="sqlite: file path; postgres/mysql: DSN")
+    a.add_argument("--dsn", help="alias of --target, for postgres/mysql")
+    a.add_argument("--path", help="alias of --target, for sqlite")
+    a.add_argument("--note"); a.set_defaults(fn=cmd_db_add)
+    a = dsub.add_parser("edit", parents=C); a.add_argument("name")
+    a.add_argument("--target"); a.add_argument("--dsn"); a.add_argument("--path")
+    a.add_argument("--note"); a.set_defaults(fn=cmd_db_edit)
+    for action in ("remove", "test", "switch"):
+        a = dsub.add_parser(action, parents=C); a.add_argument("name")
+        a.set_defaults(fn=cmd_db_action, action=action)
+    a = dsub.add_parser("migrate", parents=C)
+    a.add_argument("src"); a.add_argument("dst")
+    a.add_argument("--replace", action="store_true",
+                   help="clear the target's business tables before copying")
+    a.set_defaults(fn=cmd_db_migrate)
 
     args = p.parse_args()
     args.fn(args)

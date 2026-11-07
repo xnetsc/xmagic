@@ -131,6 +131,31 @@ def main():
     rc, out, _ = cli("--json", "list")
     names = [u["username"] for u in json.loads(out)]
     check("console user visible in CLI", names == ["alice", "bob", "carol"], out)
+    # ---- direct-to-private (LAN) egress opt-in: default off, and the
+    # render only gains freedom finalRules when the operator turns it on
+    cfg_path = os.path.join(workdir, "data", "config.json")
+    rc, out, _ = cli("--json", "settings")
+    check("direct_allow_private defaults off",
+          json.loads(out)["direct_allow_private"] is False, out)
+    rc, out, _ = cli("render", "--out", cfg_path)
+    cfg = json.load(open(cfg_path))
+    direct = [o for o in cfg["outbounds"] if o.get("tag") == "direct"][0]
+    check("default render has no finalRules (xray blocks private targets)",
+          "settings" not in direct, json.dumps(direct))
+    rc, out, _ = cli("settings", "--direct-allow-private", "on")
+    check("settings enable direct_allow_private via CLI",
+          rc == 0 and "True" in out, out)
+    rc, out, _ = cli("render", "--out", cfg_path)
+    cfg = json.load(open(cfg_path))
+    direct = [o for o in cfg["outbounds"] if o.get("tag") == "direct"][0]
+    rules = direct.get("settings", {}).get("finalRules", [])
+    check("render emits the allow finalRule when enabled",
+          len(rules) == 1 and rules[0]["action"] == "allow"
+          and "127.0.0.0/8" in rules[0]["ip"], json.dumps(direct))
+    rc, out, _ = cli("settings", "--direct-allow-private", "off")
+    check("settings disable direct_allow_private via CLI",
+          rc == 0 and "False" in out, out)
+
     rc, out, _ = cli("--json", "status")
     check("status shows registered admin", json.loads(out)["admin_registered"] is True)
     rc, out, _ = cli("--json", "sessions")

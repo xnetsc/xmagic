@@ -6,6 +6,11 @@
 # config.json / authorized_keys there and restarts the xray/sshd
 # containers over the mounted Docker socket.
 FROM python:3.12-alpine
+# Database drivers for the optional PostgreSQL / MySQL business
+# databases (SQLite, the default, is in the standard library). The
+# registry of database configs itself always stays in a local SQLite
+# file on the node.
+RUN pip install --no-cache-dir "psycopg[binary]" "pymysql"
 COPY users.py admin.py /app/
 WORKDIR /app
 ENV PROXY_DB=/data/users.db \

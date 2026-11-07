@@ -47,7 +47,6 @@ import ipaddress
 import json
 import os
 import secrets
-import sqlite3
 import sys
 import threading
 import time
@@ -564,7 +563,7 @@ def api_add_user(body):
                  users_mod.default_ss_method(conn),
                  (body.get("ssh_pubkey") or None), body.get("group") or "default",
                  body.get("note"), datetime.now(timezone.utc).isoformat()))
-        except sqlite3.IntegrityError:
+        except users_mod.IntegrityError:
             raise ApiError(409, f"user already exists: {username}")
         row = users_mod.get_user(conn, username)
     applied = apply_changes()
@@ -645,7 +644,7 @@ def api_add_upstream(body):
                  body.get("username"), body.get("password"), body.get("key_file"),
                  1 if body.get("tls") else 0, body.get("method") or "aes-256-gcm",
                  body.get("note"), datetime.now(timezone.utc).isoformat()))
-        except sqlite3.IntegrityError:
+        except users_mod.IntegrityError:
             raise ApiError(409, f"upstream already exists: {body.get('name')}")
         except KeyError as exc:
             raise ApiError(400, f"missing field: {exc}")
@@ -705,12 +704,12 @@ def api_add_route(body):
     with users_mod.db() as conn:
         if body.get("username"):
             users_mod.get_user(conn, body["username"])
-        cur = conn.execute(
+        rid = conn.insert_id(
             "INSERT INTO routes (kind, pattern, target, username, note, created_at)"
             " VALUES (?,?,?,?,?,?)",
             (kind, pattern, body["to"], body.get("username"), body.get("note"),
              datetime.now(timezone.utc).isoformat()))
-        row = users_mod.get_route(conn, cur.lastrowid)
+        row = users_mod.get_route(conn, rid)
     applied = apply_changes()
     return {"route": _route_dict(row), "applied": applied}
 
@@ -793,10 +792,66 @@ def api_set_settings(body):
                     raise ApiError(400, f"{key} must be one of {choices}")
                 else:
                     users_mod.set_setting(conn, key, value)
+        if "direct_allow_private" in body:
+            render_relevant = True
+            value = body["direct_allow_private"]
+            if value is None or value == "":
+                users_mod.delete_setting(conn, "direct_allow_private")
+            elif isinstance(value, bool):
+                users_mod.set_setting(conn, "direct_allow_private",
+                                      "1" if value else "0")
+            else:
+                raise ApiError(400, "direct_allow_private must be a boolean")
     result = api_get_settings()
     if render_relevant:
         result["applied"] = apply_changes()
     return result
+
+
+# ------------------------------------------------------------ databases
+# The database configs themselves live in the node's local registry
+# (users_mod, backed by a local SQLite file); these endpoints expose
+# the same operations as the db-* CLI commands.
+
+def _db_call(fn, *a, **kw):
+    try:
+        return fn(*a, **kw)
+    except users_mod.DBError as exc:
+        raise ApiError(400, str(exc))
+
+
+def api_list_databases():
+    return {"databases": users_mod.list_db_configs()}
+
+
+def api_add_database(body):
+    cfg = _db_call(users_mod.add_db_config, body.get("name") or "",
+                   body.get("type") or "", body.get("target") or "",
+                   body.get("note"))
+    return {"database": cfg}
+
+
+def api_database_action(name, action, body):
+    if action == "edit":
+        cfg = _db_call(users_mod.edit_db_config, name,
+                       target=body.get("target"), note=body.get("note"))
+        return {"database": cfg}
+    if action == "remove":
+        _db_call(users_mod.remove_db_config, name)
+        return {"removed": name}
+    if action == "test":
+        return {"test": _db_call(users_mod.test_db_config, name)}
+    if action == "switch":
+        cfg = _db_call(users_mod.switch_db_config, name)
+        return {"database": cfg, "applied": apply_changes()}
+    raise ApiError(404, f"unknown database action {action}")
+
+
+def api_migrate_database(body):
+    result = _db_call(users_mod.migrate_db_config, body.get("from") or "",
+                      body.get("to") or "",
+                      replace=bool(body.get("replace")))
+    return {"migration": result}
 
 
 def api_state():
@@ -929,6 +984,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send_json(200, api_list_upstreams())
         elif path == "/api/routes":
             self._send_json(200, api_list_routes())
+        elif path == "/api/databases":
+            self._send_json(200, api_list_databases())
         else:
             raise ApiError(404, "not found")
 
@@ -997,6 +1054,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._send_json(200, api_upstream_action(name, action))
         elif path == "/api/routes":
             self._send_json(201, api_add_route(body))
+        elif path == "/api/databases":
+            self._send_json(201, api_add_database(body))
+        elif path == "/api/databases/migrate":
+            self._send_json(200, api_migrate_database(body))
+        elif path.startswith("/api/databases/"):
+            name, _, action = path[len("/api/databases/"):].partition("/")
+            self._send_json(200, api_database_action(name, action, body))
         elif path.startswith("/api/routes/"):
             rid, _, action = path[len("/api/routes/"):].partition("/")
             if action == "update":
@@ -1100,14 +1164,41 @@ input,select{padding:.35rem;margin:.15rem}
       <input name="trojan_ws_paths" size="26"></label>
     <label>上级池策略 <select name="upstream_strategy"></select></label>
     <label>新用户默认 SS 方法 <select name="ss_method"></select></label>
+    <label><input type="checkbox" name="direct_allow_private"> 允许直连内网地址</label>
     <button>保存</button>
     <span class="small">会话有效期默认 168 小时（1 周），范围 1–2160，只影响新签发会话。
     WS 路径 / 策略 / 默认方法：留空保存 = 回退到部署时 .env 的值；输入框灰字是当前生效值。
+    直连内网地址默认关闭：经 VLESS / Trojan / Shadowsocks 进来的流量直连时不能访问本机与内网地址
+    （Xray 的防 SSRF 默认规则）；节点需要访问自家局域网服务时再打开。
     保存后自动重新渲染生效。</span>
   </form>
   <p class="small"><span id="admin-line"></span>
      <button type="button" id="btn-replace">更换管理员 Passkey</button>
      <span>更换后，其它所有登录会话立即失效，本页面会切到新签发的会话。</span></p>
+
+  <h2>数据库</h2>
+  <table id="databases-table"></table>
+  <form id="form-database">
+    <label>名称 <input name="name" size="12" required></label>
+    <label>类型 <select name="type">
+      <option value="sqlite">SQLite</option>
+      <option value="postgres">PostgreSQL</option>
+      <option value="mysql">MySQL</option></select></label>
+    <label>目标 <input name="target" size="46" required
+      placeholder="sqlite 文件路径，或 postgresql:// / mysql:// DSN"></label>
+    <label>备注 <input name="note" size="12"></label>
+    <button>添加配置</button>
+  </form>
+  <form id="form-migrate">
+    <label>从 <select name="from"></select></label>
+    <label>迁移到 <select name="to"></select></label>
+    <label><input type="checkbox" name="replace"> 覆盖目标已有数据</label>
+    <button>迁移数据</button>
+    <span class="small">数据库配置本身保存在节点本地，业务数据在当前启用的库里。
+    切到一个还没有表的库时会自动建表；切换后立即重新渲染生效。
+    迁移会把全部业务表（用户 / 上级 / 路由 / 设置 / 管理员凭证 / 会话）复制到目标库。
+    列表中 DSN 的密码已打码显示。</span>
+  </form>
 
   <h2>登录会话</h2>
   <table id="sessions-table"></table>
@@ -1184,6 +1275,8 @@ async function refresh() {
   const meth = sf.querySelector("[name=ss_method]");
   meth.innerHTML = settings.ss_methods.map(x =>
     `<option ${x === settings.ss_method ? "selected" : ""}>${x}</option>`).join("");
+  sf.querySelector("[name=direct_allow_private]").checked =
+    !!settings.direct_allow_private;
   $("admin-line").textContent = s.admin_registered
     ? `管理员 Passkey：${s.admin_label || "(无标签)"}，注册于 ${s.admin_created_at || "?"}，累计验签 ${s.admin_sign_count} 次。` : "";
   const sessions = (await api("/api/sessions")).sessions;
@@ -1192,6 +1285,18 @@ async function refresh() {
     sessions.map(s => `<tr><td><code>${s.id}</code></td><td>${s.kind}</td><td>${s.label || ""}</td>
       <td>${fmtTs(s.created_at)}</td><td>${fmtTs(s.expires_at)}</td><td>${s.current ? "当前" : ""}</td>
       <td><button data-session="${s.id}">撤销</button></td></tr>`).join("");
+  const dbs = (await api("/api/databases")).databases;
+  window._dbs = dbs;
+  $("databases-table").innerHTML = "<tr><th></th><th>名称</th><th>类型</th><th>目标</th><th>备注</th><th>操作</th></tr>" +
+    dbs.map(d => `<tr><td>${d.active ? "当前" : ""}</td><td>${d.name}</td><td>${d.type}</td>
+      <td><code>${d.target}</code></td><td>${d.note || ""}</td>
+      <td><button data-dbtest="${d.name}">测试</button>
+      <button data-dbedit="${d.name}">编辑</button>
+      ${d.active ? "" : `<button data-dbswitch="${d.name}">切换</button>
+      <button data-dbremove="${d.name}">删除</button>`}</td></tr>`).join("");
+  const dbOpts = dbs.map(d => `<option>${d.name}</option>`).join("");
+  $("form-migrate").querySelector("[name=from]").innerHTML = dbOpts;
+  $("form-migrate").querySelector("[name=to]").innerHTML = dbOpts;
   const routes = (await api("/api/routes")).routes;
   window._routes = routes;
   $("routes-table").innerHTML = "<tr><th>#</th><th>类型</th><th>目标模式</th><th>去向</th><th>限定用户</th><th>启用</th><th>操作</th></tr>" +
@@ -1236,6 +1341,40 @@ document.addEventListener("click", async e => {
 $("btn-apply").onclick = async () => { try {
   const r = await api("/api/apply", {}); msg(appliedText(r.applied), true); refresh();
 } catch (e) { msg(String(e)); } };
+$("form-database").onsubmit = async e => { e.preventDefault();
+  try { const r = await api("/api/databases", formJson(e.target));
+    msg(`数据库配置 ${r.database.name} 已添加`, true); e.target.reset(); refresh(); }
+  catch (err) { msg(String(err)); } };
+$("form-migrate").onsubmit = async e => { e.preventDefault();
+  const o = formJson(e.target);
+  o.replace = e.target.querySelector("[name=replace]").checked;
+  if (o.from === o.to) { msg("源和目标不能是同一个库"); return; }
+  if (!confirm(`把 ${o.from} 的全部业务数据迁移到 ${o.to}？`)) return;
+  try { const r = await api("/api/databases/migrate", o);
+    msg("迁移完成：" + Object.entries(r.migration.tables).map(([k, v]) => `${k}=${v}`).join("，"), true);
+    refresh(); }
+  catch (err) { msg(String(err)); } };
+document.addEventListener("click", async e => {
+  const t = e.target.closest("button[data-dbtest],button[data-dbedit],button[data-dbswitch],button[data-dbremove]");
+  if (!t) return;
+  try {
+    if (t.dataset.dbtest) { const r = await api(`/api/databases/${t.dataset.dbtest}/test`, {});
+      msg(`${t.dataset.dbtest} 可达：` + Object.entries(r.test.tables).map(([k, v]) => `${k}=${v}`).join("，"), true); }
+    else if (t.dataset.dbedit) { const v = prompt("新目标（sqlite 路径或完整 DSN，含密码；取消 = 不改目标）");
+      const n = prompt("备注（留空 = 清除；取消 = 不改备注）");
+      if (v === null && n === null) return;
+      const body = {};
+      if (v !== null && v !== "") body.target = v;
+      if (n !== null) body.note = n;
+      const r = await api(`/api/databases/${t.dataset.dbedit}/edit`, body);
+      msg(`配置 ${r.database.name} 已更新`, true); refresh(); }
+    else if (t.dataset.dbswitch) { if (!confirm(`切换到数据库 ${t.dataset.dbswitch}？网关将改用该库的数据并立即重新渲染。`)) return;
+      const r = await api(`/api/databases/${t.dataset.dbswitch}/switch`, {});
+      msg(`已切换到 ${r.database.name}。` + appliedText(r.applied), true); refresh(); }
+    else if (t.dataset.dbremove) { if (!confirm("删除这个数据库配置？只删配置，不会删库里的数据。")) return;
+      await api(`/api/databases/${t.dataset.dbremove}/remove`, {});
+      msg("配置已删除", true); refresh(); }
+  } catch (err) { msg(String(err)); } });
 document.addEventListener("click", async e => {
   const b = e.target.closest("button[data-act]"); if (!b) return;
   const act = b.dataset.act;
@@ -1327,6 +1466,7 @@ $("form-settings").onsubmit = async e => { e.preventDefault();
       vless_ws_paths: f.querySelector("[name=vless_ws_paths]").value,
       trojan_ws_paths: f.querySelector("[name=trojan_ws_paths]").value,
       upstream_strategy: f.querySelector("[name=upstream_strategy]").value,
+      direct_allow_private: f.querySelector("[name=direct_allow_private]").checked,
       ss_method: f.querySelector("[name=ss_method]").value});
     msg("设置已保存。" + (r.applied ? appliedText(r.applied) : ""), true); refresh(); }
   catch (err) { msg(String(err)); } };

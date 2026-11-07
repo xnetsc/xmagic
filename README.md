@@ -82,10 +82,16 @@ HTTP 代理（CONNECT）、VLESS-WS、VLESS（裸 TCP）、Trojan-WS、裸 Shado
 
 ### 设置（含渲染级配置）
 
-后台「设置」里除了会话有效期，还管三项原本只能写在 .env 里的渲染级配置：
-VLESS / Trojan 的 WS 路径列表、上级池策略、新用户的默认 SS 方法。存进库里
-的值优先生效，清空即回退到 .env 的部署默认值；保存后自动重新渲染生效。
-端口类配置不在此列——它们绑在分发器 / sshd 进程上，仍是 .env + compose 的事。
+后台「设置」里除了会话有效期，还管四项原本只能写在 .env 里的渲染级配置：
+VLESS / Trojan 的 WS 路径列表、上级池策略、新用户的默认 SS 方法、是否允许
+直连内网地址。存进库里的值优先生效，清空即回退到 .env 的部署默认值；保存
+后自动重新渲染生效。端口类配置不在此列——它们绑在分发器 / sshd 进程上，
+仍是 .env + compose 的事。
+
+「允许直连内网地址」默认关：经 VLESS / Trojan / Shadowsocks 进来的流量，
+直连时不能访问节点本机与内网地址（Xray freedom 出站的默认拦截规则，
+防 SSRF）；节点需要访问自家局域网服务时才打开，打开后渲染出的 freedom
+出站会带一条放行内网段的 finalRule。
 
 ## 管理界面二：命令行（与 Web 功能完全一致）
 
@@ -134,6 +140,30 @@ python3 xmagic.py settings set --upstream-strategy random --ss-method chacha20-i
   会话——一份会话一个文件，脚本里按节点切换，适合批量管理。
 - 退出码约定：0 成功、1 接口错误、2 配置/用法错误、3 未登录或会话过期，
   脚本可据此决定是否重跑 `login`。
+
+## 数据库
+
+业务数据（用户、上级、路由、设置、管理员凭证、登录会话）默认存 SQLite
+（`./data/users.db`），也可以跑在 PostgreSQL 或 MySQL 上：
+
+- **多套配置，随时切换**：每个库是一套命名参数（sqlite 是文件路径，
+  postgres / mysql 是 DSN），同时只能启用一套，切换立即重新渲染生效。
+- **表自动重建**：切到一个还没有表的空库（或对它执行测试）时，
+  全部业务表自动按当前结构建好，不需要手工跑迁移脚本。
+- **跨库迁移**：任意两套配置之间可以整库复制全部业务表
+  （含管理员凭证与登录会话）；目标非空时默认拒绝，显式选覆盖才清表。
+- **配置本身存本地**：数据库配置是引导信息，存在节点本地的 SQLite
+  文件里（默认 `./data/local.db`，可用 `XMAGIC_LOCAL_DB` 改位置），
+  不进任何业务库——这样无论当前启用的是哪个库，节点总能找回全部配置。
+- 三个界面操作一致：Web 后台「数据库」区；节点 CLI
+  `users.py db-list | db-add | db-edit | db-remove | db-test | db-switch | db-migrate`；
+  远程 CLI `xmagic.py db list | add | edit | remove | test | switch | migrate`。
+- 列表与输出里的 DSN 密码一律打码。postgres / mysql 驱动
+  （psycopg / PyMySQL）已装进 admin 镜像；脱离 Docker 单独跑 users.py 时
+  需自行 `pip install "psycopg[binary]" pymysql`，只用 SQLite 不需要。
+
+注意：登录会话也在业务库里。迁移会把会话一并复制过去；只切换、不迁移
+到一个没有你会话的库时，Web 与远程 CLI 都需要重新登录。
 
 ## WS 多路径
 
@@ -242,12 +272,12 @@ sshd / admin 随 `docker compose pull` 手动更新（管理面不自己重启�
 ## 文件清单
 
 - `admin.py` — Web 管理后台（Passkey、会话管理、配置 API；纯标准库，含 WebAuthn 校验实现）
-- `users.py` — 身份库引擎 + 节点侧 CLI（用户/上级/路由/渲染/apply/设置/会话）
+- `users.py` — 身份库引擎 + 节点侧 CLI（用户/上级/路由/数据库/渲染/apply/设置/会话）
 - `xmagic.py` — 远程 CLI（节点注册表、浏览器 Passkey 登录、会话文件、多节点批量管理）
 - `sniff.py` — 首字节协议分发器（纯标准库）
 - `docker-compose.yml` — xray / dispatcher / sshd / admin / tunnels（可选）/ watchtower
 - `Dockerfile.xray`、`Dockerfile.dispatcher`、`Dockerfile.sshd`、`Dockerfile.admin`、`sshd_config`
 - `versions.env` — 上游钉版（Xray 版本，upstream-check 工作流自动维护）
 - `.github/workflows/` — `build.yml`（测试 + 构建推 GHCR）、`upstream-check.yml`（上游新版自动跟进）
-- `tests/` — test_admin.py（后台协议与会话）、test_cli.py（双界面一致性）、test_client.py（远程 CLI 全流程）
+- `tests/` — test_admin.py（后台协议与会话）、test_cli.py（双界面一致性）、test_client.py（远程 CLI 全流程）、test_dispatch.py（分发器分流）、test_databases.py（多数据库：注册表/切换/迁移/方言）
 - `.env.example` — 配置模板

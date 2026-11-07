@@ -47,6 +47,7 @@ x-gateway-env: &gateway-env
   TROJAN_WS_PATHS: "${TROJAN_WS_PATHS:-/trojan-ws}"
   SS_METHOD: "${SS_METHOD:-aes-256-gcm}"
   UPSTREAM_STRATEGY: "${UPSTREAM_STRATEGY:-roundRobin}"
+  DIRECT_ALLOW_PRIVATE: "${DIRECT_ALLOW_PRIVATE:-}"
 
 services:
   xray:

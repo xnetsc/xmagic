@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
-"""SQLite-backed user manager for the single-port Xray gateway.
+"""User manager for the single-port Xray gateway.
 
-The SQLite database is the single source of truth for identity. Xray's
+The business database is the single source of truth for identity:
+SQLite by default, PostgreSQL or MySQL when configured (the db-*
+commands manage named database configs - several parameter sets, one
+active, switchable at any time, with data migration between them; the
+configs themselves live in a local SQLite registry next to the default
+database, never inside a managed database). Xray's
 config.json is a build artifact rendered from it; sshd's authorized_keys
 likewise. Credential model per user (one identity, several protocol secrets):
 
@@ -14,10 +19,11 @@ likewise. Credential model per user (one identity, several protocol secrets):
     sshd on the same host accepts the key, `ssh -D` gives a SOCKS5 proxy.
 
 A first-byte dispatcher (sniff.py) owns the single public port and routes
-each connection by its opening bytes: "SSH-" banner -> sshd; 0x05 ->
-SOCKS5 inbound; HTTP CONNECT / absolute-form -> HTTP-proxy inbound;
-HTTP with a WebSocket Upgrade -> the Xray fallback mux (WS paths, then
-bare Shadowsocks as the default); anything else -> the mux as well
+each connection by its opening bytes: "SSH-" banner -> sshd; a
+well-formed SOCKS5 greeting -> SOCKS5 inbound; HTTP CONNECT /
+absolute-form -> HTTP-proxy inbound; HTTP with a WebSocket Upgrade ->
+the Xray fallback mux (WS paths, then bare Shadowsocks as the default);
+origin-form HTTP -> the admin console; anything else -> the mux as well
 (VLESS-TCP direct, bare Shadowsocks).
 
 Usage:
@@ -29,9 +35,17 @@ Usage:
   users.py list
   users.py render [--out config.json]  write Xray config from enabled users
   users.py render-keys [--out authorized_keys]
+  users.py db-list | db-add NAME --type sqlite|postgres|mysql (--path P | --dsn D)
+  users.py db-edit NAME | db-remove NAME | db-test NAME
+  users.py db-switch NAME              make a config the active database
+  users.py db-migrate SRC DST [--replace]   copy all business tables
 
 Environment:
-  PROXY_DB        database path        (default ./data/users.db)
+  PROXY_DB        default sqlite database path (default ./data/users.db)
+  XMAGIC_LOCAL_DB local registry of database configs
+                  (default: local.db next to PROXY_DB)
+  DIRECT_ALLOW_PRIVATE  1 allows direct egress to private/LAN addresses
+                  (default off; a DB setting wins over the env)
   XRAY_PORT       public listen port (the dispatcher binds this; 8080)
   XRAY_MUX_PORT   loopback port of the Xray fallback mux (default 18080)
   BE_HTTP_PORT    loopback HTTP-proxy inbound   (default 18081)
@@ -80,12 +94,14 @@ import hashlib
 import ipaddress
 import json
 import os
+import re
 import secrets
 import socket
 import sqlite3
 import string
 import sys
 import time
+import urllib.parse
 import uuid
 from datetime import datetime, timezone
 
@@ -194,39 +210,667 @@ if UPSTREAM_STRATEGY not in STRATEGIES:
     sys.exit(f"UPSTREAM_STRATEGY must be one of {STRATEGIES}, got {UPSTREAM_STRATEGY!r}")
 
 
-def db():
-    os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+# ------------------------------------------------------------ database layer
+# Business data (users, upstreams, routes, console settings, sessions,
+# the admin credential) lives in the ACTIVE database: SQLite by default,
+# PostgreSQL or MySQL when configured. The database configurations
+# themselves - the named connection parameter sets and which one is
+# active - are node-local bootstrap data: they live in a small SQLite
+# file next to the default database (LOCAL_DB_PATH), never inside a
+# managed database, so the node can always find a working database and
+# switch between them. Web console, node CLI and remote CLI all manage
+# the same registry.
+
+BUSINESS_TABLES = ("users", "upstreams", "routes", "admin_settings",
+                   "admin_credentials", "admin_sessions")
+DB_TYPES = ("sqlite", "postgres", "mysql")
+LOCAL_DB_PATH = os.environ.get(
+    "XMAGIC_LOCAL_DB",
+    os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "local.db"))
+DEFAULT_CONFIG_NAME = "default"
+
+
+class DBError(Exception):
+    """A database-layer failure the caller can report as-is."""
+
+
+class IntegrityError(DBError):
+    """Uniqueness/constraint violation, on any dialect."""
+
+
+class OperationalError(DBError):
+    """Operational failure (missing table, unreachable server, ...)."""
+
+
+class Row:
+    """One result row: row[0], row["col"] and row.keys() all work on
+    every dialect (sqlite3.Row only exists for SQLite)."""
+
+    __slots__ = ("_cols", "_vals", "_map")
+
+    def __init__(self, cols, vals):
+        self._cols = tuple(cols)
+        self._vals = tuple(vals)
+        self._map = dict(zip(self._cols, self._vals))
+
+    def __getitem__(self, key):
+        if isinstance(key, (int, slice)):
+            return self._vals[key]
+        return self._map[key]
+
+    def get(self, key, default=None):
+        return self._map.get(key, default)
+
+    def keys(self):
+        return list(self._cols)
+
+    def __contains__(self, key):
+        return key in self._map
+
+    def __iter__(self):
+        return iter(self._vals)
+
+    def __len__(self):
+        return len(self._vals)
+
+    def __repr__(self):
+        return f"Row({self._map!r})"
+
+
+class Cursor:
+    """Driver cursor wrapper returning Row objects; iterable like a
+    sqlite3 cursor."""
+
+    def __init__(self, raw):
+        self._raw = raw
+
+    def _wrap(self, raw_row):
+        if raw_row is None:
+            return None
+        cols = [d[0] for d in (self._raw.description or ())]
+        return Row(cols, raw_row)
+
+    def fetchone(self):
+        return self._wrap(self._raw.fetchone())
+
+    def fetchall(self):
+        return [self._wrap(r) for r in self._raw.fetchall()]
+
+    def __iter__(self):
+        for r in self._raw:
+            yield self._wrap(r)
+
+    @property
+    def lastrowid(self):
+        return getattr(self._raw, "lastrowid", None)
+
+    @property
+    def rowcount(self):
+        return self._raw.rowcount
+
+
+_REPLACE_PK = {"admin_sessions": "token_hash", "admin_credentials": "id"}
+_REPLACE_RE = re.compile(
+    r"INSERT OR REPLACE INTO (\w+) \(([^)]*)\) VALUES \(([^)]*)\)",
+    re.IGNORECASE)
+
+
+def _split_sql(script):
+    """Split a DDL script on semicolons outside string literals (the
+    non-SQLite drivers refuse multi-statement executes)."""
+    parts, buf, in_q = [], [], False
+    for ch in script:
+        buf.append(ch)
+        if ch == "'":
+            in_q = not in_q
+        elif ch == ";" and not in_q:
+            parts.append("".join(buf))
+            buf = []
+    tail = "".join(buf).strip()
+    if tail:
+        parts.append(tail)
+    return [p for p in parts if p.strip()]
+
+
+class DB:
+    """Uniform connection over sqlite3 / psycopg / PyMySQL.
+
+    SQL in this codebase is written in the SQLite dialect with ?
+    placeholders; the wrapper translates the placeholders, the
+    identity-column DDL, INSERT OR REPLACE upserts and the settings
+    ON CONFLICT upsert for PostgreSQL and MySQL, and normalizes driver
+    exceptions into IntegrityError / OperationalError.
+    """
+
+    def __init__(self, raw, dialect):
+        self.raw = raw
+        self.dialect = dialect
+
+    # -- translation --------------------------------------------------
+    def _translate(self, sql):
+        if self.dialect == "sqlite":
+            return sql
+        out = sql
+        m = _REPLACE_RE.search(out)
+        if m and m.group(1).lower() in _REPLACE_PK:
+            table = m.group(1)
+            cols = [c.strip() for c in m.group(2).split(",")]
+            pk = _REPLACE_PK[table.lower()]
+            rest = [c for c in cols if c != pk]
+            if self.dialect == "postgres":
+                upd = ", ".join(f"{c} = excluded.{c}" for c in rest)
+                repl = (f"INSERT INTO {table} ({m.group(2)})"
+                        f" VALUES ({m.group(3)})"
+                        f" ON CONFLICT ({pk}) DO UPDATE SET {upd}")
+            else:  # mysql
+                upd = ", ".join(f"{c} = VALUES({c})" for c in rest)
+                repl = (f"INSERT INTO {table} ({m.group(2)})"
+                        f" VALUES ({m.group(3)})"
+                        f" ON DUPLICATE KEY UPDATE {upd}")
+            out = out[:m.start()] + repl + out[m.end():]
+        if self.dialect == "mysql":
+            out = out.replace(
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                "ON DUPLICATE KEY UPDATE value = VALUES(value)")
+            # `key` (the admin_settings column) is a reserved word in
+            # MySQL - quote it, except inside the DUPLICATE KEY keyword
+            # and where the DDL translation already quoted it.
+            out = re.sub(r"(?<!DUPLICATE )(?<!`)\bkey\b(?!`)", "`key`", out)
+        return out.replace("?", "%s")
+
+    @staticmethod
+    def _translate_ddl(sql, dialect):
+        if dialect == "postgres":
+            return sql.replace(
+                "id INTEGER PRIMARY KEY,",
+                "id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,")
+        if dialect == "mysql":
+            sql = sql.replace(
+                "id INTEGER PRIMARY KEY,",
+                "id INTEGER PRIMARY KEY AUTO_INCREMENT,")
+            # MySQL keys cannot be bare TEXT columns (error 1170):
+            # the keyed text columns become VARCHARs of a safe length.
+            sql = sql.replace("key TEXT PRIMARY KEY",
+                              "`key` VARCHAR(255) PRIMARY KEY")
+            sql = sql.replace("token_hash TEXT PRIMARY KEY",
+                              "token_hash VARCHAR(255) PRIMARY KEY")
+            sql = sql.replace("username TEXT UNIQUE NOT NULL",
+                              "username VARCHAR(255) UNIQUE NOT NULL")
+            sql = sql.replace("name TEXT UNIQUE NOT NULL",
+                              "name VARCHAR(255) UNIQUE NOT NULL")
+            sql = sql.replace("credential_id TEXT UNIQUE NOT NULL",
+                              "credential_id VARCHAR(512) UNIQUE NOT NULL")
+            return sql
+        return sql
+
+    @staticmethod
+    def _map_error(exc):
+        if isinstance(exc, DBError):
+            return exc
+        # match on the whole MRO: psycopg raises subclasses such as
+        # UniqueViolation whose own name is not "IntegrityError"
+        names = {c.__name__ for c in type(exc).__mro__}
+        if "IntegrityError" in names:
+            return IntegrityError(str(exc))
+        if names & {"OperationalError", "ProgrammingError", "InterfaceError",
+                    "InternalError", "DatabaseError"} or \
+                type(exc).__module__.startswith(("psycopg", "pymysql")):
+            return OperationalError(str(exc))
+        return DBError(str(exc))
+
+    # -- DB-API surface the codebase uses ------------------------------
+    def execute(self, sql, params=()):
+        sql = self._translate(self._translate_ddl(sql, self.dialect))
+        try:
+            cur = self.raw.cursor()
+            cur.execute(sql, tuple(params) if params else ())
+            return Cursor(cur)
+        except Exception as exc:
+            if self.dialect == "postgres":
+                # a failed statement aborts the transaction; roll back so
+                # the connection stays usable for the caller's fallback
+                try:
+                    self.raw.rollback()
+                except Exception:
+                    pass
+            raise self._map_error(exc) from exc
+
+    def executemany(self, sql, seq):
+        sql = self._translate(self._translate_ddl(sql, self.dialect))
+        try:
+            cur = self.raw.cursor()
+            cur.executemany(sql, [tuple(p) for p in seq])
+            return Cursor(cur)
+        except Exception as exc:
+            if self.dialect == "postgres":
+                try:
+                    self.raw.rollback()
+                except Exception:
+                    pass
+            raise self._map_error(exc) from exc
+
+    def executescript(self, script):
+        script = self._translate_ddl(script, self.dialect)
+        if self.dialect == "sqlite":
+            try:
+                self.raw.executescript(script)
+            except Exception as exc:
+                raise self._map_error(exc) from exc
+            return
+        for stmt in _split_sql(script):
+            self.execute(stmt)
+
+    def commit(self):
+        self.raw.commit()
+
+    def rollback(self):
+        self.raw.rollback()
+
+    def close(self):
+        self.raw.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            self.commit()
+        else:
+            self.rollback()
+        return False
+
+    # -- dialect helpers ------------------------------------------------
+    def insert_id(self, sql, params=()):
+        """INSERT and return the new row's id (PostgreSQL has no
+        lastrowid, so it goes through RETURNING)."""
+        if self.dialect == "postgres":
+            stmt = sql.rstrip().rstrip(";") + " RETURNING id"
+            return self.execute(stmt, params).fetchone()[0]
+        return self.execute(sql, params).lastrowid
+
+    def columns(self, table):
+        """Column names of a table, in declaration order ([] if the
+        table does not exist)."""
+        if self.dialect == "sqlite":
+            return [r[1] for r in self.execute(f"PRAGMA table_info({table})")]
+        if self.dialect == "mysql":
+            rows = self.execute(
+                "SELECT column_name FROM information_schema.columns"
+                " WHERE table_schema = DATABASE() AND table_name = ?"
+                " ORDER BY ordinal_position", (table,)).fetchall()
+        else:
+            rows = self.execute(
+                "SELECT column_name FROM information_schema.columns"
+                " WHERE table_name = ? ORDER BY ordinal_position",
+                (table,)).fetchall()
+        return [r[0] for r in rows]
+
+
+CREDENTIALS_SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS admin_credentials ("
+    " id INTEGER PRIMARY KEY CHECK (id = 1), credential_id TEXT UNIQUE NOT NULL,"
+    " public_key_x TEXT NOT NULL, public_key_y TEXT NOT NULL,"
+    " sign_count INTEGER NOT NULL DEFAULT 0, label TEXT, created_at TEXT NOT NULL)")
+
+
+def ensure_schema(conn):
+    """Create every business table if missing (this is what rebuilds
+    the schema when the node is pointed at a brand-new database) and
+    apply the additive column migrations older databases need."""
     conn.executescript(SCHEMA)
-    cols = [r[1] for r in conn.execute("PRAGMA table_info(users)")]
+    conn.execute(SETTINGS_SCHEMA)
+    conn.execute(SESSIONS_SCHEMA)
+    conn.execute(CREDENTIALS_SCHEMA)
+    cols = conn.columns("users")
     if cols and "upstream_group" not in cols:  # migrate pre-group databases
-        conn.execute("ALTER TABLE users ADD COLUMN upstream_group TEXT NOT NULL DEFAULT 'default'")
-    ucols = [r[1] for r in conn.execute("PRAGMA table_info(upstreams)")]
+        conn.execute("ALTER TABLE users ADD COLUMN upstream_group"
+                     " TEXT NOT NULL DEFAULT 'default'")
+    ucols = conn.columns("upstreams")
     if ucols and "username" not in ucols:  # migrate pre-http/socks databases
         conn.execute("ALTER TABLE upstreams ADD COLUMN username TEXT")
     if ucols and "key_file" not in ucols:  # migrate pre-ssh databases
         conn.execute("ALTER TABLE upstreams ADD COLUMN key_file TEXT")
     if ucols and "tls" not in ucols:  # migrate pre-tls databases
-        conn.execute("ALTER TABLE upstreams ADD COLUMN tls INTEGER NOT NULL DEFAULT 0")
-    if ucols:
+        conn.execute("ALTER TABLE upstreams ADD COLUMN tls"
+                     " INTEGER NOT NULL DEFAULT 0")
+    if ucols and conn.dialect == "sqlite":
         # SQLite cannot alter a CHECK constraint; rebuild the table if the
         # protocol whitelist predates 'ssh' or the bare 'vless' protocol
         # ('vless-ws' in the DDL does not contain the quoted 'vless').
         ddl = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='upstreams'"
-        ).fetchone()[0]
+            "SELECT sql FROM sqlite_master WHERE type='table'"
+            " AND name='upstreams'").fetchone()[0]
         if "'ssh'" not in ddl or "'vless'" not in ddl:
-            cols = ("id, name, grp, address, port, protocol, path, uuid, username,"
-                    " password, key_file, tls, method, enabled, note, created_at")
+            cols = ("id, name, grp, address, port, protocol, path, uuid,"
+                    " username, password, key_file, tls, method, enabled,"
+                    " note, created_at")
             body = SCHEMA.split("CREATE TABLE IF NOT EXISTS upstreams (")[1]
             conn.executescript(
                 "ALTER TABLE upstreams RENAME TO upstreams_old;"
                 "CREATE TABLE upstreams (" + body
-                + f"INSERT INTO upstreams ({cols}) SELECT {cols} FROM upstreams_old;"
+                + f"INSERT INTO upstreams ({cols}) SELECT {cols}"
+                + " FROM upstreams_old;"
                 + "DROP TABLE upstreams_old;"
             )
+    conn.commit()
+
+
+def _mysql_connect(dsn):
+    import pymysql
+    u = urllib.parse.urlparse(dsn)
+    if u.scheme not in ("mysql", "mysql+pymysql") or not u.path.lstrip("/"):
+        raise DBError(f"invalid MySQL DSN {dsn!r}"
+                      " (want mysql://user:pass@host:port/dbname)")
+    try:
+        return pymysql.connect(
+            host=u.hostname or "127.0.0.1", port=u.port or 3306,
+            user=urllib.parse.unquote(u.username or ""),
+            password=urllib.parse.unquote(u.password or ""),
+            database=urllib.parse.unquote(u.path.lstrip("/")),
+            charset="utf8mb4", autocommit=False)
+    except Exception as exc:
+        raise DBError(f"cannot connect to MySQL at {u.hostname}: {exc}")
+
+
+def connect_config(cfg):
+    """Open the business database a config describes and make sure the
+    full schema exists in it."""
+    typ, target = cfg["type"], cfg["target"]
+    if typ == "sqlite":
+        os.makedirs(os.path.dirname(os.path.abspath(target)),
+                    exist_ok=True)
+        conn = DB(sqlite3.connect(target), "sqlite")
+    elif typ == "postgres":
+        try:
+            import psycopg
+        except ImportError:
+            raise DBError("PostgreSQL support needs the psycopg package:"
+                          " pip install 'psycopg[binary]'")
+        try:
+            raw = psycopg.connect(target)
+        except Exception as exc:
+            raise DBError(f"cannot connect to PostgreSQL: {exc}")
+        conn = DB(raw, "postgres")
+    elif typ == "mysql":
+        try:
+            import pymysql  # noqa: F401
+        except ImportError:
+            raise DBError("MySQL support needs the pymysql package:"
+                          " pip install pymysql")
+        conn = DB(_mysql_connect(target), "mysql")
+    else:
+        raise DBError(f"unknown database type: {typ!r}")
+    ensure_schema(conn)
     return conn
+
+
+# ------------------------------------------------------------ local registry
+# The registry itself: named database configs in a local SQLite file.
+
+def _local_conn():
+    os.makedirs(os.path.dirname(os.path.abspath(LOCAL_DB_PATH)),
+                exist_ok=True)
+    fresh = not os.path.exists(LOCAL_DB_PATH)
+    conn = sqlite3.connect(LOCAL_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS db_configs ("
+        " name TEXT PRIMARY KEY, type TEXT NOT NULL, target TEXT NOT NULL,"
+        " note TEXT, is_active INTEGER NOT NULL DEFAULT 0,"
+        " created_at TEXT NOT NULL)")
+    if fresh:
+        try:
+            os.chmod(LOCAL_DB_PATH, 0o600)
+        except OSError:
+            pass
+    return conn
+
+
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def mask_target(typ, target):
+    """A config target safe to display: DSN passwords are hidden (the
+    SQLite path holds no secret and is shown as-is)."""
+    if typ == "sqlite":
+        return target
+    try:
+        u = urllib.parse.urlparse(target)
+        if u.password:
+            netloc = u.hostname or ""
+            if u.port:
+                netloc += f":{u.port}"
+            if u.username:
+                netloc = f"{u.username}:***@{netloc}"
+            return urllib.parse.urlunparse(
+                (u.scheme, netloc, u.path, "", u.query, ""))
+    except Exception:
+        pass
+    return target
+
+
+def _default_cfg():
+    return {"name": DEFAULT_CONFIG_NAME, "type": "sqlite", "target": DB_PATH,
+            "note": None, "active": True}
+
+
+def _stored_configs():
+    with _local_conn() as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM db_configs ORDER BY created_at, name")]
+
+
+def _public_cfg(cfg):
+    return {"name": cfg["name"], "type": cfg["type"],
+            "target": mask_target(cfg["type"], cfg["target"]),
+            "note": cfg.get("note"), "active": bool(cfg.get("active"))}
+
+
+def list_db_configs():
+    """Every configured database (targets masked), active one flagged.
+    With nothing stored, the implicit default - SQLite at PROXY_DB -
+    is the one and only config."""
+    rows = _stored_configs()
+    if not rows:
+        return [_public_cfg(_default_cfg())]
+    any_active = any(r["is_active"] for r in rows)
+    out = []
+    for r in rows:
+        active = bool(r["is_active"]) or (
+            not any_active and r["name"] == DEFAULT_CONFIG_NAME)
+        out.append(_public_cfg({**r, "active": active}))
+    return out
+
+
+def resolve_db_config(name):
+    """The raw (unmasked) config for a name; DBError if unknown."""
+    rows = _stored_configs()
+    for r in rows:
+        if r["name"] == name:
+            return {"name": r["name"], "type": r["type"],
+                    "target": r["target"], "note": r["note"]}
+    if not rows and name == DEFAULT_CONFIG_NAME:
+        cfg = _default_cfg()
+        return {"name": cfg["name"], "type": cfg["type"],
+                "target": cfg["target"], "note": None}
+    raise DBError(f"no such database config: {name}")
+
+
+def active_db_config():
+    """The raw config of the database the node currently runs on."""
+    rows = _stored_configs()
+    for r in rows:
+        if r["is_active"]:
+            return {"name": r["name"], "type": r["type"],
+                    "target": r["target"], "note": r["note"]}
+    return _default_cfg()
+
+
+def _materialize_default(conn):
+    """Persist the implicit default config so it can be switched back
+    to, edited and migrated like any other config."""
+    n = conn.execute("SELECT COUNT(*) FROM db_configs").fetchone()[0]
+    if n == 0:
+        cfg = _default_cfg()
+        conn.execute(
+            "INSERT INTO db_configs (name, type, target, note, is_active,"
+            " created_at) VALUES (?,?,?,?,1,?)",
+            (cfg["name"], cfg["type"], cfg["target"], None, _now_iso()))
+
+
+_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
+
+
+def _validate_config(name, typ, target):
+    if not _NAME_RE.match(name or ""):
+        raise DBError(f"invalid config name {name!r}"
+                      " (letters, digits, - and _, max 32 chars)")
+    if typ not in DB_TYPES:
+        raise DBError(f"database type must be one of {DB_TYPES}, got {typ!r}")
+    if not target:
+        raise DBError("a target is required (sqlite: file path;"
+                      " postgres/mysql: DSN)")
+    if typ == "sqlite" and "://" in target:
+        raise DBError("a sqlite target is a file path, not a DSN")
+    if typ == "postgres" and not target.startswith(
+            ("postgresql://", "postgres://")):
+        raise DBError("PostgreSQL target must be a DSN like"
+                      " postgresql://user:pass@host:5432/dbname")
+    if typ == "mysql" and not target.startswith("mysql://"):
+        raise DBError("MySQL target must be a DSN like"
+                      " mysql://user:pass@host:3306/dbname")
+
+
+def add_db_config(name, typ, target, note=None):
+    _validate_config(name, typ, target)
+    with _local_conn() as conn:
+        _materialize_default(conn)
+        if conn.execute("SELECT 1 FROM db_configs WHERE name = ?",
+                        (name,)).fetchone():
+            raise DBError(f"database config already exists: {name}")
+        conn.execute(
+            "INSERT INTO db_configs (name, type, target, note, is_active,"
+            " created_at) VALUES (?,?,?,?,0,?)",
+            (name, typ, target, note, _now_iso()))
+    return _public_cfg({**resolve_db_config(name), "active": False})
+
+
+def edit_db_config(name, target=None, note=None):
+    cfg = resolve_db_config(name)
+    if target is not None:
+        _validate_config(name, cfg["type"], target)
+    with _local_conn() as conn:
+        _materialize_default(conn)
+        if target is not None:
+            conn.execute("UPDATE db_configs SET target = ? WHERE name = ?",
+                         (target, name))
+        if note is not None:
+            conn.execute("UPDATE db_configs SET note = ? WHERE name = ?",
+                         (note or None, name))
+    active = active_db_config()["name"] == name
+    return _public_cfg({**resolve_db_config(name), "active": active})
+
+
+def remove_db_config(name):
+    if active_db_config()["name"] == name:
+        raise DBError(f"cannot remove the active database config {name!r}"
+                      " - switch to another one first")
+    with _local_conn() as conn:
+        cur = conn.execute("DELETE FROM db_configs WHERE name = ?", (name,))
+        if cur.rowcount == 0:
+            raise DBError(f"no such database config: {name}")
+
+
+def test_db_config(name):
+    """Connect to a configured database (creating the full schema in
+    it if it is still empty) and report its business-table row counts."""
+    cfg = resolve_db_config(name)
+    conn = connect_config(cfg)
+    try:
+        tables = {t: conn.execute(
+            f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+            for t in BUSINESS_TABLES}
+    finally:
+        conn.close()
+    return {"name": name, "type": cfg["type"],
+            "target": mask_target(cfg["type"], cfg["target"]),
+            "tables": tables}
+
+
+def switch_db_config(name):
+    """Make a config the active database. The target is connected to
+    first (schema auto-created) so a switch never strands the node on
+    an unreachable database."""
+    cfg = resolve_db_config(name)
+    conn = connect_config(cfg)
+    conn.close()
+    with _local_conn() as conn:
+        _materialize_default(conn)
+        conn.execute("UPDATE db_configs SET is_active = (name = ?)", (name,))
+    return _public_cfg({**cfg, "active": True})
+
+
+def migrate_db_config(src_name, dst_name, replace=False):
+    """Copy every business table from one configured database to
+    another (schema auto-created on the target). Refuses to write into
+    a non-empty target unless replace is set."""
+    if src_name == dst_name:
+        raise DBError("source and target are the same database config")
+    src = connect_config(resolve_db_config(src_name))
+    try:
+        dst = connect_config(resolve_db_config(dst_name))
+    except Exception:
+        src.close()
+        raise
+    try:
+        dst_counts = {t: dst.execute(
+            f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+            for t in BUSINESS_TABLES}
+        nonempty = {t: c for t, c in dst_counts.items() if c}
+        if nonempty and not replace:
+            raise DBError(
+                "target database is not empty ("
+                + ", ".join(f"{t}={c}" for t, c in nonempty.items())
+                + "); pass replace to overwrite it")
+        if replace:
+            for t in BUSINESS_TABLES:
+                dst.execute(f"DELETE FROM {t}")
+        copied = {}
+        for t in BUSINESS_TABLES:
+            cols = [c for c in src.columns(t) if c in dst.columns(t)]
+            rows = src.execute(
+                f"SELECT {', '.join(cols)} FROM {t}").fetchall()
+            if rows:
+                ph = ", ".join("?" * len(cols))
+                dst.executemany(
+                    f"INSERT INTO {t} ({', '.join(cols)}) VALUES ({ph})",
+                    [tuple(r[c] for c in cols) for r in rows])
+            copied[t] = len(rows)
+        if dst.dialect == "postgres":
+            # explicit ids were copied in; move each identity sequence
+            # past the largest copied id so new rows do not collide
+            for t in ("users", "upstreams", "routes"):
+                if copied[t]:
+                    dst.execute(
+                        f"SELECT setval(pg_get_serial_sequence('{t}', 'id'),"
+                        f" (SELECT MAX(id) FROM {t}))")
+        dst.commit()
+        for t in BUSINESS_TABLES:
+            got = dst.execute(
+                f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+            if got != copied[t]:
+                raise DBError(f"migration verification failed for {t}:"
+                              f" copied {copied[t]}, target holds {got}")
+        return {"from": src_name, "to": dst_name, "tables": copied}
+    finally:
+        src.close()
+        dst.close()
+
+
+def db():
+    """Connect to the active business database."""
+    return connect_config(active_db_config())
 
 
 def gen_password(n=24):
@@ -242,10 +886,16 @@ def get_user(conn, username):
 
 
 def cmd_init(_):
+    cfg = active_db_config()
     with db() as conn:
         conn.commit()
-    os.chmod(DB_PATH, 0o600)
-    print(f"initialized {DB_PATH}")
+    if cfg["type"] == "sqlite":
+        try:
+            os.chmod(cfg["target"], 0o600)
+        except OSError:
+            pass
+    print(f"initialized {cfg['name']} "
+          f"({cfg['type']}: {mask_target(cfg['type'], cfg['target'])})")
 
 
 def cmd_add(args):
@@ -265,7 +915,7 @@ def cmd_add(args):
                 (args.user, user_uuid, trojan_pw, ss_pw, method, pubkey,
                  args.group, args.note, datetime.now(timezone.utc).isoformat()),
             )
-        except sqlite3.IntegrityError:
+        except IntegrityError:
             sys.exit(f"user already exists: {args.user}")
     if JSON_OUT:
         print(json.dumps({"username": args.user, "vless_uuid": user_uuid,
@@ -409,7 +1059,7 @@ def cmd_upstream_add(args):
                  args.uuid, args.username, args.password, args.key_file, 1 if args.tls else 0,
                  args.method, args.note, datetime.now(timezone.utc).isoformat()),
             )
-        except sqlite3.IntegrityError:
+        except IntegrityError:
             sys.exit(f"upstream already exists: {args.name}")
     if JSON_OUT:
         with db() as conn:
@@ -557,12 +1207,11 @@ def cmd_route_add(args):
         if args.user:
             get_user(conn, args.user)
         known = {r[0] for r in conn.execute("SELECT DISTINCT grp FROM upstreams")}
-        cur = conn.execute(
+        rid = conn.insert_id(
             "INSERT INTO routes (kind, pattern, target, username, note, created_at)"
             " VALUES (?,?,?,?,?,?)",
             (args.kind, args.pattern, args.to, args.user, args.note,
              datetime.now(timezone.utc).isoformat()))
-        rid = cur.lastrowid
     if JSON_OUT:
         with db() as conn:
             r = get_route(conn, rid)
@@ -766,7 +1415,13 @@ def build_egress(conn, users):
             ssh_idx += 1
         else:
             outbounds.append(upstream_outbound(u, None, vpaths, tpaths))
-    outbounds.append({"tag": "direct", "protocol": "freedom"})
+    direct = {"tag": "direct", "protocol": "freedom"}
+    if allow_private_direct(conn):
+        # operator opt-in: an allow finalRule ahead of Xray's default
+        # block-private rule, for nodes that must reach their own LAN
+        direct["settings"] = {"finalRules": [
+            {"action": "allow", "ip": list(PRIVATE_CIDRS)}]}
+    outbounds.append(direct)
     if need_block:
         outbounds.append({"tag": "block", "protocol": "blackhole"})
     if not ups and not route_rules:
@@ -962,7 +1617,7 @@ def get_setting(conn, key, default=None):
     try:
         row = conn.execute("SELECT value FROM admin_settings WHERE key = ?",
                            (key,)).fetchone()
-    except sqlite3.OperationalError:
+    except OperationalError:
         return default
     return row[0] if row else default
 
@@ -995,6 +1650,27 @@ def default_ss_method(conn=None):
     return SS_METHOD
 
 
+PRIVATE_CIDRS = ("127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12",
+                 "192.168.0.0/16", "169.254.0.0/16", "100.64.0.0/10",
+                 "::1/128", "fc00::/7", "fe80::/10")
+DIRECT_ALLOW_PRIVATE = os.environ.get("DIRECT_ALLOW_PRIVATE", "")
+
+
+def allow_private_direct(conn=None):
+    """Whether direct egress may reach private / LAN addresses.
+
+    Xray's freedom outbound blackholes private targets for requests
+    arriving over the remote protocols (vless / trojan / shadowsocks -
+    an anti-SSRF default), so even a destination route to "direct"
+    cannot reach the node's own LAN unless the operator allows it.
+    A DB setting wins over the DIRECT_ALLOW_PRIVATE env."""
+    if conn is not None:
+        raw = get_setting(conn, "direct_allow_private")
+        if raw is not None:
+            return raw == "1"
+    return DIRECT_ALLOW_PRIVATE.lower() in ("1", "true", "yes", "on")
+
+
 def settings_info(conn):
     return {
         "session_ttl_hours": session_ttl_hours(conn),
@@ -1006,6 +1682,9 @@ def settings_info(conn):
         "upstream_strategy_from_db": get_setting(conn, "upstream_strategy") is not None,
         "ss_method": default_ss_method(conn),
         "ss_method_from_db": get_setting(conn, "ss_method") is not None,
+        "direct_allow_private": allow_private_direct(conn),
+        "direct_allow_private_from_db":
+            get_setting(conn, "direct_allow_private") is not None,
     }
 
 
@@ -1042,6 +1721,12 @@ def cmd_settings(args):
             if key.endswith("_paths"):
                 value = ",".join(_parse_paths(value, "/unused"))
             set_setting(conn, key, value)
+        if args.direct_allow_private is not None:
+            if args.direct_allow_private == "":
+                delete_setting(conn, "direct_allow_private")
+            else:
+                set_setting(conn, "direct_allow_private",
+                            "1" if args.direct_allow_private == "on" else "0")
         conn.commit()
         info = settings_info(conn)
     if JSON_OUT:
@@ -1058,6 +1743,8 @@ def cmd_settings(args):
           f"({src[info['upstream_strategy_from_db']]})")
     print(f"ss_method (new users): {info['ss_method']} "
           f"({src[info['ss_method_from_db']]})")
+    print(f"direct_allow_private: {info['direct_allow_private']} "
+          f"({src[info['direct_allow_private_from_db']]})")
 
 
 def render_all(out_dir):
@@ -1129,11 +1816,7 @@ def apply_changes():
     return result
 
 
-def cmd_apply(_):
-    result = apply_changes()
-    if JSON_OUT:
-        print(json.dumps(result, indent=2))
-        return
+def _applied_line(result):
     line = (f"applied: rendered {result['users']} user(s), "
             f"{result['upstreams']} upstream(s), {result['ssh_keys']} ssh key(s)")
     if result["restart_skipped"]:
@@ -1141,7 +1824,95 @@ def cmd_apply(_):
     else:
         line += "; restarts: " + ", ".join(
             f"{k}={'ok' if v else 'FAILED'}" for k, v in result["restarted"].items())
-    print(line)
+    return line
+
+
+def cmd_apply(_):
+    result = apply_changes()
+    if JSON_OUT:
+        print(json.dumps(result, indent=2))
+        return
+    print(_applied_line(result))
+
+
+# ------------------------------------------------------------ database admin
+# The db-* commands manage the local registry of database configs:
+# several named parameter sets, one active at a time, switchable at any
+# moment, with data migration between any two of them.
+
+def _db_target_arg(args):
+    return args.target or args.dsn or args.path
+
+
+def cmd_db_list(_):
+    configs = list_db_configs()
+    if JSON_OUT:
+        print(json.dumps(configs, indent=2))
+        return
+    for c in configs:
+        mark = "*" if c["active"] else " "
+        print(f"{mark} {c['name']:<16} {c['type']:<9} {c['target']}"
+              + (f"  ({c['note']})" if c["note"] else ""))
+
+
+def cmd_db_add(args):
+    cfg = add_db_config(args.name, args.type, _db_target_arg(args), args.note)
+    if JSON_OUT:
+        print(json.dumps(cfg, indent=2))
+        return
+    print(f"database config {cfg['name']} added: {cfg['type']} {cfg['target']}"
+          f"; check it with: users.py db-test {cfg['name']}")
+
+
+def cmd_db_edit(args):
+    if _db_target_arg(args) is None and args.note is None:
+        sys.exit("nothing to edit: pass --target/--dsn/--path or --note")
+    cfg = edit_db_config(args.name, target=_db_target_arg(args),
+                         note=args.note)
+    if JSON_OUT:
+        print(json.dumps(cfg, indent=2))
+        return
+    print(f"database config {cfg['name']} updated: "
+          f"{cfg['type']} {cfg['target']}"
+          + (" (active)" if cfg["active"] else ""))
+
+
+def cmd_db_remove(args):
+    remove_db_config(args.name)
+    print(f"database config {args.name} removed")
+
+
+def cmd_db_test(args):
+    info = test_db_config(args.name)
+    if JSON_OUT:
+        print(json.dumps(info, indent=2))
+        return
+    counts = ", ".join(f"{t}={c}" for t, c in info["tables"].items())
+    print(f"{info['name']}: reachable ({info['type']}: {info['target']});"
+          f" tables: {counts}")
+
+
+def cmd_db_switch(args):
+    cfg = switch_db_config(args.name)
+    applied = apply_changes()
+    if JSON_OUT:
+        print(json.dumps({"database": cfg, "applied": applied}, indent=2))
+        return
+    print(f"active database: {cfg['name']} ({cfg['type']}: {cfg['target']})")
+    print(_applied_line(applied))
+
+
+def cmd_db_migrate(args):
+    result = migrate_db_config(args.src, args.dst, replace=args.replace)
+    if JSON_OUT:
+        print(json.dumps(result, indent=2))
+        return
+    counts = ", ".join(f"{t}={c}" for t, c in result["tables"].items())
+    print(f"migrated {args.src} -> {args.dst}: {counts}")
+    if active_db_config()["name"] != args.dst:
+        print(f"note: the active database is still "
+              f"{active_db_config()['name']}; switch with:"
+              f" users.py db-switch {args.dst}")
 
 
 def cmd_status(_):
@@ -1160,18 +1931,21 @@ def cmd_status(_):
         try:
             cred = conn.execute(
                 "SELECT created_at, label FROM admin_credentials WHERE id = 1").fetchone()
-        except sqlite3.OperationalError:
+        except OperationalError:
             cred = None
     info["admin_registered"] = cred is not None
     info["admin_created_at"] = cred["created_at"] if cred else None
     info["admin_label"] = cred["label"] if cred else None
     info["docker_socket"] = os.path.exists(DOCKER_SOCK)
     info["public_port"] = PUBLIC_PORT
-    info["db"] = DB_PATH
+    _cfg = active_db_config()
+    info["db"] = mask_target(_cfg["type"], _cfg["target"])
+    info["db_name"] = _cfg["name"]
+    info["db_type"] = _cfg["type"]
     if JSON_OUT:
         print(json.dumps(info, indent=2))
         return
-    print(f"db: {info['db']}")
+    print(f"db: {info['db_name']} ({info['db_type']}: {info['db']})")
     print(f"users: {info['users_enabled']}/{info['users']} enabled; "
           f"upstreams: {info['upstreams_enabled']}/{info['upstreams']} enabled; "
           f"routes: {info['routes_enabled']}/{info['routes']} enabled")
@@ -1216,7 +1990,7 @@ def find_session(conn, token):
     try:
         row = conn.execute("SELECT * FROM admin_sessions WHERE token_hash = ?",
                            (token_hash(token),)).fetchone()
-    except sqlite3.OperationalError:
+    except OperationalError:
         return None
     if row is None:
         return None
@@ -1337,6 +2111,9 @@ def main():
     a.add_argument("--trojan-ws-paths", help="comma-separated; empty string = back to env")
     a.add_argument("--upstream-strategy")
     a.add_argument("--ss-method", help="default method for new users")
+    a.add_argument("--direct-allow-private", choices=("on", "off", ""),
+                   help="allow direct egress to private/LAN addresses;"
+                        " empty string = back to env")
     a.set_defaults(fn=cmd_settings)
     sub.add_parser("sessions").set_defaults(fn=cmd_sessions)
     a = sub.add_parser("sessions-revoke"); a.add_argument("id")
@@ -1420,10 +2197,35 @@ def main():
     a = sub.add_parser("render"); a.add_argument("--out"); a.set_defaults(fn=cmd_render)
     a = sub.add_parser("render-keys"); a.add_argument("--out")
     a.set_defaults(fn=cmd_render_keys)
+    sub.add_parser("db-list").set_defaults(fn=cmd_db_list)
+    a = sub.add_parser("db-add"); a.add_argument("name")
+    a.add_argument("--type", required=True, choices=DB_TYPES)
+    a.add_argument("--target", help="sqlite: file path; postgres/mysql: DSN")
+    a.add_argument("--dsn", help="alias of --target, for postgres/mysql")
+    a.add_argument("--path", help="alias of --target, for sqlite")
+    a.add_argument("--note")
+    a.set_defaults(fn=cmd_db_add)
+    a = sub.add_parser("db-edit"); a.add_argument("name")
+    a.add_argument("--target"); a.add_argument("--dsn"); a.add_argument("--path")
+    a.add_argument("--note", help="empty string clears the note")
+    a.set_defaults(fn=cmd_db_edit)
+    a = sub.add_parser("db-remove"); a.add_argument("name")
+    a.set_defaults(fn=cmd_db_remove)
+    a = sub.add_parser("db-test"); a.add_argument("name")
+    a.set_defaults(fn=cmd_db_test)
+    a = sub.add_parser("db-switch"); a.add_argument("name")
+    a.set_defaults(fn=cmd_db_switch)
+    a = sub.add_parser("db-migrate"); a.add_argument("src"); a.add_argument("dst")
+    a.add_argument("--replace", action="store_true",
+                   help="clear the target's business tables before copying")
+    a.set_defaults(fn=cmd_db_migrate)
     args = p.parse_args()
     global JSON_OUT
     JSON_OUT = args.json
-    args.fn(args)
+    try:
+        args.fn(args)
+    except DBError as exc:
+        sys.exit(str(exc))
 
 
 if __name__ == "__main__":
