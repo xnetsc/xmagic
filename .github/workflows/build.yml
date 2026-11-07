@@ -32,9 +32,7 @@ jobs:
           python-version: "3.12"
       - name: Admin console + CLI parity tests
         run: |
-          python3 tests/test_admin.py
-          python3 tests/test_cli.py
-          python3 tests/test_client.py
+          for t in tests/test_*.py; do python3 "$t"; done
 
   build:
     needs: test
