@@ -23,10 +23,11 @@ constant-time implementation leaks nothing here.
 Environment:
   PROXY_DB               database path (default ./data/users.db)
   XMAGIC_ADMIN_BIND      listen address (default 127.0.0.1 standalone;
-                         the image sets 0.0.0.0 and the compose port
-                         mapping publishes it on the host, 0.0.0.0 by
-                         default - XMAGIC_ADMIN_BIND there can pin it
-                         back to 127.0.0.1)
+                         the image sets 0.0.0.0 inside the container
+                         network, and compose publishes it only on the
+                         host's loopback backend port - the dispatcher
+                         routes the console's share of the public port
+                         to it)
   XMAGIC_ADMIN_PORT      listen port (default 8090)
   XMAGIC_ADMIN_RPID      WebAuthn relying-party id (default localhost).
                          Set to the domain when the console is served on

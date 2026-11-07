@@ -1,18 +1,19 @@
 # Single-port multi-protocol proxy gateway ("xmagic").
 #
 #   dispatcher (sniff.py)  binds the one public port (XRAY_PORT) and routes
-#     by first bytes: SSH banner -> sshd, 0x05 -> SOCKS5, HTTP CONNECT /
+#     by content: SSH banner -> sshd, 0x05 -> SOCKS5, HTTP CONNECT /
 #     absolute-form -> HTTP proxy, WebSocket -> Xray fallback mux (WS paths,
-#     then bare Shadowsocks as default), anything else -> Xray mux.
+#     then bare Shadowsocks as default), origin-form HTTP (a browser) ->
+#     the admin console, anything else -> Xray mux.
 #   xray                   the mux + all loopback backends; config.json is
 #     rendered from the SQLite identity DB (./data/users.db).
 #   sshd                   the node's real SSH entry; authorized_keys is
 #     rendered from the same DB.
 #   admin                  Passkey-only web console + the users.py CLI.
 #     Shares ./data, renders config after every change and restarts the
-#     xray/sshd containers over the Docker socket. Published on the host
-#     (XMAGIC_ADMIN_PORT, default 8090) so the console is reachable from
-#     anywhere; set XMAGIC_ADMIN_BIND=127.0.0.1 to lock it to loopback.
+#     xray/sshd containers over the Docker socket. It has no public port
+#     of its own: it listens on a loopback backend port and the
+#     dispatcher routes the console's share of the one public port to it.
 #   watchtower             daily auto-update of the labeled images (xray,
 #     dispatcher) - new builds land here from CI, including Xray version
 #     bumps made by the upstream-check workflow.
@@ -23,7 +24,7 @@
 # First run:
 #   cp .env.example .env        # set XRAY_PORT etc.
 #   docker compose up -d        # admin renders an empty config at boot
-#   # open http://127.0.0.1:8090 (or: ssh -L 8090:127.0.0.1:8090 <host>)
+#   # open http://<host>:8080 - the console shares the public port
 #   # register the admin passkey, then add users in the console - every
 #   # change re-renders and restarts the gateway automatically.
 # CLI instead of / in addition to the console (same engine, same DB):
@@ -40,6 +41,7 @@ x-gateway-env: &gateway-env
   VLESS_BE_BASE: "${VLESS_BE_BASE:-12100}"
   TROJAN_BE_BASE: "${TROJAN_BE_BASE:-12200}"
   SSH_BE_PORT: "${SSH_BE_PORT:-12222}"
+  ADMIN_BE_PORT: "${ADMIN_BE_PORT:-18090}"
   SSH_TUNNEL_BASE: "${SSH_TUNNEL_BASE:-13000}"
   VLESS_WS_PATHS: "${VLESS_WS_PATHS:-/vless-ws}"
   TROJAN_WS_PATHS: "${TROJAN_WS_PATHS:-/trojan-ws}"
@@ -101,11 +103,13 @@ services:
     container_name: proxy-admin
     restart: unless-stopped
     ports:
-      - "${XMAGIC_ADMIN_BIND:-0.0.0.0}:${XMAGIC_ADMIN_PORT:-8090}:8090"
+      # Loopback backend only - the dispatcher routes the console's
+      # origin-form HTTP on the public port to this port.
+      - "127.0.0.1:${ADMIN_BE_PORT:-18090}:8090"
     environment:
       <<: *gateway-env
       XMAGIC_ADMIN_RPID: "${XMAGIC_ADMIN_RPID:-localhost}"
-      XMAGIC_ADMIN_ORIGINS: "${XMAGIC_ADMIN_ORIGINS:-http://localhost:${XMAGIC_ADMIN_PORT:-8090},http://127.0.0.1:${XMAGIC_ADMIN_PORT:-8090}}"
+      XMAGIC_ADMIN_ORIGINS: "${XMAGIC_ADMIN_ORIGINS:-http://localhost:${XRAY_PORT:-8080},http://127.0.0.1:${XRAY_PORT:-8080}}"
     volumes:
       - ./data:/data
       # Lets the console restart xray/sshd after a render. Remove this

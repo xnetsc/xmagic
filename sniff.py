@@ -8,11 +8,18 @@ bytes identify the protocol unambiguously:
   0x05                               -> SOCKS5 inbound  (BE_SOCKS_PORT)
   "CONNECT ..."                      -> HTTP inbound    (BE_HTTP_PORT)
   other HTTP + "Upgrade: websocket"  -> Xray mux        (XRAY_MUX_PORT)
-  other HTTP (absolute-form proxying)-> HTTP inbound    (BE_HTTP_PORT)
+  other HTTP, absolute-form target   -> HTTP inbound    (BE_HTTP_PORT)
+  other HTTP, origin-form target     -> admin console   (ADMIN_BE_PORT)
   anything else (VLESS-TCP, bare SS) -> Xray mux        (XRAY_MUX_PORT)
 
 The mux itself then dispatches WebSocket paths to the VLESS/Trojan
 backends and everything else to the bare-Shadowsocks backend.
+
+Origin-form vs absolute-form is what separates the console from proxy
+traffic on this one port: a browser talking to the console asks for
+"/..." on this host, while a client using the HTTP proxy asks for
+"http://..." (or CONNECT). Explicit-proxy clients never send
+origin-form, so the split is unambiguous.
 
 Environment:
   XRAY_PORT      public listen port      (default 8080)
@@ -20,6 +27,7 @@ Environment:
   BE_HTTP_PORT   Xray http inbound       (default 18081)
   BE_SOCKS_PORT  Xray socks inbound      (default 18082)
   SSH_BE_PORT    sshd port               (default 12222)
+  ADMIN_BE_PORT  admin console backend   (default 18090)
   SNIFF_PEEK_TIMEOUT  seconds to wait for the client's first bytes (5)
 
 Python 3 stdlib only. One thread pair per connection; logging to stdout.
@@ -36,6 +44,7 @@ TARGETS = {
     "http": ("127.0.0.1", int(os.environ.get("BE_HTTP_PORT", "18081"))),
     "socks": ("127.0.0.1", int(os.environ.get("BE_SOCKS_PORT", "18082"))),
     "ssh": ("127.0.0.1", int(os.environ.get("SSH_BE_PORT", "12222"))),
+    "admin": ("127.0.0.1", int(os.environ.get("ADMIN_BE_PORT", "18090"))),
 }
 PEEK_TIMEOUT = float(os.environ.get("SNIFF_PEEK_TIMEOUT", "5"))
 HTTP_METHODS = (b"GET ", b"POST ", b"PUT ", b"DELETE ", b"HEAD ",
@@ -57,6 +66,11 @@ def classify(data: bytes) -> str:
         head = data.split(b"\r\n\r\n", 1)[0].lower()
         if b"upgrade: websocket" in head or b"upgrade:websocket" in head:
             return "mux"
+        first_line = data.split(b"\r\n", 1)[0]
+        parts = first_line.split(b" ")
+        target = parts[1] if len(parts) > 1 else b""
+        if target.startswith(b"/"):
+            return "admin"
         return "http"
     return "mux"
 

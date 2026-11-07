@@ -14,20 +14,21 @@ HTTP 代理（CONNECT）、VLESS-WS、VLESS（裸 TCP）、Trojan-WS、裸 Shado
 ```
                         公共端口 XRAY_PORT（唯一对外端口）
                                    │
-                        sniff.py 首字节分发器
-        ┌──────────────┬───────────┼──────────────┬────────────────┐
-     "SSH-" 横幅     0x05       CONNECT /        WebSocket        其余字节
-        │            │          绝对形式 HTTP       Upgrade           │
-       sshd        SOCKS5 入站   HTTP 入站      Xray fallback 复用器 ──┤
-    (公钥认证)    (用户+密码)   (用户+密码)     ├ 路径命中 → VLESS-WS 后端（可多路径）
-                                              ├ 路径命中 → Trojan-WS 后端（可多路径）
-                                              └ 默认回落 → 裸 Shadowsocks 后端
+                        sniff.py 首字节分发器（按内容分流）
+        ┌──────────┬────────┬──────────┬────────────┬────────────────┐
+     "SSH-" 横幅   0x05    CONNECT /    WebSocket     源形式 HTTP     其余字节
+        │          │       绝对形式 HTTP   Upgrade      （浏览器）        │
+       sshd      SOCKS5 入站   HTTP 入站   Xray fallback 复用器 ──┤   admin 后台
+    (公钥认证)   (用户+密码)  (用户+密码)   ├ 路径命中 → VLESS-WS 后端（可多路径）
+                                            ├ 路径命中 → Trojan-WS 后端（可多路径）
+                                            └ 默认回落 → 裸 Shadowsocks 后端
                                    │
                         出口：直连，或上级池（按用户分组、负载均衡）
 ```
 
-- 网关的所有后端只听 127.0.0.1，对外只有分发器一个端口；admin 后台是
-  独立发布的一个端口（见下）。
+- 对外只有一个端口（分发器）。所有后端只听 127.0.0.1，admin 后台也不
+  例外：它和代理共用这一个公网端口，分发器按内容分流——源形式 HTTP
+  （浏览器打开后台）转给它，代理形式的流量转给代理（规则见架构节）。
 - 身份只有一个事实源：**SQLite 数据库**（`data/users.db`）。Xray 的
   `config.json`、sshd 的 `authorized_keys` 都是从库里渲染出来的产物。
 - 后端回环端口全部可由 env 覆盖（同机跑多个节点做测试时必须错开）。
@@ -57,10 +58,10 @@ HTTP 代理（CONNECT）、VLESS-WS、VLESS（裸 TCP）、Trojan-WS、裸 Shado
   重启 xray / sshd 生效（没挂 socket 时只渲染，界面会如实提示）。
 - **只支持一个管理员账号，且只能用 Passkey**：第一个注册的 Passkey 即管理员，
   注册随即永久关闭；不支持密码或其它登录方式。用户验证（UV）强制开启。
-- 后台端口发布在宿主机上（默认 8090，`XMAGIC_ADMIN_PORT`），公网可直接
-  访问；`.env` 里设 `XMAGIC_ADMIN_BIND=127.0.0.1` 可以收回为仅本机。
-  若前面挂了域名 + HTTPS，把 `XMAGIC_ADMIN_RPID` / `XMAGIC_ADMIN_ORIGINS`
-  改成该域名，Passkey 按该域名签发。
+- 后台没有自己的公网端口：浏览器打开 `http://<节点>:<XRAY_PORT>/` 就是
+  它（分发器按源形式/绝对形式分流，见架构节）。若前面挂了域名 + HTTPS，
+  把 `XMAGIC_ADMIN_RPID` / `XMAGIC_ADMIN_ORIGINS` 改成该域名，Passkey 按
+  该域名签发。
 - Passkey 丢了没有网页找回通道：在节点上跑 `users.py admin-reset` 清掉凭证
   重新注册——能碰宿主机的人本来就拥有这台机器，这是刻意的破窗设计。
   还在登录状态时也可以在后台直接**更换 Passkey**（设置区）：更换完成的那一刻，
@@ -110,7 +111,7 @@ docker compose run --rm admin python3 users.py --json list   # 机器可读输�
 ### 自己机器上：xmagic.py（远程 CLI，批量管节点）
 
 ```bash
-python3 xmagic.py node add tokyo --url http://<节点地址>:8090   # 后台公网可达，直连即可
+python3 xmagic.py node add tokyo --url http://<节点地址>:8080   # 后台与代理共用公网端口，直连即可
 python3 xmagic.py login            # 自动拉起浏览器走 Passkey，登录态存回本地
 python3 xmagic.py users add alice
 python3 xmagic.py --node tokyo routes add --kind ip --pattern 1.1.1.1 --to intl
@@ -216,13 +217,51 @@ SSH/SOCKS/SS 这些裸 TCP 进不来，文件系统还是临时的；Vercel 是�
 git clone https://github.com/xnetsc/xmagic && cd xmagic
 cp .env.example .env                 # 至少设 XRAY_PORT、WS 路径
 docker compose up -d                 # admin 首次启动会先渲染一份空配置顶住
-# 浏览器打开 http://<节点地址>:8090 注册管理员 Passkey → 加用户
-# （每次修改自动渲染 + 重启生效）
-# 云控制台防火墙放行两个端口：XRAY_PORT（代理）与 8090（后台）
+# 浏览器打开 http://<节点地址>:8080 注册管理员 Passkey → 加用户
+# （后台与代理共用这一个端口，每次修改自动渲染 + 重启生效）
+# 云控制台防火墙只放行 XRAY_PORT 一个端口
 ```
 
 自更新：watchtower 每天检查，只自动更新带 label 的 xray 与 dispatcher 镜像；
 sshd / admin 随 `docker compose pull` 手动更新（管理面不自己重启自己）。
+
+## 本地实测记录（2026-11-07，全部在本地真实跑过）
+
+网关本体（沙箱内多节点实测）：
+
+- 单端口全协议（经分发器、经上级出网取 GitHub 200）：SOCKS5+密码 ✓（错密码拒）、
+  HTTP CONNECT+Basic ✓（错密码拒）、VLESS-WS ✓、Trojan-WS ✓、裸 SS ✓、
+  裸 VLESS-TCP ✓（错 uuid 拒）；SSH 经分发器端口 `ssh -D` ✓、直连 sshd ✓（错公钥拒）。
+- WS 双路径别名同时生效 ✓；级联轮询 6/6 均分、随机 10/10、坏池负例全断 ✓；
+  按目标选上级六个用例（域名/IP/block/带用户/禁用回落）全过 ✓；
+  SSH 上级按渲染出的隧道命令全程打通 ✓；
+  Xray 的 http 出站认证经自建 authproxy 逐字节验证（含密码带 `: @ / %`）✓；
+  旧格式数据库迁移 ✓。
+
+管理面（软件模拟认证器 + 真实 HTTP 服务/CLI 进程）：
+
+- Passkey 注册/登录全流程 ✓；二次注册被拒 ✓；断言重放被拒 ✓；错密钥被拒 ✓；
+  `admin-reset` 后可重新注册 ✓。
+- 会话：默认 1 周、改成 24 小时后新签发会话按新值到期 ✓；会话列表带当前标记 ✓；
+  按 id 撤销后该令牌立即失效 ✓；撤销其它会话只留当前 ✓；一次性交接代码单用 ✓；
+  非回环回调地址被拒 ✓。
+- 双界面一致性：CLI 建的用户在 Web 可见、反之亦然 ✓；`--json` 输出可解析 ✓。
+- 远程 CLI：双节点注册表、参数覆盖配置、按节点存会话、`--session-file` 选会话、
+  未登录退出码 3 ✓。
+- 管理完整性：上级编辑（改端口/密码，空密码被拒）✓；路由编辑 ✓；换 UUID /
+  改 SS 方法 / 备注三套界面 ✓；渲染级设置（WS 路径改后渲染出的配置立即带新
+  路径、清空回退 .env）✓；登录状态下更换管理员 Passkey（旧会话全灭、旧
+  Passkey 失效、新 Passkey 可登录）✓。三套测试共 110 项断言全过。
+- 单端口分流（含 admin）：桩后端 + 真实分发器实测 8 个用例——SSH 横幅、
+  SOCKS 问候、CONNECT、绝对形式 GET、WS 升级、浏览器源形式 GET、后台
+  API POST、二进制协议字节，全部落到正确后端 ✓。
+
+两个实测中定位到的坑（都不是产品缺陷）：沙箱的上游代理密码会定期轮换，长驻进程
+写死旧密码会吃 407（生产环境静态密码不受影响）；多个节点同机测试时回环后端端口
+必须错开，否则内核 SO_REUSEPORT 会把连接分流到别的节点后端。
+
+compose 文件本身只做过静态校验；Docker 实际拉起等有 VPS 时验（构建 sshd 镜像、
+host 网络、卷挂载路径都是标准用法，风险低）。
 
 ## 注意事项
 
