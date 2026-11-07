@@ -154,7 +154,7 @@ python3 xmagic.py keys list        # 本机可用的 SSH 密钥：~/.ssh、~/.xm
 python3 xmagic.py keys generate alice   # 在 ~/.xmagic/keys 下生成一对 ed25519 密钥
 python3 xmagic.py users add alice --ssh-key alice   # 把这把钥登记为她的登录凭据
 python3 xmagic.py users add bob --ssh-key-generate  # 生成 + 登记一步完成
-python3 xmagic.py update           # 从仓库把本 CLI 更新到最新版
+python3 xmagic.py update           # 与所选节点打包的副本按字节对齐更新
 ```
 
 - 节点注册表在 `~/.xmagic/config.json`；目标节点的选择优先级：
@@ -166,9 +166,10 @@ python3 xmagic.py update           # 从仓库把本 CLI 更新到最新版
 - 会话默认存 `~/.xmagic/sessions/<节点名>.json`（0600）；`login --session-file
   路径` 可存到指定位置，其它命令同名参数（或 `XMAGIC_SESSION_FILE`）选用哪份
   会话——一份会话一个文件，脚本里按节点切换，适合批量管理。
-- SSH 密钥不用再找外部工具：控制台、本 CLI 与 users.py 都能当场生成
-  ed25519 密钥对。给用户生成时私钥只留在客户端（控制台是一次性下载，
-  节点只存公钥）；给 SSH 上级生成时私钥按托管密钥存于节点。控制台的
+- SSH 密钥不用再找外部工具，且用户的私钥只在客户端生成：网页里就在
+  页面本身生成、远程 CLI 在本机生成——私钥从不出现在服务器上，节点
+  只收到公钥（users.py 根本不能生成用户密钥）；节点侧生成只用于节点
+  自有的密钥：给 SSH 上级生成时私钥按托管密钥存于节点。控制台的
   用户列表会给登记了公钥的用户直接显示现成的
   `ssh -D 1080 -N -i xmagic-<用户名>.key -p <端口> proxy@<节点>` 命令
   （sshd 登录名恒为 `proxy`，是哪位网关用户由钥决定）——普通 SSH 客户端

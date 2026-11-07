@@ -181,31 +181,60 @@ def main():
     check("settings disable direct_allow_private via CLI",
           rc == 0 and "False" in out, out)
 
-    # ---- ssh key generation (engine) + upstream --key-generate
+    # ---- user keys are minted on the client side ONLY: the node CLI
+    # refuses to generate them (a private key born on the server is a
+    # private key leaked to the server)
     keys_dir = os.path.join(workdir, "keys")
-    rc, out, err = cli("--json", "keygen", "kg1", "--out-dir", keys_dir)
-    kg = json.loads(out) if rc == 0 else {}
-    priv = os.path.join(keys_dir, "kg1")
-    check("keygen writes a 0600 private key + matching .pub",
-          rc == 0 and os.path.exists(priv)
-          and (os.stat(priv).st_mode & 0o777) == 0o600
-          and open(priv + ".pub").read().strip() == kg.get("public_key"),
-          err + out)
-    if shutil.which("ssh-keygen"):
-        derived = subprocess.run(["ssh-keygen", "-y", "-f", priv],
-                                 capture_output=True, text=True).stdout.split()[:2]
-        check("generated keypair matches ssh-keygen -y",
-              derived == (kg.get("public_key") or "").split()[:2])
-    rc, out, _ = cli("keygen", "kg1", "--out-dir", keys_dir)
-    check("keygen refuses to overwrite an existing key", rc != 0)
+    os.makedirs(keys_dir)
+    rc, _, _ = cli("keygen", "kg1", "--out-dir", keys_dir)
+    check("keygen is gone from the node CLI", rc != 0)
+    rc, _, _ = cli("add", "kdave", "--ssh-key-generate", "kdave.key")
+    check("add --ssh-key-generate is gone from the node CLI", rc != 0)
+    # client-minted fixture pairs stand in for keys a user generated in
+    # the browser page or the remote CLI; only .pub files reach the node
+    FIXTURE_A_PRIV = """-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACB+WOt/zaK6VjjfYQ1yEU/R7W+jm+UqFvJsoVszj6tndgAAAJil3EqxpdxK
+sQAAAAtzc2gtZWQyNTUxOQAAACB+WOt/zaK6VjjfYQ1yEU/R7W+jm+UqFvJsoVszj6tndg
+AAAEDjLMZS4jbzx+TTyEyzQAL9b+YD7P8bN8fq62vLV1/EGX5Y63/NorpWON9hDXIRT9Ht
+b6Ob5SoW8myhWzOPq2d2AAAAEHhtYWdpYyBmaXh0dXJlLWEBAgMEBQ==
+-----END OPENSSH PRIVATE KEY-----
+"""
+    FIXTURE_A_PUB = ("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIH5Y63/NorpWON9"
+                     "hDXIRT9Htb6Ob5SoW8myhWzOPq2d2 xmagic fixture-a")
+    FIXTURE_B_PRIV = """-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACCuEwuCWalst9A82xP3NxULSiR3XuLQLHZV2RhujBe04gAAAJjvASaE7wEm
+hAAAAAtzc2gtZWQyNTUxOQAAACCuEwuCWalst9A82xP3NxULSiR3XuLQLHZV2RhujBe04g
+AAAEAIznhF1QSUbR3o2wsbMMIOgB/+XRAVJTQRVGFa9j1MN64TC4JZqWy30DzbE/c3FQtK
+JHde4tAsdlXZGG6MF7TiAAAAEHhtYWdpYyBmaXh0dXJlLWIBAgMEBQ==
+-----END OPENSSH PRIVATE KEY-----
+"""
+    FIXTURE_B_PUB = ("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK4TC4JZqWy30DzbE"
+                     "/c3FQtKJHde4tAsdlXZGG6MF7Ti xmagic fixture-b")
+    kg1_priv = os.path.join(keys_dir, "kg1")
+    with open(kg1_priv, "w") as f:
+        f.write(FIXTURE_A_PRIV)
+    os.chmod(kg1_priv, 0o600)
+    with open(kg1_priv + ".pub", "w") as f:
+        f.write(FIXTURE_A_PUB + "\n")
     dave_key = os.path.join(workdir, "kdave.key")
+    with open(dave_key, "w") as f:
+        f.write(FIXTURE_B_PRIV)
+    os.chmod(dave_key, 0o600)
+    dave_pub = os.path.join(workdir, "kdave.pub")
+    with open(dave_pub, "w") as f:
+        f.write(FIXTURE_B_PUB + "\n")
+    if shutil.which("ssh-keygen"):
+        derived = subprocess.run(["ssh-keygen", "-y", "-f", dave_key],
+                                 capture_output=True, text=True).stdout.split()[:2]
+        check("client-minted fixture pair is real (ssh-keygen -y agrees)",
+              derived == FIXTURE_B_PUB.split()[:2])
     rc, out, err = cli("--json", "add", "kdave", "--group", "team",
-                       "--ssh-key-generate", dave_key)
+                       "--ssh-key-file", dave_pub)
     dave = json.loads(out) if rc == 0 else {}
-    check("add --ssh-key-generate registers pubkey, private stays local",
-          rc == 0 and dave.get("ssh_key") is True
-          and bool(dave.get("ssh_fingerprint"))
-          and os.path.exists(dave_key), err + out)
+    check("add --ssh-key-file registers the client-minted pubkey",
+          rc == 0 and dave.get("ssh_key") is True, err + out)
     rc, out, err = cli("--json", "upstream-add", "upssh2", "--proto", "ssh",
                        "--addr", "10.1.1.1", "--port", "22",
                        "--username", "tun", "--key-generate")
@@ -260,7 +289,7 @@ def main():
     if shutil.which("ssh-keygen"):
         derived = subprocess.run(["ssh-keygen", "-y", "-f", dave_key],
                                  capture_output=True, text=True).stdout
-        check("kdave's generated pubkey is the one in authorized_keys",
+        check("kdave's registered pubkey is the one in authorized_keys",
               derived.split()[1] in ktext)
     rc, out, _ = cli("settings", "--interconnect-off-groups", "team")
     check("settings opt team out of interconnect",

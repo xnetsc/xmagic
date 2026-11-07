@@ -694,10 +694,11 @@ def api_list_upstreams():
 
 
 def api_generate_keypair(body):
-    """Mint a fresh ed25519 keypair. The private half is returned ONCE
-    in this response and never stored on the node - a user's private
-    key belongs on the user's machine. (Upstream keys are the designed
-    exception: they live on the node via key_content/key_generate.)"""
+    """Mint a fresh ed25519 keypair FOR NODE-OWNED KEYS ONLY (the SSH
+    upstream button): those private keys live on the node by design.
+    USER keypairs are never minted here - the console generates them
+    in the page (genUserKeypair) and the remote CLI generates them
+    locally, so a user's private key never exists on the server."""
     comment = str((body or {}).get("comment") or "xmagic")[:64]
     pem, pub, fp = users_mod.generate_ed25519_keypair(comment)
     return {"private_key": pem, "public_key": pub, "fingerprint": fp}
@@ -1827,13 +1828,108 @@ function downloadText(name, text) {
   a.download = name; a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 5000);
 }
+// In-browser ed25519 keypair generation for USER keys: the private half
+// is minted here, in the page, and never reaches the server (only the
+// public half is submitted). Mirrors the pure-Python generator in
+// users.py (same curve math, same OpenSSH wire formats).
+const ED_Q = 2n ** 255n - 19n;
+const _edMod = a => { const r = a % ED_Q; return r >= 0n ? r : r + ED_Q; };
+const _edPow = (a, e) => { let r = 1n; a = _edMod(a);
+  while (e > 0n) { if (e & 1n) r = r * a % ED_Q; a = a * a % ED_Q; e >>= 1n; }
+  return r; };
+const ED_D = _edMod(-121665n * _edPow(121666n, ED_Q - 2n));
+const ED_I = _edPow(2n, (ED_Q - 1n) / 4n);
+function _edXRecover(y) {
+  const xx = _edMod((y * y - 1n) * _edPow(_edMod(ED_D * y * y + 1n), ED_Q - 2n));
+  let x = _edPow(xx, (ED_Q + 3n) / 8n);
+  if (_edMod(x * x - xx) !== 0n) x = x * ED_I % ED_Q;
+  if (x % 2n !== 0n) x = ED_Q - x;
+  return x;
+}
+const ED_BY = 4n * _edPow(5n, ED_Q - 2n) % ED_Q;
+const ED_BX = _edXRecover(ED_BY);
+const ED_B = [ED_BX, ED_BY, 1n, ED_BX * ED_BY % ED_Q];
+function _edAdd(P, Q) {
+  const A = _edMod((P[1] - P[0]) * (Q[1] - Q[0]));
+  const B = _edMod((P[1] + P[0]) * (Q[1] + Q[0]));
+  const C = 2n * ED_D * P[3] % ED_Q * Q[3] % ED_Q;
+  const D = 2n * P[2] % ED_Q * Q[2] % ED_Q;
+  const E = B - A, F = D - C, G = D + C, H = B + A;
+  return [_edMod(E * F), _edMod(G * H), _edMod(F * G), _edMod(E * H)];
+}
+function _edDouble(P) {
+  const A = P[0] * P[0] % ED_Q, B = P[1] * P[1] % ED_Q;
+  const C = 2n * P[2] * P[2] % ED_Q, D = _edMod(-A);
+  const E = _edMod((P[0] + P[1]) * (P[0] + P[1]) - A - B);
+  const G = D + B, F = G - C, H = D - B;
+  return [_edMod(E * F), _edMod(G * H), _edMod(F * G), _edMod(E * H)];
+}
+function _edScalarMult(P, e) {
+  let R = [0n, 1n, 1n, 0n];
+  while (e > 0n) { if (e & 1n) R = _edAdd(R, P); P = _edDouble(P); e >>= 1n; }
+  return R;
+}
+function _u8cat(...parts) {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let off = 0;
+  for (const p of parts) { out.set(p, off); off += p.length; }
+  return out;
+}
+function _sshStr(bytes) {
+  const len = new Uint8Array([(bytes.length >>> 24) & 255,
+    (bytes.length >>> 16) & 255, (bytes.length >>> 8) & 255,
+    bytes.length & 255]);
+  return _u8cat(len, bytes);
+}
+function _b64(bytes) {
+  let s = "";
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s);
+}
+async function genUserKeypair(comment) {
+  const seed = crypto.getRandomValues(new Uint8Array(32));
+  const h = new Uint8Array(
+    await crypto.subtle.digest("SHA-512", seed)).slice(0, 32);
+  h[0] &= 248; h[31] &= 63; h[31] |= 64;
+  let a = 0n;
+  for (let i = 31; i >= 0; i--) a = (a << 8n) | BigInt(h[i]);
+  const P = _edScalarMult(ED_B, a);
+  const zi = _edPow(P[2], ED_Q - 2n);
+  const x = P[0] * zi % ED_Q, y = P[1] * zi % ED_Q;
+  let pubInt = y | ((x & 1n) << 255n);
+  const pub = new Uint8Array(32);
+  for (let i = 0; i < 32; i++) { pub[i] = Number(pubInt & 255n); pubInt >>= 8n; }
+  const enc = new TextEncoder();
+  const blob = _u8cat(_sshStr(enc.encode("ssh-ed25519")), _sshStr(pub));
+  const chk = crypto.getRandomValues(new Uint8Array(4));
+  let section = _u8cat(chk, chk, _sshStr(enc.encode("ssh-ed25519")),
+    _sshStr(pub), _sshStr(_u8cat(seed, pub)),
+    _sshStr(enc.encode(comment || "")));
+  const pad = 8 - (section.length % 8);
+  const padding = new Uint8Array(pad);
+  for (let i = 0; i < pad; i++) padding[i] = i + 1;
+  section = _u8cat(section, padding);
+  const raw = _u8cat(enc.encode("openssh-key-v1\0"),
+    _sshStr(enc.encode("none")), _sshStr(enc.encode("none")),
+    _sshStr(new Uint8Array(0)), new Uint8Array([0, 0, 0, 1]),
+    _sshStr(blob), _sshStr(section));
+  const b64 = _b64(raw);
+  const pem = "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+    + (b64.match(/.{1,70}/g) || []).join("\n")
+    + "\n-----END OPENSSH PRIVATE KEY-----\n";
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", blob));
+  return {private_key: pem,
+          public_key: "ssh-ed25519 " + _b64(blob)
+            + (comment ? " " + comment : ""),
+          fingerprint: "SHA256:" + _b64(digest).replace(/=+$/, "")};
+}
 $("btn-gen-userkey").onclick = async () => {
   try { const form = $("form-user");
     const uname = form.querySelector("[name=username]").value.trim() || "user";
-    const r = await api("/api/keys/generate", {comment: "xmagic " + uname});
+    const r = await genUserKeypair("xmagic " + uname);
     form.querySelector('[name="ssh_pubkey"]').value = r.public_key;
     downloadText("xmagic-" + uname + ".key", r.private_key);
-    msg("已生成密钥对：公钥已填入，私钥已下载（只出现这一次，节点不保存）", true);
+    msg("已生成密钥对：在本页内生成，私钥从未经过服务器、已下载；公钥已填入", true);
   } catch (err) { msg(String(err)); } };
 $("btn-gen-upkey").onclick = async () => {
   try { const form = $("form-upstream");

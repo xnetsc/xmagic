@@ -209,19 +209,20 @@ python3 xmagic.py update           # update this CLI to the latest version from 
   other commands select it with the same flag (or
   `XMAGIC_SESSION_FILE`) - one session per file, switch per node in
   scripts, suited to managing many nodes.
-- SSH keys never need external tools: the console, this CLI and
-  users.py all generate ed25519 keypairs in place. For a user, the
-  private key stays on the client (the console offers it as a one-time
-  download; the node stores only the public key); for an SSH upstream
+- SSH keys never need external tools, and a USER's private key is
+  only ever generated on the client side: in the web page itself or
+  in this CLI - never on the server, which only receives the public
+  half (users.py cannot generate user keys at all). Node-side
+  generation exists only for node-owned keys: for an SSH upstream
   the generated key is stored on the node as its managed key. On the
   console, a user with a registered key shows the ready-made
   `ssh -D 1080 -N -i xmagic-<user>.key -p <port> proxy@<node>` command
   (the sshd login name is always `proxy`; the key says which gateway
   user you are) - a plain SSH
   client is a working proxy client.
-- `xmagic update` self-updates from the repository: the download is
-  version-checked and self-tested before it replaces the running
-  file, and the previous version is kept as `xmagic.py.bak`
+- `xmagic update` syncs with the selected node's bundled copy: the
+  download is hash-compared and self-tested before it replaces the
+  running file, and the previous version is kept as `xmagic.py.bak`
   (`--check` only reports, `--from URL` overrides the source).
 - Exit codes: 0 success, 1 API error, 2 config/usage error,
   3 not signed in or session expired - scripts can re-run `login`

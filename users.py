@@ -907,30 +907,9 @@ def cmd_init(_):
           f"({cfg['type']}: {mask_target(cfg['type'], cfg['target'])})")
 
 
-def cmd_keygen(args):
-    os.makedirs(args.out_dir, exist_ok=True)
-    priv = os.path.join(args.out_dir, args.name)
-    if os.path.exists(priv) or os.path.exists(priv + ".pub"):
-        sys.exit(f"refusing to overwrite an existing key: {priv}")
-    pub, fp = write_generated_key(priv, args.comment or args.name)
-    with open(priv + ".pub", "w") as f:
-        f.write(pub + "\n")
-    if JSON_OUT:
-        print(json.dumps({"private_key": priv, "public_key_file": priv + ".pub",
-                          "public_key": pub, "fingerprint": fp}, indent=2))
-        return
-    print(f"private key: {priv} (0600 - keep it secret)")
-    print(f"public key:  {priv}.pub")
-    print(f"fingerprint: {fp}")
-    print(pub)
-
-
 def cmd_add(args):
     pubkey = None
-    gen_fp = None
-    if getattr(args, "ssh_key_generate", None):
-        pubkey, gen_fp = write_generated_key(args.ssh_key_generate, args.user)
-    elif args.ssh_key_file:
+    if args.ssh_key_file:
         with open(args.ssh_key_file) as f:
             pubkey = f.read().strip()
     user_uuid = str(uuid.uuid4())
@@ -951,19 +930,13 @@ def cmd_add(args):
         print(json.dumps({"username": args.user, "vless_uuid": user_uuid,
                           "password": trojan_pw, "ss_method": method,
                           "ss_password": ss_pw, "group": args.group,
-                          "ssh_key": bool(pubkey),
-                          "ssh_private_key_file": (args.ssh_key_generate
-                                                   if gen_fp else None),
-                          "ssh_fingerprint": gen_fp}, indent=2))
+                          "ssh_key": bool(pubkey)}, indent=2))
         return
     print(f"user:            {args.user}")
     print(f"vless uuid:      {user_uuid}")
     print(f"password (trojan/http/socks): {trojan_pw}")
     print(f"ss:              {method} / {ss_pw}")
     print(f"ssh key:         {'registered' if pubkey else '(none)'}")
-    if gen_fp:
-        print(f"ssh private key: {args.ssh_key_generate} ({gen_fp})"
-              " - yours to keep; the node stores only the public key")
     print("shown once - store it now, then run: users.py render")
 
 
@@ -983,24 +956,17 @@ def cmd_passwd(args):
 
 
 def cmd_setkey(args):
-    gen_fp = None
     if getattr(args, "clear", False):
         pubkey = None
-    elif getattr(args, "ssh_key_generate", None):
-        pubkey, gen_fp = write_generated_key(args.ssh_key_generate, args.user)
     elif args.ssh_key_file:
         with open(args.ssh_key_file) as f:
             pubkey = f.read().strip()
     else:
-        sys.exit("setkey needs --ssh-key-file FILE, --ssh-key-generate PATH"
-                 " or --clear")
+        sys.exit("setkey needs --ssh-key-file FILE or --clear")
     with db() as conn:
         get_user(conn, args.user)
         conn.execute("UPDATE users SET ssh_pubkey = ? WHERE username = ?", (pubkey, args.user))
     print(f"ssh key {'cleared for' if pubkey is None else 'updated for'} {args.user}")
-    if gen_fp:
-        print(f"ssh private key: {args.ssh_key_generate} ({gen_fp})"
-              " - yours to keep; the node stores only the public key")
 
 
 def cmd_rotate_uuid(args):
@@ -1327,12 +1293,13 @@ def cmd_upstream_edit(args):
 
 
 # ------------------------------------------------------- ssh key generation
-# Pure-stdlib ed25519 keypair generation in OpenSSH formats, so every
-# management surface can mint keys in place: no ssh-keygen dependency
-# and no external tool for operators. Generation only - the private
-# half is handed to the caller and never kept by this module (upstream
-# keys are the exception: they live on the node by design, stored via
-# write_upstream_key).
+# Pure-stdlib ed25519 keypair generation in OpenSSH formats. Used ONLY
+# for node-owned keys (SSH upstream keys, which live on the node by
+# design, stored via write_upstream_key). USER private keys are never
+# minted on the node: they are generated on the client side (the
+# browser page itself, or the remote CLI on the user's machine), so a
+# user's private key never exists on the server - the node only ever
+# receives the public half.
 
 _ED_Q = 2 ** 255 - 19
 _ED_D = (-121665 * pow(121666, _ED_Q - 2, _ED_Q)) % _ED_Q
@@ -1432,16 +1399,6 @@ def pubkey_fingerprint(line):
         return None
     return "SHA256:" + base64.b64encode(
         hashlib.sha256(blob).digest()).decode().rstrip("=")
-
-
-def write_generated_key(priv_path, comment):
-    """Generate a keypair and write the private half to priv_path
-    (exclusive create, 0600). -> (public_line, fingerprint)."""
-    pem, pub, fp = generate_ed25519_keypair(comment)
-    fd = os.open(priv_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write(pem)
-    return pub, fp
 
 
 # ---------------------------------------------------------------- routes
@@ -2727,25 +2684,14 @@ def main():
     a.set_defaults(fn=cmd_sessions_revoke)
     sub.add_parser("sessions-revoke-all").set_defaults(fn=cmd_sessions_revoke_all)
     sub.add_parser("admin-reset").set_defaults(fn=cmd_admin_reset)
-    a = sub.add_parser("keygen"); a.add_argument("name")
-    a.add_argument("--out-dir", default=".",
-                   help="directory for NAME and NAME.pub (default: .)")
-    a.add_argument("--comment", help="key comment (default: the name)")
-    a.set_defaults(fn=cmd_keygen)
     a = sub.add_parser("add"); a.add_argument("user")
     a.add_argument("--ssh-key-file")
-    a.add_argument("--ssh-key-generate", metavar="PATH",
-                   help="generate a fresh ed25519 keypair: the public key is"
-                        " registered, the private key written to PATH (0600)")
     a.add_argument("--note")
     a.add_argument("--group", default="default", help="upstream group for this user")
     a.set_defaults(fn=cmd_add)
     a = sub.add_parser("passwd"); a.add_argument("user"); a.set_defaults(fn=cmd_passwd)
     a = sub.add_parser("setkey"); a.add_argument("user")
     a.add_argument("--ssh-key-file")
-    a.add_argument("--ssh-key-generate", metavar="PATH",
-                   help="generate a fresh ed25519 keypair: the public key is"
-                        " registered, the private key written to PATH (0600)")
     a.add_argument("--clear", action="store_true",
                    help="remove the user's ssh key instead of setting one")
     a.set_defaults(fn=cmd_setkey)
