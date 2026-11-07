@@ -195,8 +195,8 @@ python3 users.py route-add --kind full --pattern example.com --to intl --user ca
 | `ghcr.io/xnetsc/xmagic-sshd` | SSH 入口（公钥-only） |
 | `ghcr.io/xnetsc/xmagic-admin` | 管理后台 + users.py 引擎 |
 
-- `build` 工作流：推送到 main 先跑三套本地实测（后台协议、双界面一致性、
-  远程 CLI 全流程），全过才构建推送。
+- `build` 工作流：推送到 main 先跑 `tests/` 下的测试套件（后台协议、
+  双界面一致性、远程 CLI、分发器分流），全过才构建推送。
 - `upstream-check` 工作流：每天查一次 XTLS/Xray-core 的最新 Release，
   有新版就自动改 `versions.env` 的钉版、提交，并触发 `build` 重走构建——
   部署侧的 watchtower 随后自动拉新镜像，整条链无人值守。
@@ -225,49 +225,11 @@ docker compose up -d                 # admin 首次启动会先渲染一份空�
 自更新：watchtower 每天检查，只自动更新带 label 的 xray 与 dispatcher 镜像；
 sshd / admin 随 `docker compose pull` 手动更新（管理面不自己重启自己）。
 
-## 本地实测记录（2026-11-07，全部在本地真实跑过）
-
-网关本体（沙箱内多节点实测）：
-
-- 单端口全协议（经分发器、经上级出网取 GitHub 200）：SOCKS5+密码 ✓（错密码拒）、
-  HTTP CONNECT+Basic ✓（错密码拒）、VLESS-WS ✓、Trojan-WS ✓、裸 SS ✓、
-  裸 VLESS-TCP ✓（错 uuid 拒）；SSH 经分发器端口 `ssh -D` ✓、直连 sshd ✓（错公钥拒）。
-- WS 双路径别名同时生效 ✓；级联轮询 6/6 均分、随机 10/10、坏池负例全断 ✓；
-  按目标选上级六个用例（域名/IP/block/带用户/禁用回落）全过 ✓；
-  SSH 上级按渲染出的隧道命令全程打通 ✓；
-  Xray 的 http 出站认证经自建 authproxy 逐字节验证（含密码带 `: @ / %`）✓；
-  旧格式数据库迁移 ✓。
-
-管理面（软件模拟认证器 + 真实 HTTP 服务/CLI 进程）：
-
-- Passkey 注册/登录全流程 ✓；二次注册被拒 ✓；断言重放被拒 ✓；错密钥被拒 ✓；
-  `admin-reset` 后可重新注册 ✓。
-- 会话：默认 1 周、改成 24 小时后新签发会话按新值到期 ✓；会话列表带当前标记 ✓；
-  按 id 撤销后该令牌立即失效 ✓；撤销其它会话只留当前 ✓；一次性交接代码单用 ✓；
-  非回环回调地址被拒 ✓。
-- 双界面一致性：CLI 建的用户在 Web 可见、反之亦然 ✓；`--json` 输出可解析 ✓。
-- 远程 CLI：双节点注册表、参数覆盖配置、按节点存会话、`--session-file` 选会话、
-  未登录退出码 3 ✓。
-- 管理完整性：上级编辑（改端口/密码，空密码被拒）✓；路由编辑 ✓；换 UUID /
-  改 SS 方法 / 备注三套界面 ✓；渲染级设置（WS 路径改后渲染出的配置立即带新
-  路径、清空回退 .env）✓；登录状态下更换管理员 Passkey（旧会话全灭、旧
-  Passkey 失效、新 Passkey 可登录）✓。三套测试共 110 项断言全过。
-- 单端口分流（含 admin）：桩后端 + 真实分发器实测 8 个用例——SSH 横幅、
-  SOCKS 问候、CONNECT、绝对形式 GET、WS 升级、浏览器源形式 GET、后台
-  API POST、二进制协议字节，全部落到正确后端 ✓。
-
-两个实测中定位到的坑（都不是产品缺陷）：沙箱的上游代理密码会定期轮换，长驻进程
-写死旧密码会吃 407（生产环境静态密码不受影响）；多个节点同机测试时回环后端端口
-必须错开，否则内核 SO_REUSEPORT 会把连接分流到别的节点后端。
-
-compose 文件本身只做过静态校验；Docker 实际拉起等有 VPS 时验（构建 sshd 镜像、
-host 网络、卷挂载路径都是标准用法，风险低）。
-
 ## 注意事项
 
 - Xray 26.x 已把 WebSocket 传输、Trojan、Shadowsocks 标注为 deprecated（"might be
   removed"）：当前版本可用，将来大版本若移除需迁移（VLESS 侧可转 XHTTP/Reality）。
-- **Xray 26 的明文策略（已实测）**：VLESS / Trojan 本身没有传输加密，Xray 拒绝把
+- **Xray 26 的明文策略**：VLESS / Trojan 本身没有传输加密，Xray 拒绝把
   它们以明文拨向任何公网地址（IP 或域名都拒，配置构建期直接报错）；拨内网/回环
   地址、或经 SSH 隧道/组网时不受此限。公网节点互联请用 ss 或 ssh 上级，或给
   vless / vless-ws / trojan-ws 上级加 `--tls`（SNI 取上级地址，要求上级前面有
