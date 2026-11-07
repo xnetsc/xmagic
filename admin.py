@@ -1853,13 +1853,13 @@ const b64uToBytes = s => new Uint8Array(b64uToBuf(s));
 const bytesToB64u = b => bufToB64u(b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength));
 let __sess = null;  // {id, master: Uint8Array, expires_at}
 function sessSave() {
-  if (__sess) sessionStorage.setItem("xmagic_session", JSON.stringify(
+  if (__sess) localStorage.setItem("xmagic_session", JSON.stringify(
     {id: __sess.id, key: bytesToB64u(__sess.master), expires_at: __sess.expires_at}));
-  else sessionStorage.removeItem("xmagic_session");
+  else localStorage.removeItem("xmagic_session");
 }
 function sessLoad() {
   __sess = null;
-  try { const s = JSON.parse(sessionStorage.getItem("xmagic_session") || "null");
+  try { const s = JSON.parse(localStorage.getItem("xmagic_session") || "null");
     if (s && s.expires_at > Math.floor(Date.now() / 1000))
       __sess = {id: s.id, master: b64uToBytes(s.key), expires_at: s.expires_at};
   } catch (e) { __sess = null; }
@@ -2516,13 +2516,13 @@ const b64uToBytes = s => new Uint8Array(b64uToBuf(s));
 const bytesToB64u = b => bufToB64u(b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength));
 let __sess = null;  // {id, master: Uint8Array, expires_at}
 function sessSave() {
-  if (__sess) sessionStorage.setItem("xmagic_session", JSON.stringify(
+  if (__sess) localStorage.setItem("xmagic_session", JSON.stringify(
     {id: __sess.id, key: bytesToB64u(__sess.master), expires_at: __sess.expires_at}));
-  else sessionStorage.removeItem("xmagic_session");
+  else localStorage.removeItem("xmagic_session");
 }
 function sessLoad() {
   __sess = null;
-  try { const s = JSON.parse(sessionStorage.getItem("xmagic_session") || "null");
+  try { const s = JSON.parse(localStorage.getItem("xmagic_session") || "null");
     if (s && s.expires_at > Math.floor(Date.now() / 1000))
       __sess = {id: s.id, master: b64uToBytes(s.key), expires_at: s.expires_at};
   } catch (e) { __sess = null; }
@@ -2725,13 +2725,13 @@ const b64uToBytes = s => new Uint8Array(b64uToBuf(s));
 const bytesToB64u = b => bufToB64u(b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength));
 let __sess = null;  // {id, master: Uint8Array, expires_at}
 function sessSave() {
-  if (__sess) sessionStorage.setItem("xmagic_session", JSON.stringify(
+  if (__sess) localStorage.setItem("xmagic_session", JSON.stringify(
     {id: __sess.id, key: bytesToB64u(__sess.master), expires_at: __sess.expires_at}));
-  else sessionStorage.removeItem("xmagic_session");
+  else localStorage.removeItem("xmagic_session");
 }
 function sessLoad() {
   __sess = null;
-  try { const s = JSON.parse(sessionStorage.getItem("xmagic_session") || "null");
+  try { const s = JSON.parse(localStorage.getItem("xmagic_session") || "null");
     if (s && s.expires_at > Math.floor(Date.now() / 1000))
       __sess = {id: s.id, master: b64uToBytes(s.key), expires_at: s.expires_at};
   } catch (e) { __sess = null; }

@@ -745,7 +745,7 @@ def main():
               and "crypto.subtle" in page
               and "checkChallengeBinding" in page
               and "sealEnvelope" in page
-              and "sessionStorage" in page
+              and "localStorage" in page
               and 'id="up-add-btns"' in page
               and 'data-up-tab="list"' in page
               and 'id="up-form-tab"' in page
