@@ -262,11 +262,206 @@ def main():
         check("--url resolves to node A's stored session",
               [u["username"] for u in json.loads(out)["users"]] == ["alice"])
 
+        # ---- remaining remote-CLI surface: node registry management,
+        # status/apply, the full user/upstream/route action sets and the
+        # remaining settings keys
+        rc, out, err = cli("node", "list")
+        check("node list shows both nodes",
+              rc == 0 and "a" in out and "b" in out, err + out)
+        rc, out, err = cli("node", "use", "b")
+        check("node use b", rc == 0, err + out)
+        rc, out, err = cli("node", "use", "a")
+        check("node use a (restore)", rc == 0, err + out)
+
+        rc, out, err = cli("--json", "status")
+        check("status via remote CLI",
+              rc == 0 and json.loads(out)["enabled_users"] == 1, err + out)
+        rc, out, err = cli("apply")
+        check("apply via remote CLI", rc == 0, err + out)
+
+        temp_key = ("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITempTestKey"
+                    "0123456789abcdef0123456789abcdef01234567 temp@test")
+        rc, out, err = cli("users", "add", "temp", "--group", "intl",
+                           "--note", "tmpnote", "--ssh-pubkey", temp_key)
+        temp_pw = None
+        for line in out.splitlines():
+            if "password (trojan/http/socks):" in line:
+                temp_pw = line.split(":", 1)[1].strip()
+        check("users add with group/note/key via remote CLI",
+              rc == 0 and bool(temp_pw), err + out)
+        rc, out, _ = cli("--json", "users", "list")
+        temp = next(u for u in json.loads(out)["users"]
+                    if u["username"] == "temp")
+        check("temp user's fields landed",
+              temp["group"] == "intl" and temp["note"] == "tmpnote"
+              and temp["ssh_key"] is True, out)
+        rc, out, err = cli("users", "passwd", "temp")
+        new_pw = None
+        for line in out.splitlines():
+            if "password (trojan/http/socks):" in line:
+                new_pw = line.split(":", 1)[1].strip()
+        check("users passwd via remote CLI",
+              rc == 0 and bool(new_pw) and new_pw != temp_pw, err + out)
+        rc, out, err = cli("users", "setkey", "temp")
+        rc2, out, _ = cli("--json", "users", "list")
+        temp = next(u for u in json.loads(out)["users"]
+                    if u["username"] == "temp")
+        check("users setkey with no key clears it",
+              rc == 0 and temp["ssh_key"] is False, err + out)
+        rc, out, err = cli("users", "setgroup", "temp", "backup")
+        rc2, out, _ = cli("--json", "users", "list")
+        temp = next(u for u in json.loads(out)["users"]
+                    if u["username"] == "temp")
+        check("users setgroup via remote CLI",
+              rc == 0 and temp["group"] == "backup", err + out)
+        rc, out, err = cli("users", "setmethod", "temp", "aes-128-gcm")
+        rc2, out, _ = cli("--json", "users", "list")
+        temp = next(u for u in json.loads(out)["users"]
+                    if u["username"] == "temp")
+        check("users setmethod via remote CLI",
+              rc == 0 and temp["ss_method"] == "aes-128-gcm", err + out)
+        rc, out, err = cli("users", "setnote", "temp", "hello note")
+        rc2, out, _ = cli("--json", "users", "list")
+        temp = next(u for u in json.loads(out)["users"]
+                    if u["username"] == "temp")
+        check("users setnote via remote CLI",
+              rc == 0 and temp["note"] == "hello note", err + out)
+        rc, out, err = cli("users", "disable", "temp")
+        rc2, out, _ = cli("--json", "users", "list")
+        temp = next(u for u in json.loads(out)["users"]
+                    if u["username"] == "temp")
+        check("users disable via remote CLI",
+              rc == 0 and temp["enabled"] is False, err + out)
+        rc, out, err = cli("users", "enable", "temp")
+        rc2, out, _ = cli("--json", "users", "list")
+        temp = next(u for u in json.loads(out)["users"]
+                    if u["username"] == "temp")
+        check("users enable via remote CLI",
+              rc == 0 and temp["enabled"] is True, err + out)
+        rc, out, err = cli("users", "remove", "temp")
+        rc2, out, _ = cli("--json", "users", "list")
+        check("users remove via remote CLI",
+              rc == 0 and [u["username"] for u in json.loads(out)["users"]]
+              == ["alice"], err + out)
+
+        rc, out, _ = cli("--json", "upstreams", "list")
+        check("upstreams list via remote CLI",
+              [u["name"] for u in json.loads(out)["upstreams"]] == ["up1"], out)
+        rc, out, err = cli("upstreams", "disable", "up1")
+        rc2, out, _ = cli("--json", "upstreams", "list")
+        check("upstreams disable via remote CLI",
+              rc == 0 and json.loads(out)["upstreams"][0]["enabled"] is False,
+              err + out)
+        rc, out, err = cli("upstreams", "enable", "up1")
+        rc2, out, _ = cli("--json", "upstreams", "list")
+        check("upstreams enable via remote CLI",
+              rc == 0 and json.loads(out)["upstreams"][0]["enabled"] is True,
+              err + out)
+        rc, out, err = cli("upstreams", "add", "tmpup", "--proto", "socks",
+                           "--addr", "10.0.0.1", "--port", "1080")
+        check("upstreams add tmpup", rc == 0, err + out)
+        rc, out, err = cli("upstreams", "remove", "tmpup")
+        rc2, out, _ = cli("--json", "upstreams", "list")
+        check("upstreams remove via remote CLI",
+              rc == 0 and [u["name"] for u in json.loads(out)["upstreams"]]
+              == ["up1"], err + out)
+
+        rc, out, _ = cli("--json", "routes", "list")
+        check("routes list via remote CLI",
+              len(json.loads(out)["routes"]) == 1, out)
+        rc, out, err = cli("routes", "disable", "1")
+        rc2, out, _ = cli("--json", "routes", "list")
+        check("routes disable via remote CLI",
+              rc == 0 and json.loads(out)["routes"][0]["enabled"] is False,
+              err + out)
+        rc, out, err = cli("routes", "enable", "1")
+        rc2, out, _ = cli("--json", "routes", "list")
+        check("routes enable via remote CLI",
+              rc == 0 and json.loads(out)["routes"][0]["enabled"] is True,
+              err + out)
+        rc, out, err = cli("routes", "add", "--kind", "keyword",
+                           "--pattern", "ads", "--to", "block")
+        check("routes add temp route", rc == 0, err + out)
+        rc, out, _ = cli("--json", "routes", "list")
+        ads = next(r for r in json.loads(out)["routes"]
+                   if r["pattern"] == "ads")
+        rc, out, err = cli("routes", "remove", str(ads["id"]))
+        rc2, out, _ = cli("--json", "routes", "list")
+        check("routes remove via remote CLI",
+              rc == 0 and len(json.loads(out)["routes"]) == 1, err + out)
+
+        rc, out, err = cli("settings", "set", "--vless-ws-paths", "/r1,/r2",
+                           "--trojan-ws-paths", "/tj",
+                           "--ss-method", "aes-128-gcm",
+                           "--direct-allow-private")
+        check("settings set remaining keys via remote CLI", rc == 0, err + out)
+        rc, out, _ = cli("--json", "settings", "show")
+        st = json.loads(out)
+        check("settings remaining keys read back",
+              st["vless_ws_paths"] == ["/r1", "/r2"]
+              and st["trojan_ws_paths"] == ["/tj"]
+              and st["ss_method"] == "aes-128-gcm"
+              and st["direct_allow_private"] is True, out)
+        rc, out, err = cli("settings", "set", "--no-direct-allow-private")
+        rc2, out, _ = cli("--json", "settings", "show")
+        check("settings --no-direct-allow-private",
+              rc == 0 and json.loads(out)["direct_allow_private"] is False,
+              err + out)
+
+        rc, out, err = cli("node", "remove", "b")
+        check("node remove b", rc == 0, err + out)
+        rc, _, _ = cli("--node", "b", "users", "list")
+        check("removed node no longer resolves", rc != 0, f"rc={rc}")
+
         rc, out, err = cli("logout")
         check("logout removes A's session",
               rc == 0 and not os.path.exists(session_a), err + out)
         rc, _, _ = cli("users", "list")
         check("A requires login after logout", rc == 3, f"rc={rc}")
+
+        # ---- remote db management: the whole `db` group against A.
+        # Runs last: the final bare switch leaves the CLI logged out
+        # on purpose (that is the behaviour under test).
+        rc, out, err = drive_login(cli_home, PORT_A, auth_a)
+        check("re-login to A for the db block", rc == 0, err)
+        rc, out, err = cli("--json", "db", "list")
+        dbs = json.loads(out)["databases"]
+        check("remote db list shows the implicit default, active",
+              rc == 0 and len(dbs) == 1 and dbs[0]["name"] == "default"
+              and dbs[0]["active"] is True, err + out)
+        data_dir = os.path.join(workdir, "a", "data")
+        rc, out, err = cli("db", "add", "second", "--type", "sqlite",
+                           "--path", os.path.join(data_dir, "second.db"))
+        check("remote db add second", rc == 0, err + out)
+        rc, out, err = cli("db", "add", "third", "--type", "sqlite",
+                           "--path", os.path.join(data_dir, "third.db"))
+        check("remote db add third (stays empty)", rc == 0, err + out)
+        rc, out, err = cli("db", "add", "tempdb", "--type", "sqlite",
+                           "--path", os.path.join(data_dir, "temp.db"))
+        rc2, out2, err2 = cli("db", "remove", "tempdb")
+        check("remote db remove (non-active)",
+              rc == 0 and rc2 == 0, err + out + err2 + out2)
+        rc, out, err = cli("--json", "db", "test", "second")
+        check("remote db test second", rc == 0, err + out)
+        rc, out, err = cli("db", "edit", "second", "--note", "standby")
+        rc2, out, _ = cli("--json", "db", "list")
+        notes = {d["name"]: d.get("note")
+                 for d in json.loads(out)["databases"]}
+        check("remote db edit note",
+              rc == 0 and notes.get("second") == "standby", err + out)
+        rc, out, err = cli("db", "migrate", "default", "second")
+        check("remote db migrate default -> second", rc == 0, err + out)
+        rc, out, err = cli("db", "switch", "second")
+        check("remote db switch to the migrated db", rc == 0, err + out)
+        rc, out, _ = cli("--json", "users", "list")
+        check("session survives a switch to the migrated db",
+              [u["username"] for u in json.loads(out)["users"]] == ["alice"],
+              out)
+        rc, out, err = cli("db", "switch", "third")
+        check("remote db switch to the empty db", rc == 0, err + out)
+        rc, _, _ = cli("users", "list")
+        check("bare switch to a db without the session logs the CLI out",
+              rc == 3, f"rc={rc}")
     finally:
         server_a.terminate()
         server_b.terminate()

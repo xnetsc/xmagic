@@ -334,6 +334,153 @@ def main():
                                    impostor.assertion(opts["challenge"], "localhost"))
         check("wrong-key assertion rejected", status == 401, f"got {status}")
 
+        # --- full surface: state, lists, remaining user/upstream/route
+        # actions, remaining settings keys, standalone apply, console page
+        status, body = client.call("GET", "/api/state")
+        check("state endpoint reports counts + restart channel",
+              status == 200 and body.get("enabled_users") == 1
+              and body.get("enabled_upstreams") == 1
+              and body.get("enabled_routes") == 1
+              and body.get("restart_via") is None, f"{status} {body}")
+
+        status, body = client.call("GET", "/api/users")
+        check("users list shows alice's fields",
+              status == 200
+              and [u["username"] for u in body["users"]] == ["alice"]
+              and body["users"][0]["note"] == "primary", f"{status} {body}")
+
+        dave_key = ("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDaveTestKey"
+                    "0123456789abcdef0123456789abcdef01234567 dave@test")
+        status, body = client.call("POST", "/api/users",
+                                   {"username": "dave", "group": "intl",
+                                    "note": "second", "ssh_pubkey": dave_key})
+        check("add user with group/note/ssh key",
+              status == 201 and body["user"]["group"] == "intl"
+              and body["user"]["note"] == "second"
+              and body["user"]["ssh_key"] is True, f"{status} {body}")
+        dave_pw = body["user"]["password"]
+        status, body = client.call("POST", "/api/users/dave/passwd", {})
+        check("passwd rotates the shared password",
+              status == 200 and body["user"]["password"] != dave_pw,
+              f"{status} {body}")
+        status, body = client.call("POST", "/api/users/dave/setgroup",
+                                   {"group": "backup"})
+        check("setgroup applies", status == 200
+              and body["user"]["group"] == "backup", f"{status} {body}")
+        status, body = client.call("POST", "/api/users/dave/setkey",
+                                   {"ssh_pubkey": dave_key})
+        check("setkey stores the key", status == 200
+              and body["user"]["ssh_pubkey"] == dave_key, f"{status} {body}")
+        status, body = client.call("POST", "/api/users/dave/setkey",
+                                   {"ssh_pubkey": ""})
+        check("setkey with empty clears the key",
+              status == 200 and body["user"]["ssh_key"] is False,
+              f"{status} {body}")
+        status, body = client.call("POST", "/api/users/dave/setnote",
+                                   {"note": ""})
+        check("setnote with empty clears the note",
+              status == 200 and body["user"]["note"] is None, f"{status} {body}")
+        status, body = client.call("POST", "/api/users/dave/disable", {})
+        check("disable user", status == 200
+              and body["user"]["enabled"] is False, f"{status} {body}")
+        status, body = client.call("POST", "/api/users/dave/enable", {})
+        check("enable user", status == 200
+              and body["user"]["enabled"] is True, f"{status} {body}")
+        status, body = client.call("POST", "/api/users/dave/remove", {})
+        check("remove user", status == 200, f"{status} {body}")
+        status, body = client.call("GET", "/api/users")
+        check("removed user leaves the list",
+              [u["username"] for u in body["users"]] == ["alice"], f"{body}")
+
+        status, body = client.call("GET", "/api/upstreams")
+        check("upstreams list shows up-a",
+              status == 200
+              and [u["name"] for u in body["upstreams"]] == ["up-a"],
+              f"{status} {body}")
+        status, _ = client.call("POST", "/api/upstreams/up-a/disable", {})
+        status2, body = client.call("GET", "/api/upstreams")
+        check("disable upstream", status == 200
+              and body["upstreams"][0]["enabled"] is False,
+              f"{status} {status2} {body}")
+        status, _ = client.call("POST", "/api/upstreams/up-a/enable", {})
+        status2, body = client.call("GET", "/api/upstreams")
+        check("enable upstream", status == 200
+              and body["upstreams"][0]["enabled"] is True,
+              f"{status} {status2} {body}")
+        status, body = client.call("POST", "/api/upstreams/up-a/remove", {})
+        check("remove upstream", status == 200, f"{status} {body}")
+        status, body = client.call("GET", "/api/upstreams")
+        check("upstreams list empty after remove", body["upstreams"] == [],
+              f"{body}")
+
+        status, body = client.call("GET", "/api/routes")
+        check("routes list shows the route",
+              status == 200 and len(body["routes"]) == 1
+              and body["routes"][0]["target"] == "direct", f"{status} {body}")
+        rid = body["routes"][0]["id"]
+        status, _ = client.call("POST", f"/api/routes/{rid}/disable", {})
+        status2, body = client.call("GET", "/api/routes")
+        check("disable route", status == 200
+              and body["routes"][0]["enabled"] is False,
+              f"{status} {status2} {body}")
+        status, _ = client.call("POST", f"/api/routes/{rid}/enable", {})
+        status2, body = client.call("GET", "/api/routes")
+        check("enable route", status == 200
+              and body["routes"][0]["enabled"] is True,
+              f"{status} {status2} {body}")
+        status, body = client.call("POST", "/api/routes",
+                                   {"kind": "ip", "pattern": "203.0.113.7",
+                                    "to": "pool", "username": "alice"})
+        check("add user-scoped route", status == 201
+              and body["route"]["username"] == "alice", f"{status} {body}")
+        status, body = client.call(
+            "POST", f"/api/routes/{body['route']['id']}/remove", {})
+        check("remove route", status == 200, f"{status} {body}")
+        status, body = client.call("GET", "/api/routes")
+        check("routes list back to one after remove",
+              len(body["routes"]) == 1, f"{body}")
+
+        status, body = client.call("POST", "/api/settings",
+                                   {"trojan_ws_paths": "/tj,/tj2",
+                                    "upstream_strategy": "leastPing",
+                                    "ss_method": "aes-128-gcm",
+                                    "direct_allow_private": True})
+        check("settings: remaining keys stored",
+              status == 200 and body["trojan_ws_paths"] == ["/tj", "/tj2"]
+              and body["upstream_strategy"] == "leastPing"
+              and body["ss_method"] == "aes-128-gcm"
+              and body["direct_allow_private"] is True, f"{status} {body}")
+        status, body = client.call("GET", "/api/settings")
+        check("settings: remaining keys read back",
+              status == 200 and body["trojan_ws_paths"] == ["/tj", "/tj2"]
+              and body["upstream_strategy"] == "leastPing", f"{status} {body}")
+        status, _ = client.call("POST", "/api/settings",
+                                {"upstream_strategy": "bogus"})
+        check("settings rejects a bogus strategy", status == 400,
+              f"got {status}")
+        status, body = client.call("POST", "/api/settings",
+                                   {"direct_allow_private": False})
+        check("settings: direct_allow_private back off",
+              status == 200 and body["direct_allow_private"] is False,
+              f"{status} {body}")
+
+        status, body = client.call("POST", "/api/apply", {})
+        check("standalone apply endpoint",
+              status == 200 and body["applied"]["restart_skipped"] is True,
+              f"{status} {body}")
+
+        conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=10)
+        conn.request("GET", "/")
+        resp = conn.getresponse()
+        page = resp.read().decode("utf-8", "replace")
+        conn.close()
+        check("console page carries the copyable CLI install command",
+              resp.status == 200
+              and "raw.githubusercontent.com/xnetsc/xmagic/main/xmagic.py" in page
+              and 'id="cli-install"' in page
+              and 'id="btn-copy-install"' in page
+              and 'id="cli-onboard"' in page, f"status {resp.status}")
+
         # --- admin passkey replacement while authenticated ---
         old_cookie = client.cookie
         auth2 = Authenticator()

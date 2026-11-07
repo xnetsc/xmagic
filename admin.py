@@ -1111,6 +1111,15 @@ input,select{padding:.35rem;margin:.15rem}
      <button id="btn-apply">重新渲染并应用</button>
      <button id="btn-logout">退出</button></p>
 
+  <h2>远程 CLI</h2>
+  <p class="small">在自己的机器上安装单文件 CLI（纯 Python 标准库，不用 pip），
+     装完把本节点加进去登录即可管理：</p>
+  <p><input id="cli-install" readonly size="92" value="mkdir -p ~/.local/bin && curl -fsSL https://raw.githubusercontent.com/xnetsc/xmagic/main/xmagic.py -o ~/.local/bin/xmagic && chmod +x ~/.local/bin/xmagic">
+     <button type="button" id="btn-copy-install">复制</button></p>
+  <p><input id="cli-onboard" readonly size="92" value="">
+     <button type="button" id="btn-copy-onboard">复制</button></p>
+  <p class="small">若提示找不到 xmagic 命令，把 ~/.local/bin 加入 PATH 后重试。</p>
+
   <h2>网关用户</h2>
   <table id="users-table"></table>
   <form id="form-user">
@@ -1346,6 +1355,14 @@ document.addEventListener("click", async e => {
 $("btn-apply").onclick = async () => { try {
   const r = await api("/api/apply", {}); msg(appliedText(r.applied), true); refresh();
 } catch (e) { msg(String(e)); } };
+$("cli-onboard").value = "xmagic node add main --url " + location.origin + " && xmagic login";
+function copyCmd(id, btn) { const el = $(id); el.select();
+  const done = () => { btn.textContent = "已复制"; setTimeout(() => btn.textContent = "复制", 1500); };
+  if (navigator.clipboard && window.isSecureContext)
+    navigator.clipboard.writeText(el.value).then(done, () => { document.execCommand("copy"); done(); });
+  else { document.execCommand("copy"); done(); } }
+$("btn-copy-install").onclick = e => copyCmd("cli-install", e.target);
+$("btn-copy-onboard").onclick = e => copyCmd("cli-onboard", e.target);
 $("form-database").onsubmit = async e => { e.preventDefault();
   try { const r = await api("/api/databases", formJson(e.target));
     msg(`数据库配置 ${r.database.name} 已添加`, true); e.target.reset(); refresh(); }

@@ -60,9 +60,13 @@ services:
     container_name: proxy-xray
     restart: unless-stopped
     network_mode: host
-    command: ["run", "-c", "/etc/xray/config.json"]
+    command: ["run", "-c", "/data/config.json"]
     volumes:
-      - ./data/config.json:/etc/xray/config.json:ro
+      # Mount the data DIRECTORY, never the config file itself: with a
+      # file bind mount, Docker creates a DIRECTORY at the source path
+      # when it does not exist yet (every first boot), which then
+      # blocks the admin's render at that path forever.
+      - ./data:/data:ro
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
 
@@ -91,7 +95,11 @@ services:
     environment:
       SSH_BE_PORT: "${SSH_BE_PORT:-12222}"
     volumes:
-      - ./data/authorized_keys:/home/proxy/.ssh/authorized_keys:ro
+      # Directory mount for the same reason as the xray service; the
+      # image entrypoint copies the rendered authorized_keys from /data
+      # into the proxy home at every start (apply restarts this
+      # container after each render, so key changes propagate).
+      - ./data:/data:ro
       - ./data/ssh_host_keys:/etc/ssh/keys
     depends_on:
       - xray
@@ -126,9 +134,9 @@ services:
     restart: unless-stopped
     network_mode: host
     profiles: ["cascade"]
-    command: ["sh", "/app/start-tunnels.sh"]
+    command: ["sh", "/data/start-tunnels.sh"]
     volumes:
-      - ./data/start-tunnels.sh:/app/start-tunnels.sh:ro
+      - ./data:/data:ro
       - ${SSH_KEY_DIR:-./data/ssh_client_keys}:/keys:ro
     depends_on:
       - xray

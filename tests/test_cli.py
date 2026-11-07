@@ -9,6 +9,7 @@ Run: python3 tests/test_cli.py
 """
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -209,6 +210,113 @@ def main():
     check("CLI revoke-all", rc == 0 and "revoked" in out, out)
     rc, out, _ = cli("admin-reset")
     check("admin-reset", rc == 0 and "cleared" in out, out)
+
+    # ---- remaining engine-CLI surface: full user lifecycle, upstream /
+    # route toggles + removal, gen-paths, render-keys, remaining settings.
+    # Field-level assertions read the DB directly where the CLI's own
+    # list output omits the field (note, passwords, keys).
+    def dbval(sql, params=()):
+        conn = sqlite3.connect(db_path)
+        try:
+            row = conn.execute(sql, params).fetchone()
+            return row[0] if row else None
+        finally:
+            conn.close()
+
+    key_path = os.path.join(workdir, "dave.pub")
+    dave_key = ("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDaveTestKey"
+                "0123456789abcdef0123456789abcdef01234567 dave@test")
+    with open(key_path, "w") as f:
+        f.write(dave_key + "\n")
+    rc, out, err = cli("--json", "add", "dave", "--group", "intl",
+                       "--note", "via cli", "--ssh-key-file", key_path)
+    try:
+        dave = json.loads(out)
+    except ValueError:
+        dave = {}
+    check("add with group/note/ssh-key-file",
+          rc == 0 and bool(dave.get("password")), err + out)
+    check("add stored the ssh key + group + note",
+          dbval("SELECT ssh_pubkey FROM users WHERE username='dave'") == dave_key
+          and dbval("SELECT upstream_group FROM users WHERE username='dave'") == "intl"
+          and dbval("SELECT note FROM users WHERE username='dave'") == "via cli")
+    rc, out, err = cli("passwd", "dave")
+    new_pw = dbval("SELECT trojan_password FROM users WHERE username='dave'")
+    check("passwd rotates the password",
+          rc == 0 and bool(new_pw) and new_pw != dave.get("password"),
+          err + out)
+    keys_out = os.path.join(workdir, "keys_out")
+    rc, out, err = cli("render-keys", "--out", keys_out)
+    keys_flat = open(keys_out).read() if rc == 0 and os.path.exists(keys_out) else ""
+    check("render-keys emits dave's key", rc == 0 and dave_key in keys_flat, err)
+    rc, _, err = cli("setkey", "dave", "--clear")
+    check("setkey --clear (dave)", rc == 0
+          and dbval("SELECT ssh_pubkey FROM users WHERE username='dave'") is None,
+          err)
+    rc, _, err = cli("setgroup", "dave", "backup")
+    check("setgroup via node CLI", rc == 0
+          and dbval("SELECT upstream_group FROM users WHERE username='dave'") == "backup",
+          err)
+    rc, _, err = cli("setnote", "dave", "")
+    check("setnote empty clears", rc == 0
+          and dbval("SELECT note FROM users WHERE username='dave'") is None, err)
+    rc, _, err = cli("disable", "dave")
+    check("disable user via node CLI", rc == 0
+          and dbval("SELECT enabled FROM users WHERE username='dave'") == 0, err)
+    rc, _, err = cli("enable", "dave")
+    check("enable user via node CLI", rc == 0
+          and dbval("SELECT enabled FROM users WHERE username='dave'") == 1, err)
+    rc, out, _ = cli("--json", "list")
+    check("list flags dave's group + no key",
+          any(u["username"] == "dave" and u["group"] == "backup"
+              and u["ssh_key"] is False for u in json.loads(out)), out)
+    rc, _, err = cli("remove", "dave")
+    check("remove user via node CLI", rc == 0
+          and dbval("SELECT COUNT(*) FROM users WHERE username='dave'") == 0, err)
+
+    rc, out, _ = cli("--json", "upstream-list")
+    check("--json upstream-list shows up1",
+          [u["name"] for u in json.loads(out)] == ["up1"], out)
+    rc, _, err = cli("upstream-disable", "up1")
+    check("upstream-disable via node CLI", rc == 0
+          and dbval("SELECT enabled FROM upstreams WHERE name='up1'") == 0, err)
+    rc, _, err = cli("upstream-enable", "up1")
+    check("upstream-enable via node CLI", rc == 0
+          and dbval("SELECT enabled FROM upstreams WHERE name='up1'") == 1, err)
+    rc, _, err = cli("upstream-remove", "up1")
+    check("upstream-remove via node CLI", rc == 0
+          and dbval("SELECT COUNT(*) FROM upstreams WHERE name='up1'") == 0, err)
+
+    rc, out, _ = cli("--json", "route-list")
+    routes = json.loads(out)
+    check("--json route-list shows the route",
+          len(routes) == 1 and routes[0]["pattern"] == "example.com", out)
+    rc, _, err = cli("route-disable", "1")
+    check("route-disable via node CLI", rc == 0
+          and dbval("SELECT enabled FROM routes WHERE id=1") == 0, err)
+    rc, _, err = cli("route-enable", "1")
+    check("route-enable via node CLI", rc == 0
+          and dbval("SELECT enabled FROM routes WHERE id=1") == 1, err)
+    rc, _, err = cli("route-remove", "1")
+    check("route-remove via node CLI", rc == 0
+          and dbval("SELECT COUNT(*) FROM routes WHERE id=1") == 0, err)
+
+    rc, out, err = cli("gen-paths", "3")
+    paths = [ln for ln in out.splitlines() if "/" in ln]
+    check("gen-paths prints N paths", rc == 0 and len(paths) == 3, err + out)
+
+    rc, _, err = cli("settings", "--trojan-ws-paths", "/t1,/t2",
+                     "--upstream-strategy", "roundRobin",
+                     "--ss-method", "aes-128-gcm")
+    check("settings remaining keys via CLI", rc == 0, err)
+    rc, out, _ = cli("--json", "settings")
+    st = json.loads(out)
+    check("settings remaining keys persisted",
+          st["trojan_ws_paths"] == ["/t1", "/t2"]
+          and st["upstream_strategy"] == "roundRobin"
+          and st["ss_method"] == "aes-128-gcm", out)
+    rc, _, _ = cli("settings", "--upstream-strategy", "bogus")
+    check("settings rejects a bogus strategy", rc != 0)
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     return 1 if FAIL else 0

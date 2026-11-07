@@ -149,6 +149,13 @@ docker compose run --rm admin python3 users.py --json list   # machine-readable 
 
 ### On your own machine: xmagic.py (remote CLI, manages many nodes)
 
+Install the single-file CLI (Python standard library only, no pip) — the
+same command is shown, with a copy button, in the web console:
+
+```bash
+mkdir -p ~/.local/bin && curl -fsSL https://raw.githubusercontent.com/xnetsc/xmagic/main/xmagic.py -o ~/.local/bin/xmagic && chmod +x ~/.local/bin/xmagic
+```
+
 ```bash
 python3 xmagic.py node add tokyo --url http://<node-address>:8080   # console and proxy share the public port
 python3 xmagic.py login            # opens the browser for Passkey; the session is stored locally
