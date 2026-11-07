@@ -1154,144 +1154,341 @@ UI_HTML = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>xmagic 管理后台</title>
 <style>
-body{font-family:system-ui,sans-serif;margin:2rem auto;max-width:980px;padding:0 1rem;color:#1c1c1e}
-h1{font-size:1.3rem} h2{font-size:1.05rem;margin-top:1.6rem}
-table{border-collapse:collapse;width:100%;font-size:.85rem}
-th,td{border:1px solid #ddd;padding:.35rem .5rem;text-align:left;vertical-align:top}
-code{font-size:.78rem;word-break:break-all}
-button{padding:.4rem .8rem;margin:.15rem;cursor:pointer}
-input,select{padding:.35rem;margin:.15rem}
-.err{color:#b00020;white-space:pre-wrap}.ok{color:#146c2e}
-.tab{font-weight:600}.hidden{display:none}
-.small{color:#666;font-size:.8rem}
+:root{
+  --bg:#f4f6fb; --card:#ffffff; --border:#e4e8f1; --border-strong:#d3d9e6;
+  --text:#101828; --muted:#667085; --faint:#98a2b3;
+  --accent:#2563eb; --accent-hover:#1d4ed8; --accent-soft:#eff4ff;
+  --ok:#12805c; --ok-soft:#ecfdf3; --err:#b42318; --err-soft:#fef3f2;
+  --side:#0b1220; --side-text:#c3cad9; --side-active:#ffffff;
+  --radius:12px; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;
+  background:var(--bg);color:var(--text);font-size:14px;line-height:1.55}
+.hidden{display:none!important}
+button{font:inherit;cursor:pointer;border:1px solid var(--border-strong);background:#fff;color:var(--text);
+  border-radius:8px;padding:.42rem .85rem;font-size:.85rem;transition:background .12s,border-color .12s}
+button:hover{background:#f2f5fa}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+button.primary:hover{background:var(--accent-hover)}
+button.ghost{border-color:transparent;background:transparent;color:var(--muted)}
+button.ghost:hover{background:#eef1f7;color:var(--text)}
+button.sm{padding:.22rem .6rem;font-size:.8rem;border-radius:7px}
+button.danger{color:var(--err)}
+button.danger:hover{background:var(--err-soft);border-color:#f3c2bd}
+input,select{font:inherit;font-size:.88rem;padding:.45rem .6rem;border:1px solid var(--border-strong);
+  border-radius:8px;background:#fff;color:var(--text);width:100%}
+input:focus,select:focus{outline:2px solid var(--accent-soft);border-color:var(--accent)}
+input[readonly]{background:#f8fafc;font-family:var(--mono);font-size:.78rem}
+code{font-family:var(--mono);font-size:.76rem;word-break:break-all;color:#344054}
+label{font-size:.82rem;color:var(--muted);display:block;margin-bottom:.3rem;font-weight:500}
+.hint{color:var(--muted);font-size:.82rem}
+.small{color:var(--muted);font-size:.82rem}
+
+/* ---------- auth screens (setup / login) ---------- */
+.auth-wrap{min-height:100vh;display:flex;align-items:flex-start;justify-content:center;padding:9vh 1rem 2rem}
+.auth-card{background:var(--card);border:1px solid var(--border);border-radius:16px;
+  box-shadow:0 12px 32px rgba(16,24,40,.08);max-width:520px;width:100%;padding:2.2rem 2.4rem}
+.auth-card .logo{font-size:1.5rem;font-weight:700;letter-spacing:-.02em}
+.auth-card .logo span{color:var(--accent)}
+.auth-card h2{font-size:1.05rem;margin:1.1rem 0 .4rem}
+.auth-card p{color:var(--muted);margin:.4rem 0 1.2rem}
+.auth-card button{width:100%;padding:.6rem;font-size:.95rem}
+
+/* ---------- app shell ---------- */
+.shell{display:flex;min-height:100vh}
+.sidebar{width:230px;flex:0 0 230px;background:var(--side);color:var(--side-text);
+  position:sticky;top:0;height:100vh;display:flex;flex-direction:column;padding:1.1rem .8rem}
+.brand{font-size:1.25rem;font-weight:700;color:#fff;letter-spacing:-.02em;padding:.2rem .6rem}
+.brand span{color:#6ea8ff}
+.brand-sub{font-size:.72rem;color:#7d879c;padding:0 .6rem;margin-bottom:1.4rem}
+.nav{display:flex;flex-direction:column;gap:2px}
+.nav button{display:flex;align-items:center;gap:.55rem;text-align:left;background:transparent;border:0;
+  color:var(--side-text);padding:.5rem .6rem;border-radius:8px;font-size:.9rem;width:100%}
+.nav button:hover{background:#141d31;color:#fff}
+.nav button.active{background:#1b2740;color:var(--side-active);font-weight:600}
+.nav button .dot{width:6px;height:6px;border-radius:50%;background:#3d4a63;flex:0 0 6px}
+.nav button.active .dot{background:#6ea8ff}
+.side-foot{margin-top:auto;font-size:.72rem;padding:0 .6rem;color:#5b6678}
+.main{flex:1;min-width:0;display:flex;flex-direction:column}
+.topbar{position:sticky;top:0;z-index:5;background:rgba(255,255,255,.88);backdrop-filter:blur(8px);
+  border-bottom:1px solid var(--border);padding:.8rem 1.6rem;display:flex;align-items:center;gap:1rem}
+.topbar h1{font-size:1.08rem;margin:0;font-weight:650}
+.topbar .spacer{flex:1}
+.topbar .actions{display:flex;gap:.5rem;align-items:center}
+.content{padding:1.4rem 1.6rem 3rem;max-width:1180px;width:100%;margin:0 auto}
+#msg{position:fixed;top:16px;left:50%;transform:translateX(-50%);z-index:60;min-width:280px;max-width:min(720px,92vw);border-radius:10px;padding:.6rem .95rem;font-size:.88rem;display:none;white-space:pre-wrap;box-shadow:0 10px 28px rgba(16,24,40,.16);background:#fff}
+#msg.ok{display:block;background:var(--ok-soft);color:var(--ok);border:1px solid #a6e9c5}
+#msg.err{display:block;background:var(--err-soft);color:var(--err);border:1px solid #f3c2bd}
+.view{display:none}
+.view.active{display:block}
+.card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);
+  padding:1.15rem 1.25rem;margin-bottom:1.1rem;box-shadow:0 1px 2px rgba(16,24,40,.04)}
+.card h2{font-size:.98rem;margin:0 0 .2rem;font-weight:650}
+.card .sub{color:var(--muted);font-size:.83rem;margin:0 0 .9rem}
+.card .divider{border-top:1px solid var(--border);margin:1rem -1.25rem 0;padding:.9rem 1.25rem 0}
+
+/* ---------- overview stats ---------- */
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem;margin-bottom:1.1rem}
+.stat{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:1rem 1.15rem}
+.stat .k{color:var(--muted);font-size:.8rem;font-weight:500}
+.stat .v{font-size:1.55rem;font-weight:700;letter-spacing:-.02em;margin-top:.15rem}
+.stat .v small{font-size:.8rem;color:var(--muted);font-weight:500}
+.cmd-row{display:flex;gap:.5rem;margin:.55rem 0}
+.cmd-row input{flex:1}
+.cmd-row button{flex:0 0 auto}
+
+/* ---------- tables ---------- */
+.tbl-wrap{overflow-x:auto;margin:0 -1.25rem;padding:0 1.25rem}
+table{border-collapse:collapse;width:100%;font-size:.86rem}
+th{ text-align:left;color:var(--muted);font-size:.74rem;font-weight:600;letter-spacing:.04em;
+  text-transform:uppercase;padding:.45rem .6rem;border-bottom:1px solid var(--border);white-space:nowrap}
+td{padding:.55rem .6rem;border-bottom:1px solid #eef1f6;vertical-align:top}
+tr:last-child td{border-bottom:0}
+tbody tr:hover td{background:#f8fafd}
+td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
+.badge{display:inline-block;padding:.08rem .55rem;border-radius:999px;font-size:.76rem;font-weight:600;white-space:nowrap}
+.badge.on{background:var(--ok-soft);color:var(--ok)}
+.badge.off{background:#f2f4f7;color:var(--muted)}
+.badge.cur{background:var(--accent-soft);color:var(--accent)}
+
+/* ---------- forms ---------- */
+.form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:.8rem .9rem;margin-top:1rem}
+.form-grid .wide{grid-column:span 2}
+.form-grid .full{grid-column:1/-1}
+.form-actions{display:flex;gap:.5rem;align-items:center;margin-top:1rem;flex-wrap:wrap}
+.check{display:flex;align-items:center;gap:.45rem;font-size:.88rem;color:var(--text)}
+.check input{width:auto}
+.check label{margin:0;font-size:.88rem;color:var(--text);font-weight:400}
+
+@media (max-width:860px){
+  .shell{flex-direction:column}
+  .sidebar{width:100%;flex:none;height:auto;position:static;padding:.8rem}
+  .brand-sub{display:none}
+  .nav{flex-direction:row;flex-wrap:wrap}
+  .nav button{width:auto}
+  .side-foot{display:none}
+  .content{padding:1rem}
+  .topbar{padding:.7rem 1rem}
+}
 </style></head><body>
-<h1>xmagic 管理后台</h1>
 <div id="msg"></div>
 
-<div id="setup" class="hidden">
-  <p>尚未注册管理员。这个后台只支持一个管理员账号、且只能用 Passkey：
-  第一个注册的 Passkey 即为管理员，之后注册永久关闭。</p>
-  <button id="btn-register">注册管理员 Passkey</button>
-</div>
-
-<div id="login" class="hidden">
-  <p>管理员已注册。请用 Passkey 登录（不支持其它方式）。</p>
-  <button id="btn-login">用 Passkey 登录</button>
+<div class="auth-wrap" id="auth-wrap">
+  <div class="auth-card hidden" id="setup">
+    <div class="logo">x<span>magic</span></div>
+    <h2>初始化管理后台</h2>
+    <p>尚未注册管理员。这个后台只支持一个管理员账号、且只能用 Passkey：
+    第一个注册的 Passkey 即为管理员，之后注册永久关闭。</p>
+    <button id="btn-register" class="primary">注册管理员 Passkey</button>
+  </div>
+  <div class="auth-card hidden" id="login">
+    <div class="logo">x<span>magic</span></div>
+    <h2>管理员登录</h2>
+    <p>管理员已注册。请用 Passkey 登录（不支持其它方式）。</p>
+    <button id="btn-login" class="primary">用 Passkey 登录</button>
+  </div>
 </div>
 
 <div id="console" class="hidden">
-  <p><span id="state-line"></span>
-     <button id="btn-apply">重新渲染并应用</button>
-     <button id="btn-logout">退出</button></p>
+<div class="shell">
+  <aside class="sidebar">
+    <div class="brand">x<span>magic</span></div>
+    <div class="brand-sub">网关管理后台</div>
+    <nav class="nav">
+      <button data-nav="overview" class="active"><span class="dot"></span>概览</button>
+      <button data-nav="users"><span class="dot"></span>网关用户</button>
+      <button data-nav="upstreams"><span class="dot"></span>上级节点</button>
+      <button data-nav="routes"><span class="dot"></span>目标路由</button>
+      <button data-nav="settings"><span class="dot"></span>设置</button>
+      <button data-nav="databases"><span class="dot"></span>数据库</button>
+      <button data-nav="sessions"><span class="dot"></span>登录会话</button>
+    </nav>
+    <div class="side-foot">Passkey 管理员会话</div>
+  </aside>
+  <div class="main">
+    <div class="topbar">
+      <h1 id="view-title">概览</h1>
+      <div class="spacer"></div>
+      <div class="actions">
+        <button id="btn-apply" class="primary">重新渲染并应用</button>
+        <button id="btn-logout" class="ghost">退出</button>
+      </div>
+    </div>
+    <div class="content">
 
-  <h2>远程 CLI</h2>
-  <p class="small">在自己的机器上安装单文件 CLI（纯 Python 标准库，不用 pip），
-     装完把本节点加进去登录即可管理：</p>
-  <p><input id="cli-install" readonly size="92" value="mkdir -p ~/.local/bin && curl -fsSL https://raw.githubusercontent.com/xnetsc/xmagic/main/xmagic.py -o ~/.local/bin/xmagic && chmod +x ~/.local/bin/xmagic">
-     <button type="button" id="btn-copy-install">复制</button></p>
-  <p><input id="cli-onboard" readonly size="92" value="">
-     <button type="button" id="btn-copy-onboard">复制</button></p>
-  <p class="small">若提示找不到 xmagic 命令，把 ~/.local/bin 加入 PATH 后重试。</p>
+      <section class="view active" data-view="overview">
+        <div class="stats">
+          <div class="stat"><div class="k">启用用户</div><div class="v" id="stat-users">–</div></div>
+          <div class="stat"><div class="k">启用上级</div><div class="v" id="stat-upstreams">–</div></div>
+          <div class="stat"><div class="k">启用路由</div><div class="v" id="stat-routes">–</div></div>
+          <div class="stat"><div class="k">公共端口</div><div class="v" id="stat-port">–</div></div>
+          <div class="stat"><div class="k">重启通道</div><div class="v" id="stat-restart" style="font-size:1.05rem;padding-top:.45rem">–</div></div>
+        </div>
+        <p class="hint" id="state-line" style="margin:0 0 1.1rem"></p>
+        <div class="card">
+          <h2>远程 CLI</h2>
+          <p class="sub">在自己的机器上安装单文件 CLI（纯 Python 标准库，不用 pip），装完把本节点加进去登录即可管理。</p>
+          <div class="cmd-row"><input id="cli-install" readonly value="mkdir -p ~/.local/bin && curl -fsSL https://raw.githubusercontent.com/xnetsc/xmagic/main/xmagic.py -o ~/.local/bin/xmagic && chmod +x ~/.local/bin/xmagic">
+            <button type="button" id="btn-copy-install">复制</button></div>
+          <div class="cmd-row"><input id="cli-onboard" readonly value="">
+            <button type="button" id="btn-copy-onboard">复制</button></div>
+          <p class="hint">若提示找不到 xmagic 命令，把 ~/.local/bin 加入 PATH 后重试。</p>
+        </div>
+      </section>
 
-  <h2>网关用户</h2>
-  <table id="users-table"></table>
-  <form id="form-user">
-    <input name="username" placeholder="用户名" required>
-    <input name="group" placeholder="上级分组（默认 default）">
-    <input name="ssh_pubkey" placeholder="SSH 公钥（可选）" size="42">
-    <input name="note" placeholder="备注（可选）" size="16">
-    <button>添加用户</button>
-  </form>
+      <section class="view" data-view="users">
+        <div class="card">
+          <h2>网关用户</h2>
+          <p class="sub">每个用户有一套 VLESS / Trojan / HTTP / SOCKS 凭证与独立的 Shadowsocks 密码，可选登记 SSH 公钥。</p>
+          <div class="tbl-wrap"><table id="users-table"></table></div>
+          <form id="form-user">
+            <div class="form-grid">
+              <div><label>用户名</label><input name="username" placeholder="用户名" required></div>
+              <div><label>上级分组</label><input name="group" placeholder="默认 default"></div>
+              <div><label>备注</label><input name="note" placeholder="可选"></div>
+              <div class="wide"><label>SSH 公钥（可选）</label><input name="ssh_pubkey" placeholder="ssh-ed25519 AAAA…"></div>
+            </div>
+            <div class="form-actions"><button class="primary">添加用户</button></div>
+          </form>
+        </div>
+      </section>
 
-  <h2>上级节点</h2>
-  <table id="upstreams-table"></table>
-  <form id="form-upstream">
-    <input name="name" placeholder="名称" required>
-    <select name="protocol">
-      <option>vless-ws</option><option>vless</option><option>trojan-ws</option>
-      <option>ss</option><option>http</option><option>socks</option><option>ssh</option>
-    </select>
-    <input name="address" placeholder="地址" required>
-    <input name="port" placeholder="端口" type="number" required size="7">
-    <input name="group" placeholder="分组" size="9">
-    <input name="path" placeholder="WS 路径" size="10">
-    <input name="uuid" placeholder="UUID" size="20">
-    <input name="username" placeholder="用户名" size="10">
-    <input name="password" placeholder="密码" size="14">
-    <input name="key_file" placeholder="SSH 密钥路径" size="14">
-    <input name="method" placeholder="SS 方法" size="14">
-    <input name="note" placeholder="备注" size="12">
-    <label><input type="checkbox" name="tls"> TLS</label>
-    <button id="up-submit">添加上级</button>
-    <button type="button" id="up-cancel" class="hidden">取消编辑</button>
-  </form>
+      <section class="view" data-view="upstreams">
+        <div class="card">
+          <h2>上级节点</h2>
+          <p class="sub">级联上级按用户分组选择，池策略在「设置」里调整。带 * 的凭据字段在编辑时留空表示不改动。</p>
+          <div class="tbl-wrap"><table id="upstreams-table"></table></div>
+          <form id="form-upstream">
+            <div class="form-grid">
+              <div><label>名称</label><input name="name" placeholder="名称" required></div>
+              <div><label>协议</label><select name="protocol">
+                <option>vless-ws</option><option>vless</option><option>trojan-ws</option>
+                <option>ss</option><option>http</option><option>socks</option><option>ssh</option>
+              </select></div>
+              <div class="wide"><label>地址</label><input name="address" placeholder="主机名或 IP" required></div>
+              <div><label>端口</label><input name="port" placeholder="端口" type="number" required></div>
+              <div><label>分组</label><input name="group" placeholder="分组"></div>
+              <div><label>WS 路径</label><input name="path" placeholder="/path"></div>
+              <div class="wide"><label>UUID</label><input name="uuid" placeholder="VLESS / Trojan UUID"></div>
+              <div><label>用户名</label><input name="username" placeholder="用户名"></div>
+              <div><label>密码</label><input name="password" placeholder="密码"></div>
+              <div><label>SSH 密钥路径</label><input name="key_file" placeholder="/keys/id_ed25519"></div>
+              <div><label>SS 方法</label><input name="method" placeholder="SS method"></div>
+              <div><label>备注</label><input name="note" placeholder="可选"></div>
+            </div>
+            <div class="form-actions">
+              <span class="check"><input type="checkbox" name="tls" id="up-tls"><label for="up-tls">TLS</label></span>
+              <button id="up-submit" class="primary">添加上级</button>
+              <button type="button" id="up-cancel" class="hidden">取消编辑</button>
+            </div>
+          </form>
+        </div>
+      </section>
 
-  <h2>目标路由</h2>
-  <table id="routes-table"></table>
-  <form id="form-route">
-    <select name="kind"><option>domain</option><option>full</option>
-      <option>keyword</option><option>regexp</option><option>ip</option></select>
-    <input name="pattern" placeholder="匹配目标" required>
-    <input name="to" placeholder="目标：分组名 / direct / block" required size="24">
-    <input name="username" placeholder="限定用户（可选）" size="14">
-    <input name="note" placeholder="备注" size="12">
-    <button id="route-submit">添加路由</button>
-    <button type="button" id="route-cancel" class="hidden">取消编辑</button>
-  </form>
-  <p class="small">每次修改都会自动重新渲染配置；若 Docker socket 可用，还会重启
-  xray / sshd 容器生效。渲染结果见上方状态行。</p>
+      <section class="view" data-view="routes">
+        <div class="card">
+          <h2>目标路由</h2>
+          <p class="sub">按域名 / 关键词 / 正则 / IP 把流量导向某个上级分组、直连或拦截；可限定只对某个用户生效。</p>
+          <div class="tbl-wrap"><table id="routes-table"></table></div>
+          <form id="form-route">
+            <div class="form-grid">
+              <div><label>类型</label><select name="kind"><option>domain</option><option>full</option>
+                <option>keyword</option><option>regexp</option><option>ip</option></select></div>
+              <div class="wide"><label>匹配目标</label><input name="pattern" placeholder="如 example.com 或 10.0.0.0/8" required></div>
+              <div><label>去向</label><input name="to" placeholder="分组名 / direct / block" required></div>
+              <div><label>限定用户（可选）</label><input name="username" placeholder="留空 = 全部用户"></div>
+              <div><label>备注</label><input name="note" placeholder="可选"></div>
+            </div>
+            <div class="form-actions">
+              <button id="route-submit" class="primary">添加路由</button>
+              <button type="button" id="route-cancel" class="hidden">取消编辑</button>
+            </div>
+          </form>
+          <p class="hint">每次修改都会自动重新渲染配置；若 Docker socket 可用，还会重启 xray / sshd 容器生效。渲染结果见「概览」页状态。</p>
+        </div>
+      </section>
 
-  <h2>设置</h2>
-  <form id="form-settings">
-    <label>登录会话有效期（小时）
-      <input name="session_ttl_hours" type="number" min="1" max="2160" size="6"></label>
-    <label>VLESS WS 路径（逗号分隔）
-      <input name="vless_ws_paths" size="26"></label>
-    <label>Trojan WS 路径
-      <input name="trojan_ws_paths" size="26"></label>
-    <label>上级池策略 <select name="upstream_strategy"></select></label>
-    <label>新用户默认 SS 方法 <select name="ss_method"></select></label>
-    <label><input type="checkbox" name="direct_allow_private"> 允许直连内网地址</label>
-    <button>保存</button>
-    <span class="small">会话有效期默认 168 小时（1 周），范围 1–2160，只影响新签发会话。
-    WS 路径 / 策略 / 默认方法：留空保存 = 回退到部署时 .env 的值；输入框灰字是当前生效值。
-    直连内网地址默认关闭：经 VLESS / Trojan / Shadowsocks 进来的流量直连时不能访问本机与内网地址
-    （Xray 的防 SSRF 默认规则）；节点需要访问自家局域网服务时再打开。
-    保存后自动重新渲染生效。</span>
-  </form>
-  <p class="small"><span id="admin-line"></span>
-     <button type="button" id="btn-replace">更换管理员 Passkey</button>
-     <span>更换后，其它所有登录会话立即失效，本页面会切到新签发的会话。</span></p>
+      <section class="view" data-view="settings">
+        <div class="card">
+          <h2>设置</h2>
+          <p class="sub">渲染级配置保存在数据库里，优先于部署时的环境变量；保存后自动重新渲染生效。</p>
+          <form id="form-settings">
+            <div class="form-grid">
+              <div><label>登录会话有效期（小时）</label>
+                <input name="session_ttl_hours" type="number" min="1" max="2160"></div>
+              <div><label>上级池策略</label><select name="upstream_strategy"></select></div>
+              <div><label>新用户默认 SS 方法</label><select name="ss_method"></select></div>
+              <div class="wide"><label>VLESS WS 路径（逗号分隔）</label><input name="vless_ws_paths"></div>
+              <div class="wide"><label>Trojan WS 路径（逗号分隔）</label><input name="trojan_ws_paths"></div>
+            </div>
+            <div class="form-actions">
+              <span class="check"><input type="checkbox" name="direct_allow_private" id="set-dap"><label for="set-dap">允许直连内网地址</label></span>
+              <button class="primary">保存</button>
+            </div>
+          </form>
+          <p class="hint">会话有效期默认 168 小时（1 周），范围 1–2160，只影响新签发会话。
+          WS 路径 / 策略 / 默认方法：留空保存 = 回退到部署时 .env 的值；输入框灰字是当前生效值。
+          直连内网地址默认关闭：经 VLESS / Trojan / Shadowsocks 进来的流量直连时不能访问本机与内网地址
+          （Xray 的防 SSRF 默认规则）；节点需要访问自家局域网服务时再打开。</p>
+          <div class="divider">
+            <p class="small" style="margin:0 0 .5rem"><span id="admin-line"></span></p>
+            <button type="button" id="btn-replace">更换管理员 Passkey</button>
+            <span class="small">更换后，其它所有登录会话立即失效，本页面会切到新签发的会话。</span>
+          </div>
+        </div>
+      </section>
 
-  <h2>数据库</h2>
-  <table id="databases-table"></table>
-  <form id="form-database">
-    <label>名称 <input name="name" size="12" required></label>
-    <label>类型 <select name="type">
-      <option value="sqlite">SQLite</option>
-      <option value="postgres">PostgreSQL</option>
-      <option value="mysql">MySQL</option></select></label>
-    <label>目标 <input name="target" size="46" required
-      placeholder="sqlite 文件路径，或 postgresql:// / mysql:// DSN"></label>
-    <label>备注 <input name="note" size="12"></label>
-    <button>添加配置</button>
-  </form>
-  <form id="form-migrate">
-    <label>从 <select name="from"></select></label>
-    <label>迁移到 <select name="to"></select></label>
-    <label><input type="checkbox" name="replace"> 覆盖目标已有数据</label>
-    <button>迁移数据</button>
-    <span class="small">数据库配置本身保存在节点本地，业务数据在当前启用的库里。
-    切到一个还没有表的库时会自动建表；切换后立即重新渲染生效。
-    迁移会把全部业务表（用户 / 上级 / 路由 / 设置 / 管理员凭证 / 会话）复制到目标库。
-    列表中 DSN 的密码已打码显示。</span>
-  </form>
+      <section class="view" data-view="databases">
+        <div class="card">
+          <h2>数据库</h2>
+          <p class="sub">数据库配置本身保存在节点本地，业务数据在当前启用的库里；切到还没有表的库时自动建表。列表中 DSN 的密码已打码。</p>
+          <div class="tbl-wrap"><table id="databases-table"></table></div>
+          <form id="form-database">
+            <div class="form-grid">
+              <div><label>名称</label><input name="name" required></div>
+              <div><label>类型</label><select name="type">
+                <option value="sqlite">SQLite</option>
+                <option value="postgres">PostgreSQL</option>
+                <option value="mysql">MySQL</option></select></div>
+              <div class="wide"><label>目标</label><input name="target" required
+                placeholder="sqlite 文件路径，或 postgresql:// / mysql:// DSN"></div>
+              <div><label>备注</label><input name="note"></div>
+            </div>
+            <div class="form-actions"><button class="primary">添加配置</button></div>
+          </form>
+          <div class="divider">
+            <h2 style="margin-bottom:.6rem">数据迁移</h2>
+            <form id="form-migrate">
+              <div class="form-grid">
+                <div><label>从</label><select name="from"></select></div>
+                <div><label>迁移到</label><select name="to"></select></div>
+              </div>
+              <div class="form-actions">
+                <span class="check"><input type="checkbox" name="replace" id="mig-replace"><label for="mig-replace">覆盖目标已有数据</label></span>
+                <button class="primary">迁移数据</button>
+              </div>
+            </form>
+            <p class="hint">迁移会把全部业务表（用户 / 上级 / 路由 / 设置 / 管理员凭证 / 会话）复制到目标库；切换后立即重新渲染生效。</p>
+          </div>
+        </div>
+      </section>
 
-  <h2>登录会话</h2>
-  <table id="sessions-table"></table>
-  <p><button id="btn-revoke-others">撤销其它全部会话</button>
-     <span class="small">同一管理员可以有多个会话（不同浏览器、不同机器的 CLI）。
-     「当前」是本页面正在用的会话；撤销它会立即退出本页面。</span></p>
+      <section class="view" data-view="sessions">
+        <div class="card">
+          <h2>登录会话</h2>
+          <p class="sub">同一管理员可以有多个会话（不同浏览器、不同机器的 CLI）。「当前」是本页面正在用的会话；撤销它会立即退出本页面。</p>
+          <div class="tbl-wrap"><table id="sessions-table"></table></div>
+          <div class="form-actions">
+            <button id="btn-revoke-others" class="danger">撤销其它全部会话</button>
+          </div>
+        </div>
+      </section>
+
+    </div>
+  </div>
+</div>
 </div>
 
 <script>
@@ -1322,33 +1519,42 @@ async function refresh() {
   const st = await api("/api/status");
   $("setup").classList.toggle("hidden", st.registered);
   $("login").classList.toggle("hidden", !st.registered || st.authenticated);
+  $("auth-wrap").classList.toggle("hidden", st.authenticated);
   $("console").classList.toggle("hidden", !st.authenticated);
   if (!st.authenticated) return;
   const s = await api("/api/state");
+  const restartName = s.restart_via === "container" ? "整容器重启" : s.restart_via === "docker" ? "Docker socket" : "无（仅渲染）";
   $("state-line").textContent =
     `状态：${s.enabled_users} 启用用户 / ${s.enabled_upstreams} 上级 / ${s.enabled_routes} 路由` +
-    `，公共端口 ${s.public_port}，重启通道 ${s.restart_via === "container" ? "整容器重启" : s.restart_via === "docker" ? "Docker socket" : "无（仅渲染）"}。`;
+    `，公共端口 ${s.public_port}，重启通道 ${restartName}。`;
+  $("stat-users").textContent = s.enabled_users;
+  $("stat-upstreams").textContent = s.enabled_upstreams;
+  $("stat-routes").textContent = s.enabled_routes;
+  $("stat-port").textContent = s.public_port;
+  $("stat-restart").textContent = restartName;
   const users = (await api("/api/users")).users;
   $("users-table").innerHTML = "<tr><th>用户</th><th>分组</th><th>启用</th><th>凭证</th><th>操作</th></tr>" +
-    users.map(u => `<tr><td>${u.username}</td><td>${u.group}</td><td>${u.enabled}</td>
+    users.map(u => `<tr><td><strong>${u.username}</strong>${u.note ? `<br><span class="small">${u.note}</span>` : ""}</td><td>${u.group}</td>
+      <td><span class="badge ${u.enabled ? "on" : "off"}">${u.enabled ? "启用" : "停用"}</span></td>
       <td><code>uuid ${u.vless_uuid}<br>密码 ${u.password}<br>ss ${u.ss_method} / ${u.ss_password}` +
       `${u.ssh_key ? "<br>SSH 公钥已登记" : ""}</code></td>
-      <td><button data-act="passwd" data-u="${u.username}">换密码</button>
-      <button data-act="rotate-uuid" data-u="${u.username}">换UUID</button>
-      <button data-act="setkey" data-u="${u.username}">公钥</button>
-      <button data-act="setgroup" data-u="${u.username}" data-g="${u.group}">分组</button>
-      <button data-act="setmethod" data-u="${u.username}" data-m="${u.ss_method}">SS方法</button>
-      <button data-act="setnote" data-u="${u.username}" data-n="${u.note || ""}">备注</button>
-      <button data-act="${u.enabled ? "disable" : "enable"}" data-u="${u.username}">${u.enabled ? "停用" : "启用"}</button>
-      <button data-act="remove" data-u="${u.username}">删除</button></td></tr>`).join("");
+      <td><div class="row-actions"><button class="sm" data-act="passwd" data-u="${u.username}">换密码</button>
+      <button class="sm" data-act="rotate-uuid" data-u="${u.username}">换UUID</button>
+      <button class="sm" data-act="setkey" data-u="${u.username}">公钥</button>
+      <button class="sm" data-act="setgroup" data-u="${u.username}" data-g="${u.group}">分组</button>
+      <button class="sm" data-act="setmethod" data-u="${u.username}" data-m="${u.ss_method}">SS方法</button>
+      <button class="sm" data-act="setnote" data-u="${u.username}" data-n="${u.note || ""}">备注</button>
+      <button class="sm" data-act="${u.enabled ? "disable" : "enable"}" data-u="${u.username}">${u.enabled ? "停用" : "启用"}</button>
+      <button class="sm danger" data-act="remove" data-u="${u.username}">删除</button></div></td></tr>`).join("");
   const ups = (await api("/api/upstreams")).upstreams;
   window._ups = ups;
   $("upstreams-table").innerHTML = "<tr><th>名称</th><th>分组</th><th>协议</th><th>地址</th><th>启用</th><th>操作</th></tr>" +
-    ups.map(u => `<tr><td>${u.name}</td><td>${u.group}</td><td>${u.protocol}${u.tls ? " +tls" : ""}</td>
-      <td>${u.address}:${u.port}${u.path || ""}</td><td>${u.enabled}</td>
-      <td><button data-edit-up="${u.name}">编辑</button>
-      <button data-act="${u.enabled ? "disable" : "enable"}" data-up="${u.name}">${u.enabled ? "停用" : "启用"}</button>
-      <button data-act="remove" data-up="${u.name}">删除</button></td></tr>`).join("");
+    ups.map(u => `<tr><td><strong>${u.name}</strong>${u.note ? `<br><span class="small">${u.note}</span>` : ""}</td><td>${u.group}</td><td>${u.protocol}${u.tls ? " +tls" : ""}</td>
+      <td><code>${u.address}:${u.port}${u.path || ""}</code></td>
+      <td><span class="badge ${u.enabled ? "on" : "off"}">${u.enabled ? "启用" : "停用"}</span></td>
+      <td><div class="row-actions"><button class="sm" data-edit-up="${u.name}">编辑</button>
+      <button class="sm" data-act="${u.enabled ? "disable" : "enable"}" data-up="${u.name}">${u.enabled ? "停用" : "启用"}</button>
+      <button class="sm danger" data-act="remove" data-up="${u.name}">删除</button></div></td></tr>`).join("");
   const settings = await api("/api/settings");
   document.querySelector("[name=session_ttl_hours]").value = settings.session_ttl_hours;
   const sf = $("form-settings");
@@ -1367,31 +1573,34 @@ async function refresh() {
   $("admin-line").textContent = s.admin_registered
     ? `管理员 Passkey：${s.admin_label || "(无标签)"}，注册于 ${s.admin_created_at || "?"}，累计验签 ${s.admin_sign_count} 次。` : "";
   const sessions = (await api("/api/sessions")).sessions;
+
   const fmtTs = ts => new Date(ts * 1000).toLocaleString();
   $("sessions-table").innerHTML = "<tr><th>标识</th><th>类型</th><th>来源</th><th>创建时间</th><th>到期</th><th></th><th>操作</th></tr>" +
     sessions.map(s => `<tr><td><code>${s.id}</code></td><td>${s.kind}</td><td>${s.label || ""}</td>
-      <td>${fmtTs(s.created_at)}</td><td>${fmtTs(s.expires_at)}</td><td>${s.current ? "当前" : ""}</td>
-      <td><button data-session="${s.id}">撤销</button></td></tr>`).join("");
+      <td>${fmtTs(s.created_at)}</td><td>${fmtTs(s.expires_at)}</td>
+      <td>${s.current ? '<span class="badge cur">当前</span>' : ""}</td>
+      <td><button class="sm danger" data-session="${s.id}">撤销</button></td></tr>`).join("");
   const dbs = (await api("/api/databases")).databases;
   window._dbs = dbs;
   $("databases-table").innerHTML = "<tr><th></th><th>名称</th><th>类型</th><th>目标</th><th>备注</th><th>操作</th></tr>" +
-    dbs.map(d => `<tr><td>${d.active ? "当前" : ""}</td><td>${d.name}</td><td>${d.type}</td>
+    dbs.map(d => `<tr><td>${d.active ? '<span class="badge cur">当前</span>' : ""}</td><td><strong>${d.name}</strong></td><td>${d.type}</td>
       <td><code>${d.target}</code></td><td>${d.note || ""}</td>
-      <td><button data-dbtest="${d.name}">测试</button>
-      <button data-dbedit="${d.name}">编辑</button>
-      ${d.active ? "" : `<button data-dbswitch="${d.name}">切换</button>
-      <button data-dbremove="${d.name}">删除</button>`}</td></tr>`).join("");
+      <td><div class="row-actions"><button class="sm" data-dbtest="${d.name}">测试</button>
+      <button class="sm" data-dbedit="${d.name}">编辑</button>
+      ${d.active ? "" : `<button class="sm" data-dbswitch="${d.name}">切换</button>
+      <button class="sm danger" data-dbremove="${d.name}">删除</button>`}</div></td></tr>`).join("");
   const dbOpts = dbs.map(d => `<option>${d.name}</option>`).join("");
   $("form-migrate").querySelector("[name=from]").innerHTML = dbOpts;
   $("form-migrate").querySelector("[name=to]").innerHTML = dbOpts;
   const routes = (await api("/api/routes")).routes;
   window._routes = routes;
   $("routes-table").innerHTML = "<tr><th>#</th><th>类型</th><th>目标模式</th><th>去向</th><th>限定用户</th><th>启用</th><th>操作</th></tr>" +
-    routes.map(r => `<tr><td>${r.id}</td><td>${r.kind}</td><td>${r.pattern}</td><td>${r.target}</td>
-      <td>${r.username || "*"}</td><td>${r.enabled}</td>
-      <td><button data-edit-route="${r.id}">编辑</button>
-      <button data-act="${r.enabled ? "disable" : "enable"}" data-route="${r.id}">${r.enabled ? "停用" : "启用"}</button>
-      <button data-act="remove" data-route="${r.id}">删除</button></td></tr>`).join("");
+    routes.map(r => `<tr><td>${r.id}</td><td>${r.kind}</td><td><code>${r.pattern}</code></td><td>${r.target}</td>
+      <td>${r.username || "*"}</td>
+      <td><span class="badge ${r.enabled ? "on" : "off"}">${r.enabled ? "启用" : "停用"}</span></td>
+      <td><div class="row-actions"><button class="sm" data-edit-route="${r.id}">编辑</button>
+      <button class="sm" data-act="${r.enabled ? "disable" : "enable"}" data-route="${r.id}">${r.enabled ? "停用" : "启用"}</button>
+      <button class="sm danger" data-act="remove" data-route="${r.id}">删除</button></div></td></tr>`).join("");
 }
 $("btn-register").onclick = async () => { try {
   const opts = await api("/api/register/options", {});
@@ -1506,6 +1715,7 @@ const setField = (form, name, value) => { const el = form.querySelector(`[name=$
 document.addEventListener("click", e => {
   const bu = e.target.closest("button[data-edit-up]");
   if (bu) { const u = (window._ups || []).find(x => x.name === bu.dataset.editUp); if (!u) return;
+    switchView("upstreams");
     const f = $("form-upstream"); editingUp = u.name;
     for (const k of ["name", "address", "port", "group", "path", "uuid", "username",
                      "password", "key_file", "method", "note"])
@@ -1518,6 +1728,7 @@ document.addEventListener("click", e => {
     msg("正在编辑上级 " + u.name + "：密码等字段留空 = 不改动", true); return; }
   const br = e.target.closest("button[data-edit-route]");
   if (br) { const r = (window._routes || []).find(x => x.id === Number(br.dataset.editRoute)); if (!r) return;
+    switchView("routes");
     const f = $("form-route"); editingRoute = r.id;
     setField(f, "kind", r.kind); setField(f, "pattern", r.pattern);
     setField(f, "to", r.target); setField(f, "username", r.username || "");
@@ -1566,6 +1777,17 @@ $("form-settings").onsubmit = async e => { e.preventDefault();
     msg("设置已保存。" + (r.applied ? appliedText(r.applied) : ""), true); refresh(); }
   catch (err) { msg(String(err)); } };
 $("btn-replace").onclick = () => $("btn-register").onclick();
+const VIEW_TITLES = {overview: "概览", users: "网关用户", upstreams: "上级节点",
+  routes: "目标路由", settings: "设置", databases: "数据库", sessions: "登录会话"};
+function switchView(name) {
+  document.querySelectorAll(".view").forEach(v =>
+    v.classList.toggle("active", v.dataset.view === name));
+  document.querySelectorAll("[data-nav]").forEach(b =>
+    b.classList.toggle("active", b.dataset.nav === name));
+  $("view-title").textContent = VIEW_TITLES[name] || name;
+}
+document.querySelectorAll("[data-nav]").forEach(b =>
+  b.addEventListener("click", () => switchView(b.dataset.nav)));
 refresh().catch(e => msg(String(e)));
 </script></body></html>
 """
