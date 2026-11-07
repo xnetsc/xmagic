@@ -283,6 +283,7 @@ def check_auth_data_basics(auth, require_uv=True):
 _lock = threading.Lock()
 _challenges = {}  # token -> (purpose, expires_at)
 _cli_codes = {}   # one-time handoff code -> expires_at
+_cli_replace_tickets = {}  # passkey-replace ticket -> {expires, initiator_hash, done}
 
 
 def new_challenge(purpose: str) -> bytes:
@@ -352,6 +353,61 @@ def cli_exchange(body):
     token = new_session("cli", (body.get("label") or "")[:80] or None)
     return {"token": token,
             "expires_at": int(time.time()) + session_ttl_seconds()}
+
+
+CLI_REPLACE_TTL = 300
+
+
+def cli_replace_ticket(initiator_token):
+    """Issue a one-time ticket authorizing a browser ceremony that
+    replaces the admin passkey on behalf of the calling (CLI) session.
+    The ticket remembers the initiator's session hash so the ceremony
+    can keep exactly that session alive while revoking all others -
+    the same semantics as a console-side replacement, with the CLI
+    session treated as the operator's current one."""
+    ticket = secrets.token_urlsafe(24)
+    initiator_hash = users_mod.token_hash(initiator_token)
+    with _lock:
+        for stale in [t for t, v in _cli_replace_tickets.items()
+                      if v["initiator_hash"] == initiator_hash]:
+            del _cli_replace_tickets[stale]
+        _cli_replace_tickets[ticket] = {
+            "expires": time.time() + CLI_REPLACE_TTL,
+            "initiator_hash": initiator_hash, "done": False}
+    return {"ticket": ticket, "expires_in": CLI_REPLACE_TTL}
+
+
+def _live_replace_ticket(ticket):
+    with _lock:
+        entry = _cli_replace_tickets.get(ticket or "")
+    if entry is None or entry["expires"] < time.time():
+        raise ApiError(400, "replace ticket unknown or expired - "
+                            "start again from the CLI")
+    return entry
+
+
+def cli_replace_status(ticket):
+    return {"done": _live_replace_ticket(ticket)["done"]}
+
+
+def cli_replace_verify(ticket, body):
+    """Complete a CLI-issued passkey replacement: verify the
+    attestation (registration_verify), swap the credential, mint the
+    browser's fresh session and revoke every other session except
+    that one and the initiating CLI session. Returns
+    (result, fresh_browser_token)."""
+    entry = _live_replace_ticket(ticket)
+    if entry["done"]:
+        raise ApiError(400, "this replace ticket was already used")
+    result = registration_verify(body, allow_replace=True)
+    token = new_session("web", body.get("label"))
+    with admin_db() as conn:
+        conn.execute(
+            "DELETE FROM admin_sessions WHERE token_hash NOT IN (?, ?)",
+            (users_mod.token_hash(token), entry["initiator_hash"]))
+    with _lock:
+        entry["done"] = True
+    return result, token
 
 
 def api_list_sessions(current_token):
@@ -969,6 +1025,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/cli-auth":
             self._send_html(CLI_AUTH_HTML)
             return
+        if path == "/cli-replace":
+            self._send_html(CLI_REPLACE_HTML)
+            return
         if path == "/api/status":
             with admin_db() as conn:
                 registered = load_credential(conn) is not None
@@ -1028,6 +1087,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._require_auth()
         if path == "/api/cli-token":
             self._send_json(200, cli_token_request(body))
+            return
+        if path == "/api/cli-replace-ticket":
+            self._send_json(200, cli_replace_ticket(self._session_token()))
+            return
+        if path == "/api/cli-replace-status":
+            self._send_json(200, cli_replace_status(body.get("ticket")))
+            return
+        if path == "/api/cli-replace-options":
+            _live_replace_ticket(body.get("ticket"))
+            self._send_json(200, registration_options(allow_replace=True))
+            return
+        if path == "/api/cli-replace-verify":
+            result, fresh = cli_replace_verify(body.get("ticket"), body)
+            self._send_json(200, result, cookie=self._session_cookie(fresh))
             return
         if path == "/api/logout":
             drop_session(self._session_token())
@@ -1570,6 +1643,76 @@ async function start() {
         await handoff();
       } catch (e) { fail(e); } };
     }
+  } catch (e) { fail(e); }
+}
+start();
+</script></body></html>
+"""
+
+CLI_REPLACE_HTML = r"""<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>xmagic 更换 Passkey</title>
+<style>body{font-family:system-ui,sans-serif;margin:2rem auto;max-width:560px;padding:0 1rem}
+button{padding:.5rem 1rem;cursor:pointer}.err{color:#b00020;white-space:pre-wrap}</style>
+</head><body>
+<h1>更换管理员 Passkey</h1>
+<div id="msg">正在检查…</div>
+<p><button id="btn" style="display:none"></button></p>
+<script>
+const params = new URLSearchParams(location.search);
+const ticket = params.get("ticket");
+const msgEl = document.getElementById("msg"), btn = document.getElementById("btn");
+const b64uToBuf = s => { s = s.replace(/-/g, "+").replace(/_/g, "/");
+  s += "=".repeat((4 - s.length % 4) % 4);
+  const bin = atob(s), buf = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i); return buf.buffer; };
+const bufToB64u = buf => { let bin = ""; const b = new Uint8Array(buf);
+  for (const c of b) bin += String.fromCharCode(c);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); };
+async function api(path, body) {
+  const r = await fetch(path, {method: body === undefined ? "GET" : "POST",
+    headers: {"Content-Type": "application/json"},
+    body: body === undefined ? undefined : JSON.stringify(body)});
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || ("HTTP " + r.status));
+  return data; }
+function fail(e) { msgEl.className = "err"; msgEl.textContent = String(e); }
+async function start() {
+  if (!ticket) {
+    fail("这个页面需要从 xmagic 命令行发起（缺少 ticket 参数）。");
+    return;
+  }
+  try {
+    const st = await api("/api/status");
+    if (!st.registered) {
+      fail("这个节点还没有管理员 Passkey，无法更换。");
+      return;
+    }
+    msgEl.textContent = "更换需要两步：先用当前 Passkey 验证身份，再注册新 Passkey。完成后，除发起更换的命令行会话和本页会话外，其余登录会话都会被撤销。";
+    btn.style.display = "";
+    btn.textContent = "开始更换 Passkey";
+    btn.onclick = async () => { try {
+      const lopts = await api("/api/login/options", {});
+      lopts.challenge = b64uToBuf(lopts.challenge);
+      lopts.allowCredentials = lopts.allowCredentials.map(c => ({...c, id: b64uToBuf(c.id)}));
+      const assertion = await navigator.credentials.get({publicKey: lopts});
+      await api("/api/login/verify", {id: assertion.id,
+        response: {authenticatorData: bufToB64u(assertion.response.authenticatorData),
+                   clientDataJSON: bufToB64u(assertion.response.clientDataJSON),
+                   signature: bufToB64u(assertion.response.signature),
+                   userHandle: assertion.response.userHandle ? bufToB64u(assertion.response.userHandle) : null}});
+      msgEl.textContent = "身份已验证，请注册新 Passkey…";
+      const opts = await api("/api/cli-replace-options", {ticket});
+      opts.challenge = b64uToBuf(opts.challenge); opts.user.id = b64uToBuf(opts.user.id);
+      const cred = await navigator.credentials.create({publicKey: opts});
+      await api("/api/cli-replace-verify", {ticket, id: cred.id,
+        response: {attestationObject: bufToB64u(cred.response.attestationObject),
+                   clientDataJSON: bufToB64u(cred.response.clientDataJSON)},
+        label: "cli-replace " + navigator.userAgent.slice(0, 60)});
+      btn.style.display = "none";
+      msgEl.textContent = "Passkey 已更换。今后请用新 Passkey 登录；可以关闭此页，回到命令行。";
+    } catch (e) { fail(e); } };
   } catch (e) { fail(e); }
 }
 start();

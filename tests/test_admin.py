@@ -481,6 +481,80 @@ def main():
               and 'id="btn-copy-install"' in page
               and 'id="cli-onboard"' in page, f"status {resp.status}")
 
+        # --- CLI-issued passkey replacement (ticket flow): the ticket
+        # is issued by one session, the ceremony runs in a browser, and
+        # exactly those two sessions survive the credential swap
+        anon2 = Client()
+        status, _ = anon2.call("POST", "/api/cli-replace-ticket", {})
+        check("replace ticket requires auth", status == 401, f"got {status}")
+        other = Client()
+        status, opts = other.call("POST", "/api/login/options", {})
+        status, _ = other.call("POST", "/api/login/verify",
+                               auth.assertion(opts["challenge"], "localhost"))
+        check("second web session established", status == 200, f"{status}")
+        status, body = client.call("POST", "/api/cli-token",
+                                   {"callback": "http://127.0.0.1:9999/callback",
+                                    "state": "s2"})
+        code2 = body["redirect"].split("code=")[1].split("&")[0]
+        status, body = anon2.call("POST", "/api/cli-exchange", {"code": code2})
+        initiator = Client()
+        initiator.cookie = f"xmagic_session={body.get('token')}"
+        status, body = initiator.call("POST", "/api/cli-replace-ticket", {})
+        ticket = body.get("ticket")
+        check("CLI session can issue a replace ticket",
+              status == 200 and bool(ticket), f"{status} {body}")
+        status, body = initiator.call("POST", "/api/cli-replace-status",
+                                      {"ticket": ticket})
+        check("ticket starts not-done",
+              status == 200 and body["done"] is False, f"{status} {body}")
+        status, _ = client.call("POST", "/api/cli-replace-options",
+                                {"ticket": "bogus"})
+        check("replace options reject a bogus ticket", status == 400,
+              f"got {status}")
+        conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=10)
+        conn.request("GET", "/cli-replace?ticket=x")
+        resp = conn.getresponse()
+        page = resp.read().decode("utf-8", "replace")
+        conn.close()
+        check("replace ceremony page is served",
+              resp.status == 200 and "更换管理员 Passkey" in page,
+              f"status {resp.status}")
+        auth_new = Authenticator()
+        status, opts = client.call("POST", "/api/cli-replace-options",
+                                   {"ticket": ticket})
+        check("replace options issued", status == 200 and "challenge" in opts,
+              f"{status}")
+        status, body = client.call(
+            "POST", "/api/cli-replace-verify",
+            dict(auth_new.attestation(opts["challenge"], "localhost"),
+                 ticket=ticket))
+        check("CLI-ticket passkey replacement succeeds",
+              status == 200, f"{status} {body}")
+        status, body = initiator.call("POST", "/api/cli-replace-status",
+                                      {"ticket": ticket})
+        check("ticket reports done after the ceremony",
+              status == 200 and body["done"] is True, f"{status} {body}")
+        status, _ = initiator.call("GET", "/api/users")
+        check("initiating CLI session survives replacement",
+              status == 200, f"got {status}")
+        status, _ = other.call("GET", "/api/users")
+        check("unrelated web session is revoked by replacement",
+              status == 401, f"got {status}")
+        status, _ = client.call("GET", "/api/users")
+        check("performing browser session survives (fresh cookie)",
+              status == 200, f"got {status}")
+        status, opts = client.call("POST", "/api/login/options", {})
+        status, _ = client.call("POST", "/api/login/verify",
+                                auth.assertion(opts["challenge"], "localhost"))
+        check("old passkey dead after CLI-ticket replacement",
+              status in (400, 401), f"got {status}")
+        status, opts = client.call("POST", "/api/login/options", {})
+        status, _ = client.call("POST", "/api/login/verify",
+                                auth_new.assertion(opts["challenge"],
+                                                   "localhost"))
+        check("new passkey logs in after CLI-ticket replacement",
+              status == 200, f"got {status}")
+
         # --- admin passkey replacement while authenticated ---
         old_cookie = client.cookie
         auth2 = Authenticator()

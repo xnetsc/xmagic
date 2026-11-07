@@ -252,6 +252,36 @@ def cmd_login(args):
     print(f"logged in to {name or url}; session saved to {path} (expires {when})")
 
 
+def cmd_passkey_replace(args):
+    """Replace the node's admin passkey. The CLI cannot run a WebAuthn
+    ceremony itself, so it asks the node for a one-time ticket, opens
+    the browser at the node's /cli-replace page (fresh login with the
+    current passkey, then registration of the new one) and polls the
+    ticket status. On success every session except this CLI session
+    and the browser's fresh one has been revoked server-side."""
+    api, name, url = authed_api(args)
+    issued = api.call("POST", "/api/cli-replace-ticket", {})
+    replace_url = url + "/cli-replace?" + urllib.parse.urlencode(
+        {"ticket": issued["ticket"]})
+    opened = False
+    if not args.no_browser:
+        opened = webbrowser.open(replace_url)
+    if not opened:
+        print(f"在浏览器打开这个地址更换 Passkey：\n{replace_url}", flush=True)
+    print("等待浏览器完成 Passkey 更换（5 分钟超时）…", file=sys.stderr,
+          flush=True)
+    deadline = time.time() + issued.get("expires_in", 300) + 30
+    while time.time() < deadline:
+        status = api.call("POST", "/api/cli-replace-status",
+                          {"ticket": issued["ticket"]})
+        if status.get("done"):
+            print(f"passkey on {name or url} replaced; all other sessions "
+                  "were revoked (this CLI session was kept)")
+            return
+        time.sleep(2)
+    die(EXIT_AUTH, "timed out waiting for the browser passkey replacement")
+
+
 def cmd_logout(args):
     cfg, _ = load_config(args)
     name, url = resolve_node(args, cfg)
@@ -647,6 +677,14 @@ def main():
                    help="print the login URL instead of opening a browser")
     a.set_defaults(fn=cmd_login)
     sub.add_parser("logout", parents=C).set_defaults(fn=cmd_logout)
+
+    pk = sub.add_parser("passkey", parents=C, help="admin passkey")
+    pksub = pk.add_subparsers(dest="passkey_cmd", required=True)
+    a = pksub.add_parser("replace", parents=C,
+                         help="replace the admin passkey via a browser ceremony")
+    a.add_argument("--no-browser", action="store_true",
+                   help="print the replace URL instead of opening a browser")
+    a.set_defaults(fn=cmd_passkey_replace)
 
     n = sub.add_parser("node", parents=C, help="manage the local node registry")
     nsub = n.add_subparsers(dest="node_cmd", required=True)

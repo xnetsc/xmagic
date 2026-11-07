@@ -161,6 +161,7 @@ python3 xmagic.py node add tokyo --url http://<node-address>:8080   # console an
 python3 xmagic.py login            # opens the browser for Passkey; the session is stored locally
 python3 xmagic.py users add alice
 python3 xmagic.py --node tokyo routes add --kind ip --pattern 1.1.1.1 --to intl
+python3 xmagic.py passkey replace  # opens the browser: verify with the current passkey, register the new one; this CLI session is kept, all others are revoked
 python3 xmagic.py sessions list    # all sign-in sessions on this node
 python3 xmagic.py sessions revoke <id>
 python3 xmagic.py upstreams edit b1 --port 8443      # same API as the web editor

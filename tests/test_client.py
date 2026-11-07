@@ -130,6 +130,48 @@ def drive_login(cli_home, port, auth, extra_args=()):
     return proc.returncode, out, err
 
 
+def drive_replace(cli_home, port, current_auth, new_auth):
+    """Run `xmagic passkey replace --no-browser`, play the browser
+    (fresh login with the current passkey, then register the new one
+    under the CLI-issued ticket), return the proc result."""
+    env = dict(os.environ, XMAGIC_HOME=cli_home)
+    proc = subprocess.Popen(
+        [sys.executable, os.path.join(ROOT, "xmagic.py"), "passkey",
+         "replace", "--no-browser"],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    url = None
+    while True:
+        line = proc.stdout.readline()
+        if not line:
+            break
+        if line.startswith("http"):
+            url = line.strip()
+            break
+    if url is None:
+        out, err = proc.communicate()
+        raise RuntimeError(f"replace printed no URL: {out} {err}")
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+    ticket = query["ticket"][0]
+    browser = Browser(port)
+    status, _ = browser.call("GET", f"/cli-replace?ticket={ticket}")
+    assert status == 200, status
+    origin = f"http://localhost:{port}"
+    _, opts = browser.call("POST", "/api/login/options", {})
+    status, body = browser.call(
+        "POST", "/api/login/verify",
+        current_auth.assertion(opts["challenge"], "localhost", origin))
+    assert status == 200, body
+    _, opts = browser.call("POST", "/api/cli-replace-options",
+                           {"ticket": ticket})
+    status, body = browser.call(
+        "POST", "/api/cli-replace-verify",
+        dict(new_auth.attestation(opts["challenge"], "localhost", origin),
+             ticket=ticket))
+    assert status == 200, body
+    out, err = proc.communicate(timeout=30)
+    return proc.returncode, out, err
+
+
 def main():
     workdir = tempfile.mkdtemp(prefix="xmagic-client-test-")
     cli_home = os.path.join(workdir, "home")
@@ -424,6 +466,33 @@ def main():
         # on purpose (that is the behaviour under test).
         rc, out, err = drive_login(cli_home, PORT_A, auth_a)
         check("re-login to A for the db block", rc == 0, err)
+
+        # ---- passkey replacement initiated from the CLI: the ticket
+        # ceremony swaps the credential, keeps this CLI session, and
+        # the old key dies while the new one works.
+        auth_a2 = Authenticator()
+        rc, out, err = drive_replace(cli_home, PORT_A, auth_a, auth_a2)
+        check("passkey replace via CLI + browser ceremony",
+              rc == 0 and "replaced" in out, err + out)
+        rc, out, _ = cli("--json", "users", "list")
+        check("initiating CLI session survives the replacement",
+              rc == 0 and [u["username"] for u in json.loads(out)["users"]]
+              == ["alice"], out)
+        probe = Browser(PORT_A)
+        _, opts = probe.call("POST", "/api/login/options", {})
+        status, _ = probe.call(
+            "POST", "/api/login/verify",
+            auth_a.assertion(opts["challenge"], "localhost",
+                             f"http://localhost:{PORT_A}"))
+        check("old passkey rejected after CLI replacement",
+              status in (400, 401), f"got {status}")
+        _, opts = probe.call("POST", "/api/login/options", {})
+        status, _ = probe.call(
+            "POST", "/api/login/verify",
+            auth_a2.assertion(opts["challenge"], "localhost",
+                              f"http://localhost:{PORT_A}"))
+        check("new passkey logs in after CLI replacement",
+              status == 200, f"got {status}")
         rc, out, err = cli("--json", "db", "list")
         dbs = json.loads(out)["databases"]
         check("remote db list shows the implicit default, active",

@@ -130,6 +130,7 @@ python3 xmagic.py node add tokyo --url http://<节点地址>:8080   # 后台与�
 python3 xmagic.py login            # 自动拉起浏览器走 Passkey，登录态存回本地
 python3 xmagic.py users add alice
 python3 xmagic.py --node tokyo routes add --kind ip --pattern 1.1.1.1 --to intl
+python3 xmagic.py passkey replace  # 拉起浏览器：先用当前 Passkey 验证，再注册新 Passkey；保留本 CLI 会话，其余会话全部撤销
 python3 xmagic.py sessions list    # 看这个节点上的全部登录会话
 python3 xmagic.py sessions revoke <id>
 python3 xmagic.py upstreams edit b1 --port 8443      # 与 Web 编辑同一接口
