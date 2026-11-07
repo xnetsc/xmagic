@@ -71,6 +71,15 @@ def main():
           all(i["tag"] != "vless-ws-0" for i in vcfg["inbounds"])
           and vcfg["inbounds"][0]["settings"]["clients"] == [],
           json.dumps([i["tag"] for i in vcfg["inbounds"]]))
+    rc, out, err = cli("upstream-add", "upv", "--proto", "vless-ws",
+                       "--addr", "10.0.0.9", "--port", "443",
+                       "--uuid", "11111111-2222-3333-4444-555555555555")
+    check("vless upstream refused while the protocol is off",
+          rc != 0, out + err)
+    rc, out, err = cli("upstream-add", "upb", "--proto", "ss",
+                       "--addr", "10.0.0.9", "--port", "8388",
+                       "--password", "pw", "--method", "aes-999-bogus")
+    check("bogus ss method refused at add time", rc != 0, out + err)
     rc, out, _ = cli("settings", "--vless", "on")
     check("settings --vless on (VLESS is opt-in)",
           rc == 0 and "vless_enabled: True" in out, out)

@@ -207,6 +207,20 @@ def main():
         check("second registration refused for strangers", status == 403,
               f"got {status}")
 
+        status, body = client.call("POST", "/api/upstreams",
+                                   {"name": "upv", "protocol": "vless-ws",
+                                    "address": "10.0.0.9", "port": 443,
+                                    "uuid": "11111111-2222-3333-4444-"
+                                            "555555555555"})
+        check("vless upstream refused while the protocol is off",
+              status == 400, f"{status} {body}")
+        status, body = client.call("POST", "/api/upstreams",
+                                   {"name": "upb", "protocol": "ss",
+                                    "address": "10.0.0.9", "port": 8388,
+                                    "password": "pw",
+                                    "method": "aes-999-bogus"})
+        check("bogus ss method refused by the API",
+              status == 400, f"{status} {body}")
         status, body = client.call("POST", "/api/settings",
                                    {"vless_enabled": True})
         check("settings: vless opt-in (render checks below need it)",
@@ -610,6 +624,8 @@ def main():
               and 'name="vless_enabled"' in page
               and "组内互访端口" in page
               and "公网 SOCKS5 默认关闭" in page
+              and '<select name="method"' in page
+              and "buildUpProtoOptions" in page
               and "（未启用）" in page,
               f"status {resp.status}")
 

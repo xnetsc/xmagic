@@ -409,6 +409,12 @@ def main():
         check("cleanup: key-test users + upstream removed again",
               rc == 0, err + out)
 
+        rc, out, err = cli("upstreams", "add", "upbad", "--proto", "ss",
+                           "--addr", "10.0.0.9", "--port", "8388",
+                           "--password", "pw", "--method", "aes-999-bogus")
+        check("remote CLI: bogus ss method refused by the node",
+              rc == 1, err + out)
+
         # ---- self-update: a copied CLI updates itself from a local
         # server (never the repo file itself)
         upd_dir = os.path.join(workdir, "upd")

@@ -1156,6 +1156,15 @@ def _read_key_content_arg(args):
     return content
 
 
+def validate_ss_method(method):
+    """Reject SS methods xray does not know - a typo'd free-text method
+    otherwise lands in the database and only fails at render time."""
+    if method and method not in SS_METHODS:
+        raise ValueError(
+            f"ss method must be one of {', '.join(SS_METHODS)};"
+            f" got {method!r}")
+
+
 def cmd_upstream_add(args):
     key_content = _read_key_content_arg(args)
     if getattr(args, "key_generate", False):
@@ -1175,6 +1184,13 @@ def cmd_upstream_add(args):
                  " stored on the node)")
     key_file = managed_key_path(args.name) if key_content is not None else args.key_file
     with db() as conn:
+        if args.proto in ("vless-ws", "vless") and not vless_enabled(conn):
+            sys.exit("vless upstreams are disabled together with the vless"
+                     " protocol (run: users.py settings --vless on)")
+        try:
+            validate_ss_method(args.method)
+        except ValueError as exc:
+            sys.exit(str(exc))
         try:
             conn.execute(
                 "INSERT INTO upstreams (name, grp, address, port, protocol, path, uuid,"
@@ -1251,6 +1267,11 @@ def update_upstream(conn, name, changes):
     empty string is a real value (clears path/username/etc.).
     `key_content` is not a column: it stores a private key on the node
     and points key_file at the stored copy (/keys/<name>.key)."""
+    validate_ss_method(changes.get("method"))
+    if (changes.get("protocol") in ("vless-ws", "vless")
+            and not vless_enabled(conn)):
+        raise ValueError("vless upstreams are disabled together with the"
+                         " vless protocol (enable vless first)")
     row = get_upstream(conn, name)
     merged = {k: row[k] for k in row.keys()}
     applied = {}

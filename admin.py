@@ -705,6 +705,8 @@ def api_generate_keypair(body):
 
 def api_add_upstream(body):
     proto = body.get("protocol")
+    if body.get("method") and body["method"] not in users_mod.SS_METHODS:
+        raise ApiError(400, f"method must be one of {users_mod.SS_METHODS}")
     if proto in ("vless-ws", "vless") and not body.get("uuid"):
         raise ApiError(400, f"{proto} upstream needs a uuid")
     if proto in ("trojan-ws", "ss") and not body.get("password"):
@@ -728,6 +730,9 @@ def api_add_upstream(body):
                 if key_content else body.get("key_file"))
     from datetime import datetime, timezone
     with users_mod.db() as conn:
+        if proto in ("vless-ws", "vless") and not users_mod.vless_enabled(conn):
+            raise ApiError(400, "vless upstreams are disabled together with"
+                                " the vless protocol (enable vless first)")
         try:
             conn.execute(
                 "INSERT INTO upstreams (name, grp, address, port, protocol, path, uuid,"
@@ -1444,21 +1449,25 @@ td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
               <div class="wide"><label>地址</label><input name="address" placeholder="主机名或 IP" required></div>
               <div><label>端口</label><input name="port" placeholder="端口" type="number" required></div>
               <div><label>分组</label><input name="group" placeholder="分组"></div>
-              <div><label>WS 路径</label><input name="path" placeholder="/path"></div>
-              <div class="wide"><label>UUID</label><input name="uuid" placeholder="VLESS / Trojan UUID"></div>
-              <div><label>用户名</label><input name="username" placeholder="用户名"></div>
-              <div><label>密码</label><input name="password" placeholder="密码"></div>
-              <div class="wide"><label>SSH 私钥（粘贴内容或选文件上传，存于节点、不回显）</label>
+              <div data-proto="vless-ws trojan-ws"><label>WS 路径</label><input name="path" placeholder="/path"></div>
+              <div class="wide" data-proto="vless-ws vless"><label>UUID</label><input name="uuid" placeholder="VLESS UUID"></div>
+              <div data-proto="http socks ssh"><label>用户名</label><input name="username" placeholder="用户名"></div>
+              <div data-proto="trojan-ws ss http socks"><label>密码</label><input name="password" placeholder="密码"></div>
+              <div class="wide" data-proto="ssh"><label>SSH 私钥（粘贴内容或选文件上传，存于节点、不回显）</label>
                 <div class="keyrow"><textarea name="key_content" rows="3" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea>
                 <button type="button" class="btn ghost sm" id="btn-pick-privkey">选文件</button>
                 <button type="button" class="btn ghost sm" id="btn-gen-upkey">生成密钥对</button>
                 <input type="file" id="pick-privkey" class="hidden"></div></div>
-              <div><label>或：节点上的密钥路径</label><input name="key_file" placeholder="/keys/id_ed25519"></div>
-              <div><label>SS 方法</label><input name="method" placeholder="SS method"></div>
+              <div data-proto="ssh"><label>或：节点上的密钥路径</label><input name="key_file" placeholder="/keys/id_ed25519"></div>
+              <div data-proto="ss"><label>SS 方法</label><select name="method">
+                <option>aes-256-gcm</option><option>aes-128-gcm</option>
+                <option>chacha20-ietf-poly1305</option><option>2022-blake3-aes-128-gcm</option>
+                <option>2022-blake3-aes-256-gcm</option><option>2022-blake3-chacha20-poly1305</option>
+              </select></div>
               <div><label>备注</label><input name="note" placeholder="可选"></div>
             </div>
             <div class="form-actions">
-              <span class="check"><input type="checkbox" name="tls" id="up-tls"><label for="up-tls">TLS</label></span>
+              <span class="check" data-proto="vless-ws vless trojan-ws"><input type="checkbox" name="tls" id="up-tls"><label for="up-tls">TLS</label></span>
               <button id="up-submit" class="primary">添加上级</button>
               <button type="button" id="up-cancel" class="hidden">取消编辑</button>
             </div>
@@ -1499,7 +1508,7 @@ td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
                 <input name="session_ttl_hours" type="number" min="1" max="2160"></div>
               <div><label>上级池策略</label><select name="upstream_strategy"></select></div>
               <div><label>新用户默认 SS 方法</label><select name="ss_method"></select></div>
-              <div class="wide"><label>VLESS WS 路径（逗号分隔）</label><input name="vless_ws_paths"></div>
+              <div class="wide" id="row-vless-paths"><label>VLESS WS 路径（逗号分隔）</label><input name="vless_ws_paths"></div>
               <div class="wide"><label>Trojan WS 路径（逗号分隔）</label><input name="trojan_ws_paths"></div>
               <div class="wide"><label>关闭组内互访的分组（逗号分隔，空 = 全部组互访）</label><input name="interconnect_off_groups" placeholder="例如 team"></div>
             </div>
@@ -1663,6 +1672,8 @@ async function refresh() {
     !!settings.direct_allow_private;
   sf.querySelector("[name=vless_enabled]").checked =
     !!settings.vless_enabled;
+  window.__vlessOn = !!settings.vless_enabled;
+  buildUpProtoOptions(); syncUpProto(); syncVlessPaths();
   sf.querySelector("[name=interconnect_off_groups]").value =
     settings.db_values.interconnect_off_groups || "";
   $("admin-line").textContent = s.admin_registered
@@ -1852,7 +1863,9 @@ document.addEventListener("click", e => {
     for (const k of ["name", "address", "port", "group", "path", "uuid", "username",
                      "password", "key_file", "method", "note"])
       setField(f, k, k === "group" ? u.group : u[k]);
+    buildUpProtoOptions(u.protocol);
     f.querySelector("[name=protocol]").value = u.protocol;
+    syncUpProto();
     f.querySelector("[name=tls]").checked = !!u.tls;
     f.querySelector("[name=name]").disabled = true;
     $("up-submit").textContent = "保存修改：" + u.name;
@@ -1870,10 +1883,35 @@ document.addEventListener("click", e => {
     msg("正在编辑路由 #" + r.id, true); }
 });
 $("up-cancel").onclick = () => { editingUp = null; const f = $("form-upstream");
-  f.reset(); f.querySelector("[name=name]").disabled = false;
+  f.reset(); buildUpProtoOptions(); syncUpProto();
+  f.querySelector("[name=name]").disabled = false;
   $("up-submit").textContent = "添加上级"; $("up-cancel").classList.add("hidden"); };
 $("route-cancel").onclick = () => { editingRoute = null; $("form-route").reset();
   $("route-submit").textContent = "添加路由"; $("route-cancel").classList.add("hidden"); };
+const UP_PROTOS = ["vless-ws", "vless", "trojan-ws", "ss", "http", "socks", "ssh"];
+function buildUpProtoOptions(keep) {
+  const sel = $("form-upstream").querySelector("[name=protocol]");
+  const cur = keep || sel.value;
+  const list = UP_PROTOS.filter(p =>
+    window.__vlessOn || (p !== "vless-ws" && p !== "vless") || p === keep);
+  sel.innerHTML = list.map(p => `<option>${p}</option>`).join("");
+  sel.value = list.includes(cur) ? cur : list[0];
+}
+function syncUpProto() {
+  const f = $("form-upstream");
+  const p = f.querySelector("[name=protocol]").value;
+  f.querySelectorAll("[data-proto]").forEach(d => {
+    d.style.display = d.dataset.proto.split(" ").includes(p) ? "" : "none";
+  });
+}
+$("form-upstream").querySelector("[name=protocol]")
+  .addEventListener("change", syncUpProto);
+function syncVlessPaths() {
+  const on = $("form-settings").querySelector("[name=vless_enabled]").checked;
+  $("row-vless-paths").style.display = on ? "" : "none";
+}
+$("form-settings").querySelector("[name=vless_enabled]")
+  .addEventListener("change", syncVlessPaths);
 $("form-upstream").onsubmit = async e => { e.preventDefault();
   try { if (editingUp) {
       const o = formJson(e.target); delete o.name;
@@ -1884,7 +1922,7 @@ $("form-upstream").onsubmit = async e => { e.preventDefault();
       msg("上级已修改。" + appliedText(r.applied), true); $("up-cancel").onclick();
     } else {
       const r = await api("/api/upstreams", formJson(e.target));
-      msg("上级已添加。" + appliedText(r.applied), true); e.target.reset(); }
+      msg("上级已添加。" + appliedText(r.applied), true); e.target.reset(); syncUpProto(); }
     refresh(); }
   catch (err) { msg(String(err)); } };
 $("form-route").onsubmit = async e => { e.preventDefault();
