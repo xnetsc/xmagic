@@ -90,7 +90,7 @@ and upstream records to keep them distinct upstream.
   deliberate. While signed in, you can also **replace the Passkey**
   (Settings): the moment the replacement completes, every other
   session is revoked and this page continues on the new session.
-- **Scope is all business data, not just creation**: gateway users
+- **Scope is all business data, not just creation**: proxy users
   (change password, rotate UUID, SSH key / group / SS method / note,
   enable/disable, delete), upstreams (every field editable in place),
   destination routes (editable), settings and sign-in sessions - in

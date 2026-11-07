@@ -1295,10 +1295,10 @@ td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
 <div class="shell">
   <aside class="sidebar">
     <div class="brand">x<span>magic</span></div>
-    <div class="brand-sub">网关管理后台</div>
+    <div class="brand-sub">代理管理后台</div>
     <nav class="nav">
       <button data-nav="overview" class="active"><span class="dot"></span>概览</button>
-      <button data-nav="users"><span class="dot"></span>网关用户</button>
+      <button data-nav="users"><span class="dot"></span>代理用户</button>
       <button data-nav="upstreams"><span class="dot"></span>上级节点</button>
       <button data-nav="routes"><span class="dot"></span>目标路由</button>
       <button data-nav="settings"><span class="dot"></span>设置</button>
@@ -1340,7 +1340,7 @@ td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
 
       <section class="view" data-view="users">
         <div class="card">
-          <h2>网关用户</h2>
+          <h2>代理用户</h2>
           <p class="sub">每个用户有一套 VLESS / Trojan / HTTP / SOCKS 凭证与独立的 Shadowsocks 密码，可选登记 SSH 公钥。</p>
           <div class="tbl-wrap"><table id="users-table"></table></div>
           <form id="form-user">
@@ -1672,7 +1672,7 @@ document.addEventListener("click", async e => {
       if (n !== null) body.note = n;
       const r = await api(`/api/databases/${t.dataset.dbedit}/edit`, body);
       msg(`配置 ${r.database.name} 已更新`, true); refresh(); }
-    else if (t.dataset.dbswitch) { if (!confirm(`切换到数据库 ${t.dataset.dbswitch}？网关将改用该库的数据并立即重新渲染。`)) return;
+    else if (t.dataset.dbswitch) { if (!confirm(`切换到数据库 ${t.dataset.dbswitch}？将改用该库的数据并立即重新渲染。`)) return;
       const r = await api(`/api/databases/${t.dataset.dbswitch}/switch`, {});
       msg(`已切换到 ${r.database.name}。` + appliedText(r.applied), true); refresh(); }
     else if (t.dataset.dbremove) { if (!confirm("删除这个数据库配置？只删配置，不会删库里的数据。")) return;
@@ -1777,7 +1777,7 @@ $("form-settings").onsubmit = async e => { e.preventDefault();
     msg("设置已保存。" + (r.applied ? appliedText(r.applied) : ""), true); refresh(); }
   catch (err) { msg(String(err)); } };
 $("btn-replace").onclick = () => $("btn-register").onclick();
-const VIEW_TITLES = {overview: "概览", users: "网关用户", upstreams: "上级节点",
+const VIEW_TITLES = {overview: "概览", users: "代理用户", upstreams: "上级节点",
   routes: "目标路由", settings: "设置", databases: "数据库", sessions: "登录会话"};
 function switchView(name) {
   document.querySelectorAll(".view").forEach(v =>
