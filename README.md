@@ -135,13 +135,13 @@ python3 xmagic.py settings set --upstream-strategy random --ss-method chacha20-i
 - 退出码约定：0 成功、1 接口错误、2 配置/用法错误、3 未登录或会话过期，
   脚本可据此决定是否重跑 `login`。
 
-## WS 多路径（防单路径特征）
+## WS 多路径
 
 Xray 的 fallback 路径是**精确匹配，不支持通配符/正则**。等效做法：一份路径列表，
 每条路径一个回落条目 + 一个后端入站（共用同一用户表），全部同时生效：
 
 ```bash
-python3 users.py gen-paths 8         # 生成随机伪装路径，如 /assets/x3kf9a
+python3 users.py gen-paths 8         # 生成随机路径，如 /assets/x3kf9a
 # 路径填进设置即可（Web 后台「设置」或 users.py settings --vless-ws-paths ...，
 # 立即渲染生效）；只在部署期定死时才写 .env 的 VLESS_WS_PATHS / TROJAN_WS_PATHS
 ```
