@@ -903,6 +903,11 @@ def cmd_init(_):
             os.chmod(cfg["target"], 0o600)
         except OSError:
             pass
+    if JSON_OUT:
+        print(json.dumps({"database": cfg["name"], "type": cfg["type"],
+                          "target": mask_target(cfg["type"], cfg["target"])},
+                         indent=2))
+        return
     print(f"initialized {cfg['name']} "
           f"({cfg['type']}: {mask_target(cfg['type'], cfg['target'])})")
 
@@ -927,11 +932,11 @@ def cmd_add(args):
         except IntegrityError:
             sys.exit(f"user already exists: {args.user}")
     if JSON_OUT:
-        print(json.dumps({"username": args.user, "vless_uuid": user_uuid,
-                          "password": trojan_pw, "ss_method": method,
-                          "ss_password": ss_pw, "group": args.group,
-                          "ssh_key": bool(pubkey)}, indent=2))
+        with db() as conn:
+            print(json.dumps(_user_record(get_user(conn, args.user)),
+                             indent=2))
         return
+
     print(f"user:            {args.user}")
     print(f"vless uuid:      {user_uuid}")
     print(f"password (trojan/http/socks): {trojan_pw}")
@@ -947,9 +952,11 @@ def cmd_passwd(args):
         conn.execute("UPDATE users SET trojan_password = ?, ss_password = ? WHERE username = ?",
                      (trojan_pw, ss_pw, args.user))
     if JSON_OUT:
-        print(json.dumps({"username": args.user, "password": trojan_pw,
-                          "ss_password": ss_pw}, indent=2))
+        with db() as conn:
+            print(json.dumps(_user_record(get_user(conn, args.user)),
+                             indent=2))
         return
+
     print(f"password (trojan/http/socks): {trojan_pw}")
     print(f"ss password:     {ss_pw}")
     print("run: users.py render")
@@ -966,6 +973,11 @@ def cmd_setkey(args):
     with db() as conn:
         get_user(conn, args.user)
         conn.execute("UPDATE users SET ssh_pubkey = ? WHERE username = ?", (pubkey, args.user))
+    if JSON_OUT:
+        with db() as conn:
+            print(json.dumps(_user_record(get_user(conn, args.user)),
+                             indent=2))
+        return
     print(f"ssh key {'cleared for' if pubkey is None else 'updated for'} {args.user}")
 
 
@@ -976,8 +988,11 @@ def cmd_rotate_uuid(args):
         conn.execute("UPDATE users SET vless_uuid = ? WHERE username = ?",
                      (new_uuid, args.user))
     if JSON_OUT:
-        print(json.dumps({"username": args.user, "vless_uuid": new_uuid}, indent=2))
+        with db() as conn:
+            print(json.dumps(_user_record(get_user(conn, args.user)),
+                             indent=2))
         return
+
     print(f"vless uuid:      {new_uuid}")
     print("run: users.py render")
 
@@ -989,6 +1004,11 @@ def cmd_setmethod(args):
         get_user(conn, args.user)
         conn.execute("UPDATE users SET ss_method = ? WHERE username = ?",
                      (args.method, args.user))
+    if JSON_OUT:
+        with db() as conn:
+            print(json.dumps(_user_record(get_user(conn, args.user)),
+                             indent=2))
+        return
     print(f"{args.user}: ss method = {args.method}; run: users.py render")
 
 
@@ -997,6 +1017,11 @@ def cmd_setnote(args):
         get_user(conn, args.user)
         conn.execute("UPDATE users SET note = ? WHERE username = ?",
                      (args.note or None, args.user))
+    if JSON_OUT:
+        with db() as conn:
+            print(json.dumps(_user_record(get_user(conn, args.user)),
+                             indent=2))
+        return
     print(f"{args.user}: note updated; run: users.py render")
 
 
@@ -1004,6 +1029,11 @@ def cmd_flag(args, value):
     with db() as conn:
         get_user(conn, args.user)
         conn.execute("UPDATE users SET enabled = ? WHERE username = ?", (value, args.user))
+    if JSON_OUT:
+        with db() as conn:
+            print(json.dumps(_user_record(get_user(conn, args.user)),
+                             indent=2))
+        return
     print(f"{args.user}: enabled = {bool(value)}; run: users.py render")
 
 
@@ -1011,18 +1041,18 @@ def cmd_remove(args):
     with db() as conn:
         get_user(conn, args.user)
         conn.execute("DELETE FROM users WHERE username = ?", (args.user,))
+    if JSON_OUT:
+        print(json.dumps({"removed": args.user}, indent=2))
+        return
     print(f"removed {args.user}; run: users.py render")
 
 
 def cmd_list(_):
     with db() as conn:
         rows = conn.execute("SELECT * FROM users ORDER BY username").fetchall()
+        members = interconnect_members(conn)
     if JSON_OUT:
-        print(json.dumps([{"username": r["username"], "enabled": bool(r["enabled"]),
-                           "group": r["upstream_group"], "ssh_key": bool(r["ssh_pubkey"]),
-                           "ssh_pubkey": r["ssh_pubkey"],
-                           "ssh_fingerprint": _fingerprint_or_none(r["ssh_pubkey"]),
-                           "created_at": r["created_at"]} for r in rows], indent=2))
+        print(json.dumps([_user_record(r, members) for r in rows], indent=2))
         return
     if not rows:
         print("(no users)")
@@ -1037,6 +1067,11 @@ def cmd_setgroup(args):
         get_user(conn, args.user)
         conn.execute("UPDATE users SET upstream_group = ? WHERE username = ?",
                      (args.group, args.user))
+    if JSON_OUT:
+        with db() as conn:
+            print(json.dumps(_user_record(get_user(conn, args.user)),
+                             indent=2))
+        return
     print(f"{args.user}: upstream_group = {args.group}; run: users.py render")
 
 
@@ -1200,6 +1235,12 @@ def cmd_upstream_flag(args, value):
     with db() as conn:
         get_upstream(conn, args.name)
         conn.execute("UPDATE upstreams SET enabled = ? WHERE name = ?", (value, args.name))
+    if JSON_OUT:
+        with db() as conn:
+            row = get_upstream(conn, args.name)
+        print(json.dumps({k: row[k] for k in row.keys()},
+                         indent=2, default=str))
+        return
     print(f"upstream {args.name}: enabled = {bool(value)}; run: users.py render")
 
 
@@ -1208,6 +1249,9 @@ def cmd_upstream_remove(args):
         row = get_upstream(conn, args.name)
         conn.execute("DELETE FROM upstreams WHERE name = ?", (args.name,))
     delete_managed_key(row["key_file"])
+    if JSON_OUT:
+        print(json.dumps({"removed": args.name}, indent=2))
+        return
     print(f"removed upstream {args.name}; run: users.py render")
 
 
@@ -1401,6 +1445,23 @@ def _fingerprint_or_none(line):
         return None
 
 
+def _user_record(r, members=None):
+    """The canonical user record for --json output: identity, credentials
+    and key material in one shape (mirrors the admin API's user dict), so
+    list/add/passwd/rotate and the field setters all emit the same
+    object and automation never has to merge partial outputs."""
+    rec = {"username": r["username"], "enabled": bool(r["enabled"]),
+           "group": r["upstream_group"], "ssh_key": bool(r["ssh_pubkey"]),
+           "ssh_fingerprint": _fingerprint_or_none(r["ssh_pubkey"]),
+           "note": r["note"], "created_at": r["created_at"],
+           "vless_uuid": r["vless_uuid"], "password": r["trojan_password"],
+           "ss_method": r["ss_method"], "ss_password": r["ss_password"],
+           "ssh_pubkey": r["ssh_pubkey"]}
+    if members is not None and r["username"] in members:
+        rec["interconnect"] = list(members[r["username"]])
+    return rec
+
+
 def pubkey_fingerprint(line):
     """SHA256: fingerprint of an authorized_keys-style public key line,
     or None when the line does not parse."""
@@ -1497,6 +1558,12 @@ def cmd_route_flag(args, value):
     with db() as conn:
         get_route(conn, args.id)
         conn.execute("UPDATE routes SET enabled = ? WHERE id = ?", (value, args.id))
+    if JSON_OUT:
+        with db() as conn:
+            row = get_route(conn, args.id)
+        print(json.dumps({k: row[k] for k in row.keys()},
+                         indent=2, default=str))
+        return
     print(f"route #{args.id}: enabled = {bool(value)}; run: users.py render")
 
 
@@ -1504,6 +1571,9 @@ def cmd_route_remove(args):
     with db() as conn:
         get_route(conn, args.id)
         conn.execute("DELETE FROM routes WHERE id = ?", (args.id,))
+    if JSON_OUT:
+        print(json.dumps({"removed": args.id}, indent=2))
+        return
     print(f"removed route #{args.id}; run: users.py render")
 
 
@@ -1841,6 +1911,12 @@ def cmd_render(args):
         os.chmod(spath, 0o755)
     egress = (f"{n_up} upstream(s), strategy {strat}" if n_up
               else "direct (no upstreams)")
+    if JSON_OUT:
+        print(json.dumps({"out": out, "users": n, "upstreams": n_up,
+                          "strategy": strat, "vless_paths": vp,
+                          "trojan_paths": tp,
+                          "ssh_tunnels": len(tunnels)}, indent=2))
+        return
     print(f"wrote {out}: dispatcher port {PUBLIC_PORT} -> mux {MUX_PORT}, "
           f"http-in {BE_HTTP}, socks-in {BE_SOCKS}, {n} enabled user(s), "
           f"vless paths {vp}, trojan paths {tp}, "
@@ -1852,10 +1928,16 @@ _PATH_PREFIXES = ("/assets", "/static", "/api", "/cdn", "/media", "/dist", "/res
 
 
 def cmd_gen_paths(args):
+    paths = []
     for _ in range(args.count):
         token = "".join(secrets.choice(string.ascii_lowercase + string.digits)
                         for _ in range(secrets.choice((6, 8, 10))))
-        print(f"{secrets.choice(_PATH_PREFIXES)}/{token}")
+        paths.append(f"{secrets.choice(_PATH_PREFIXES)}/{token}")
+    if JSON_OUT:
+        print(json.dumps(paths, indent=2))
+        return
+    for path in paths:
+        print(path)
 
 
 def cmd_render_keys(args):
@@ -1883,6 +1965,9 @@ def cmd_render_keys(args):
             f.write(key + "\n")
     os.replace(tmp, out)
     os.chmod(out, 0o600)
+    if JSON_OUT:
+        print(json.dumps({"out": out, "keys": len(rows)}, indent=2))
+        return
     print(f"wrote {out}: {len(rows)} key(s)")
 
 
@@ -2448,6 +2533,9 @@ def cmd_db_edit(args):
 
 def cmd_db_remove(args):
     remove_db_config(args.name)
+    if JSON_OUT:
+        print(json.dumps({"removed": args.name}, indent=2))
+        return
     print(f"database config {args.name} removed")
 
 
@@ -2652,6 +2740,9 @@ def cmd_sessions_revoke(args):
         row = revoke_session_by_id(conn, args.id)
     if row is None:
         sys.exit(f"no unique live session with id prefix {args.id!r}")
+    if JSON_OUT:
+        print(json.dumps({"revoked": row["sid"][:12]}, indent=2))
+        return
     print(f"revoked session {row['sid'][:12]} ({row['kind']}, "
           f"created {_fmt_ts(row['created_at'])})")
 
@@ -2659,6 +2750,9 @@ def cmd_sessions_revoke(args):
 def cmd_sessions_revoke_all(_):
     with db() as conn:
         n = revoke_all_sessions(conn)
+    if JSON_OUT:
+        print(json.dumps({"revoked": n}, indent=2))
+        return
     print(f"revoked {n} session(s) - every web and CLI login is signed out")
 
 
@@ -2677,6 +2771,9 @@ def cmd_admin_reset(_):
         conn.commit()
     finally:
         conn.close()
+    if JSON_OUT:
+        print(json.dumps({"reset": bool(cur.rowcount)}, indent=2))
+        return
     print("admin passkey cleared - the console is in setup mode again"
           if cur.rowcount else "no admin passkey was registered")
 
@@ -2685,7 +2782,7 @@ def main():
     p = argparse.ArgumentParser(prog="users.py", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--json", action="store_true",
-                   help="machine-readable output (data commands)")
+                   help="machine-readable output")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("init").set_defaults(fn=cmd_init)
     sub.add_parser("status").set_defaults(fn=cmd_status)

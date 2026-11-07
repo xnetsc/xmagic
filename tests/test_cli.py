@@ -53,12 +53,106 @@ def main():
     rc, out, _ = cli("--json", "list")
     names = [u["username"] for u in json.loads(out)]
     check("--json list shows both users", names == ["alice", "bob"], out)
+    listed = {u["username"]: u for u in json.loads(out)}
+    check("--json list records carry credentials (API parity)",
+          bool(listed["alice"]["vless_uuid"])
+          and bool(listed["alice"]["password"])
+          and bool(listed["alice"]["ss_password"]), out)
+
+    # ---- --json parity: every user mutation answers with the canonical
+    # record (or a removal receipt), never human text
+    rc, out, err = cli("--json", "add", "jsonuser")
+    rec = json.loads(out) if rc == 0 else {}
+    check("--json add emits the canonical user record",
+          rec.get("username") == "jsonuser" and rec.get("ssh_key") is False
+          and "ssh_fingerprint" in rec and "created_at" in rec, err + out)
+    rc, out, err = cli("--json", "setmethod", "jsonuser", "aes-128-gcm")
+    rec = json.loads(out) if rc == 0 else {}
+    check("--json setmethod returns the record with the new method",
+          rec.get("ss_method") == "aes-128-gcm"
+          and bool(rec.get("vless_uuid")), err + out)
+    rc, out, err = cli("--json", "setnote", "jsonuser", "via json")
+    rec = json.loads(out) if rc == 0 else {}
+    check("--json setnote returns the record",
+          rec.get("note") == "via json", err + out)
+    rc, out, err = cli("--json", "setgroup", "jsonuser", "team")
+    rec = json.loads(out) if rc == 0 else {}
+    check("--json setgroup returns the record",
+          rec.get("group") == "team", err + out)
+    rc, out, err = cli("--json", "disable", "jsonuser")
+    rec = json.loads(out) if rc == 0 else {}
+    check("--json disable returns the record",
+          rec.get("enabled") is False, err + out)
+    rc, out, err = cli("--json", "enable", "jsonuser")
+    rec = json.loads(out) if rc == 0 else {}
+    check("--json enable returns the record",
+          rec.get("enabled") is True, err + out)
+    key_base = os.path.join(workdir, "jsonuser_key")
+    subprocess.run(["ssh-keygen", "-t", "ed25519", "-N", "", "-C",
+                    "json@test", "-f", key_base],
+                   capture_output=True, check=True)
+    rc, out, err = cli("--json", "setkey", "jsonuser",
+                       "--ssh-key-file", key_base + ".pub")
+    rec = json.loads(out) if rc == 0 else {}
+    check("--json setkey returns the record with key + fingerprint",
+          bool(rec.get("ssh_pubkey"))
+          and (rec.get("ssh_fingerprint") or "").startswith("SHA256:"),
+          err + out)
+    rc, out, err = cli("--json", "passwd", "jsonuser")
+    rec = json.loads(out) if rc == 0 else {}
+    check("--json passwd returns the full record, not just passwords",
+          bool(rec.get("password")) and rec.get("group") == "team",
+          err + out)
+    rc, out, err = cli("--json", "rotate-uuid", "jsonuser")
+    rec = json.loads(out) if rc == 0 else {}
+    check("--json rotate-uuid returns the full record",
+          bool(rec.get("vless_uuid")) and bool(rec.get("ss_password")),
+          err + out)
+    rc, out, err = cli("--json", "remove", "jsonuser")
+    check("--json remove returns a removal receipt",
+          rc == 0 and json.loads(out) == {"removed": "jsonuser"},
+          err + out)
+    rc, out, err = cli("--json", "init")
+    check("--json init returns the database identity",
+          rc == 0 and json.loads(out).get("type") == "sqlite", err + out)
+    rc, out, err = cli("--json", "db-add", "tmpdb", "--type", "sqlite",
+                       "--path", os.path.join(workdir, "tmp.db"))
+    check("--json db-add", rc == 0
+          and json.loads(out)["name"] == "tmpdb", err + out)
+    rc, out, err = cli("--json", "db-remove", "tmpdb")
+    check("--json db-remove returns a receipt",
+          rc == 0 and json.loads(out) == {"removed": "tmpdb"}, err + out)
     rc, _, _ = cli("upstream-add", "up1", "--proto", "ss", "--addr", "10.0.0.9",
                    "--port", "8388", "--password", "pw")
     check("upstream-add", rc == 0)
     rc, out, _ = cli("--json", "route-add", "--kind", "domain",
                      "--pattern", "example.com", "--to", "block")
     check("--json route-add", rc == 0 and json.loads(out)["pattern"] == "example.com")
+    rc, out, _ = cli("--json", "route-list")
+    rid = json.loads(out)[0]["id"]
+    rc, out, err = cli("--json", "route-disable", str(rid))
+    rt = json.loads(out) if rc == 0 else {}
+    check("--json route-disable returns the row",
+          rt.get("enabled") in (0, False) and rt.get("id") == rid, err + out)
+    rc, out, err = cli("--json", "route-enable", str(rid))
+    rt = json.loads(out) if rc == 0 else {}
+    check("--json route-enable returns the row",
+          rt.get("enabled") in (1, True), err + out)
+    rc, out, err = cli("--json", "upstream-disable", "up1")
+    up = json.loads(out) if rc == 0 else {}
+    check("--json upstream-disable returns the row",
+          up.get("enabled") in (0, False) and up.get("name") == "up1",
+          err + out)
+    rc, out, err = cli("--json", "upstream-enable", "up1")
+    up = json.loads(out) if rc == 0 else {}
+    check("--json upstream-enable returns the row",
+          up.get("enabled") in (1, True), err + out)
+    rc, out, err = cli("--json", "route-remove", str(rid))
+    check("--json route-remove returns a receipt",
+          rc == 0 and json.loads(out) == {"removed": rid}, err + out)
+    rc, out, err = cli("--json", "route-add", "--kind", "domain",
+                       "--pattern", "example.com", "--to", "block")
+    check("route re-added for the checks below", rc == 0, err + out)
     rc, out, _ = cli("status")
     check("status (human)", rc == 0 and "users: 2/2 enabled" in out, out)
     rc, out, _ = cli("--json", "status")
@@ -67,6 +161,21 @@ def main():
     voff_path = os.path.join(workdir, "voff.json")
     rc, out, _ = cli("render", "--out", voff_path)
     vcfg = json.load(open(voff_path))
+    rc, out, err = cli("--json", "render", "--out",
+                       os.path.join(workdir, "vjson.json"))
+    rj = json.loads(out) if rc == 0 else {}
+    check("--json render returns a summary",
+          rj.get("users") == 2 and "strategy" in rj, err + out)
+    rc, out, err = cli("--json", "render-keys", "--out",
+                       os.path.join(workdir, "ak.txt"))
+    kj = json.loads(out) if rc == 0 else {}
+    check("--json render-keys returns a summary",
+          kj.get("keys") == 0, err + out)
+    rc, out, err = cli("--json", "gen-paths", "2")
+    pj = json.loads(out) if rc == 0 else []
+    check("--json gen-paths returns an array",
+          rc == 0 and len(pj) == 2
+          and all(x.startswith("/") for x in pj), err + out)
     check("VLESS off by default: no vless-ws inbound, mux clients empty",
           all(i["tag"] != "vless-ws-0" for i in vcfg["inbounds"])
           and vcfg["inbounds"][0]["settings"]["clients"] == [],
@@ -446,10 +555,16 @@ JHde4tAsdlXZGG6MF7TiAAAAEHhtYWdpYyBmaXh0dXJlLWIBAgMEBQ==
     if rows:
         rc, out, _ = cli("sessions-revoke", rows[0]["id"])
         check("CLI revokes a session by id", rc == 0 and "revoked" in out, out)
+    rc, out, _ = cli("--json", "sessions-revoke-all")
+    check("--json revoke-all returns a receipt",
+          rc == 0 and isinstance(json.loads(out).get("revoked"), int), out)
     rc, out, _ = cli("sessions-revoke-all")
     check("CLI revoke-all", rc == 0 and "revoked" in out, out)
+    rc, out, _ = cli("--json", "admin-reset")
+    check("--json admin-reset returns a receipt",
+          rc == 0 and json.loads(out) == {"reset": True}, out)
     rc, out, _ = cli("admin-reset")
-    check("admin-reset", rc == 0 and "cleared" in out, out)
+    check("admin-reset", rc == 0 and "no admin passkey" in out, out)
 
     # ---- remaining engine-CLI surface: full user lifecycle, upstream /
     # route toggles + removal, gen-paths, render-keys, remaining settings.
