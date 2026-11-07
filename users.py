@@ -1020,13 +1020,16 @@ def cmd_list(_):
     if JSON_OUT:
         print(json.dumps([{"username": r["username"], "enabled": bool(r["enabled"]),
                            "group": r["upstream_group"], "ssh_key": bool(r["ssh_pubkey"]),
+                           "ssh_pubkey": r["ssh_pubkey"],
+                           "ssh_fingerprint": _fingerprint_or_none(r["ssh_pubkey"]),
                            "created_at": r["created_at"]} for r in rows], indent=2))
         return
     if not rows:
         print("(no users)")
     for r in rows:
+        key = _fingerprint_or_none(r["ssh_pubkey"]) or ("yes" if r["ssh_pubkey"] else "no")
         print(f"{r['username']:<20} enabled={bool(r['enabled'])!s:<5} group={r['upstream_group']:<10} "
-              f"ssh_key={'yes' if r['ssh_pubkey'] else 'no':<3} created={r['created_at']}")
+              f"ssh_key={key} created={r['created_at']}")
 
 
 def cmd_setgroup(args):
@@ -1385,6 +1388,17 @@ def generate_ed25519_keypair(comment=""):
     if comment:
         pub_line += " " + comment
     return pem, pub_line, pubkey_fingerprint(pub_line)
+
+
+def _fingerprint_or_none(line):
+    """Fingerprint of a stored pubkey line, or None when the line is
+    absent or unparsable (a hand-edited database must not break list)."""
+    if not line:
+        return None
+    try:
+        return pubkey_fingerprint(line)
+    except Exception:
+        return None
 
 
 def pubkey_fingerprint(line):

@@ -590,6 +590,10 @@ def main():
               status == 201 and body["user"]["group"] == "intl"
               and body["user"]["note"] == "second"
               and body["user"]["ssh_key"] is True, f"{status} {body}")
+        check("user dict carries the ssh key fingerprint",
+              body["user"].get("ssh_fingerprint")
+              == admin_mod.users_mod.pubkey_fingerprint(dave_key),
+              f"{body}")
         dave_pw = body["user"]["password"]
         status, body = client.call("POST", "/api/users/dave/passwd", {})
         check("passwd rotates the shared password",

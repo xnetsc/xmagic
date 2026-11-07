@@ -721,6 +721,7 @@ def apply_changes():
 def _user_dict(r, with_secrets=False):
     out = {"username": r["username"], "enabled": bool(r["enabled"]),
            "group": r["upstream_group"], "ssh_key": bool(r["ssh_pubkey"]),
+           "ssh_fingerprint": users_mod._fingerprint_or_none(r["ssh_pubkey"]),
            "note": r["note"], "created_at": r["created_at"]}
     if with_secrets:
         out.update({"vless_uuid": r["vless_uuid"],
@@ -1992,7 +1993,7 @@ async function refresh() {
     users.map(u => `<tr><td><strong>${u.username}</strong>${u.note ? `<br><span class="small">${u.note}</span>` : ""}</td><td>${u.group}</td>
       <td><span class="badge ${u.enabled ? "on" : "off"}">${u.enabled ? "启用" : "停用"}</span></td>
       <td><code>vless uuid ${u.vless_uuid}${window.__vlessOn ? "" : "（未启用）"}<br>密码 ${u.password}<br>ss ${u.ss_method} / ${u.ss_password}` +
-      `${u.ssh_key ? "<br>SSH 公钥已登记<br>ssh -D 1080 -N -i xmagic-" + u.username + ".key -p " + s.public_port + " proxy@" + location.hostname : ""}${u.interconnect ? "<br>组内互访端口 " + u.interconnect[0] + "-" + u.interconnect[1] : ""}</code></td>
+      `${u.ssh_key ? "<br>SSH 公钥已登记" + (u.ssh_fingerprint ? " " + u.ssh_fingerprint : "") + "<br>ssh -D 1080 -N -i xmagic-" + u.username + ".key -p " + s.public_port + " proxy@" + location.hostname : ""}${u.interconnect ? "<br>组内互访端口 " + u.interconnect[0] + "-" + u.interconnect[1] : ""}</code></td>
       <td><div class="row-actions"><button class="sm" data-act="passwd" data-u="${u.username}">换密码</button>
       <button class="sm" data-act="rotate-uuid" data-u="${u.username}">换UUID</button>
       <button class="sm" data-act="setkey" data-u="${u.username}">公钥</button>

@@ -556,6 +556,12 @@ def main():
         check("temp user's fields landed",
               temp["group"] == "intl" and temp["note"] == "tmpnote"
               and temp["ssh_key"] is True, out)
+        check("--json list carries the full pubkey and its fingerprint",
+              temp["ssh_pubkey"] == temp_key
+              and temp["ssh_fingerprint"].startswith("SHA256:"), out)
+        rc, out, _ = cli("users", "list")
+        check("human list shows the key fingerprint, not just yes",
+              rc == 0 and "ssh-key=SHA256:" in out, out)
         rc, out, err = cli("users", "passwd", "temp")
         new_pw = None
         for line in out.splitlines():

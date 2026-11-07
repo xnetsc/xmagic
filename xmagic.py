@@ -684,7 +684,8 @@ def cmd_users_list(args):
             f"{u['username']:<16} group={u['group']:<10} "
             f"enabled={u['enabled']!s:<5} vless uuid={u['vless_uuid']}{off}\n"
             f"{'':<16} password={u['password']}  ss={u['ss_method']}/{u['ss_password']}"
-            + ("  ssh-key=yes" if u["ssh_key"] else ""))
+            + (f"  ssh-key={u.get('ssh_fingerprint') or 'yes'}"
+               if u["ssh_key"] else ""))
     emit(args, payload, "\n".join(lines) if lines else "(no users)")
 
 

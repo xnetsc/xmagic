@@ -235,6 +235,15 @@ JHde4tAsdlXZGG6MF7TiAAAAEHhtYWdpYyBmaXh0dXJlLWIBAgMEBQ==
     dave = json.loads(out) if rc == 0 else {}
     check("add --ssh-key-file registers the client-minted pubkey",
           rc == 0 and dave.get("ssh_key") is True, err + out)
+    rc, out, _ = cli("--json", "list")
+    kdave = next(u for u in json.loads(out) if u["username"] == "kdave")
+    check("--json list carries the full ssh pubkey for automation",
+          kdave["ssh_pubkey"] == FIXTURE_B_PUB
+          and kdave["ssh_fingerprint"]
+          == "SHA256:bNmrOHDN63AWm7TXHGthrY+y2dwnI5Ub4k2a30yM9Ek", out)
+    rc, out, _ = cli("list")
+    check("human list shows the key fingerprint, not just yes",
+          "SHA256:bNmrOHDN63AWm7TXHGthrY+y2dwnI5Ub4k2a30yM9Ek" in out, out)
     rc, out, err = cli("--json", "upstream-add", "upssh2", "--proto", "ssh",
                        "--addr", "10.1.1.1", "--port", "22",
                        "--username", "tun", "--key-generate")
