@@ -1045,15 +1045,92 @@ def get_upstream(conn, name):
     return row
 
 
+# ------------------------------------------------- ssh upstream private keys
+# An ssh upstream's private key may be supplied as content (console
+# upload/paste, or a CLI file flag): it is stored on the node in the
+# ssh_client_keys directory next to the database, and the upstream row
+# records the runtime path /keys/<file> - the tunnels processes see
+# that directory mounted at /keys (compose form) or symlinked there
+# (single-container form). A key_file given as a plain path keeps its
+# original meaning: a file the operator provisioned themselves.
+KEYS_DIR_NAME = "ssh_client_keys"
+MANAGED_KEY_PREFIX = "/keys/"
+MAX_KEY_BYTES = 65536
+
+
+def keys_dir():
+    return os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), KEYS_DIR_NAME)
+
+
+def managed_key_path(name):
+    """The runtime path recorded for an uploaded key (pure - no I/O)."""
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", name).lstrip(".") or "upstream"
+    return MANAGED_KEY_PREFIX + safe + ".key"
+
+
+def validate_key_content(content):
+    """Return the normalized key text, or raise ValueError."""
+    text = (content or "").strip()
+    if "PRIVATE KEY-----" not in text:
+        raise ValueError("key content is not a PEM private key")
+    if len(text.encode()) > MAX_KEY_BYTES:
+        raise ValueError("key content is too large")
+    return text
+
+
+def write_upstream_key(name, content):
+    """Store an uploaded private key on the node (0600, atomic)."""
+    text = validate_key_content(content)
+    d = keys_dir()
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, os.path.basename(managed_key_path(name)))
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(text + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def delete_managed_key(key_file):
+    """Remove a node-stored key file; plain operator paths are untouched."""
+    if key_file and key_file.startswith(MANAGED_KEY_PREFIX):
+        try:
+            os.unlink(os.path.join(keys_dir(), os.path.basename(key_file)))
+        except OSError:
+            pass
+
+
+def _read_key_content_arg(args):
+    """The --key-content-file flag: a private key read from a local
+    file, to be stored on the node. None when the flag is absent."""
+    path = getattr(args, "key_content_file", None)
+    if not path:
+        return None
+    try:
+        with open(path) as f:
+            content = f.read()
+    except OSError as exc:
+        sys.exit(f"cannot read key file {path}: {exc.strerror or exc}")
+    try:
+        validate_key_content(content)
+    except ValueError as exc:
+        sys.exit(str(exc))
+    return content
+
+
 def cmd_upstream_add(args):
+    key_content = _read_key_content_arg(args)
     if args.proto in ("vless-ws", "vless") and not args.uuid:
         sys.exit(f"{args.proto} upstream needs --uuid (the uuid the upstream operator issued you)")
     if args.proto in ("trojan-ws", "ss") and not args.password:
         sys.exit(f"{args.proto} upstream needs --password")
     if args.proto in ("http", "socks") and args.username and not args.password:
         sys.exit(f"{args.proto} upstream with --username also needs --password")
-    if args.proto == "ssh" and not (args.username and args.key_file):
-        sys.exit("ssh upstream needs --username (ssh user) and --key-file (private key path)")
+    if args.proto == "ssh" and not (args.username and (args.key_file or key_content is not None)):
+        sys.exit("ssh upstream needs --username (ssh user) and a key: --key-file"
+                 " (path on the node) or --key-content-file (a local key file,"
+                 " stored on the node)")
+    key_file = managed_key_path(args.name) if key_content is not None else args.key_file
     with db() as conn:
         try:
             conn.execute(
@@ -1061,11 +1138,13 @@ def cmd_upstream_add(args):
                 " username, password, key_file, tls, method, note, created_at)"
                 " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (args.name, args.group, args.addr, args.port, args.proto, args.path,
-                 args.uuid, args.username, args.password, args.key_file, 1 if args.tls else 0,
+                 args.uuid, args.username, args.password, key_file, 1 if args.tls else 0,
                  args.method, args.note, datetime.now(timezone.utc).isoformat()),
             )
         except IntegrityError:
             sys.exit(f"upstream already exists: {args.name}")
+    if key_content is not None:
+        write_upstream_key(args.name, key_content)
     if JSON_OUT:
         with db() as conn:
             r = get_upstream(conn, args.name)
@@ -1098,8 +1177,9 @@ def cmd_upstream_flag(args, value):
 
 def cmd_upstream_remove(args):
     with db() as conn:
-        get_upstream(conn, args.name)
+        row = get_upstream(conn, args.name)
         conn.execute("DELETE FROM upstreams WHERE name = ?", (args.name,))
+    delete_managed_key(row["key_file"])
     print(f"removed upstream {args.name}; run: users.py render")
 
 
@@ -1125,11 +1205,16 @@ def validate_upstream_values(values):
 
 def update_upstream(conn, name, changes):
     """Partial edit: keys in `changes` with value None are left alone;
-    empty string is a real value (clears path/username/etc.)."""
+    empty string is a real value (clears path/username/etc.).
+    `key_content` is not a column: it stores a private key on the node
+    and points key_file at the stored copy (/keys/<name>.key)."""
     row = get_upstream(conn, name)
     merged = {k: row[k] for k in row.keys()}
     applied = {}
+    key_content = changes.get("key_content")
     for key, value in changes.items():
+        if key == "key_content":
+            continue
         if key not in UPSTREAM_FIELDS:
             raise ValueError(f"unknown upstream field {key!r}")
         if value is None:
@@ -1140,11 +1225,19 @@ def update_upstream(conn, name, changes):
             value = int(value)
         merged[key] = value
         applied[key] = value
+    if key_content:
+        validate_key_content(key_content)
+        merged["key_file"] = managed_key_path(name)
+        applied["key_file"] = merged["key_file"]
     validate_upstream_values(merged)
+    if key_content:
+        write_upstream_key(name, key_content)
     if applied:
         sets = ", ".join(f"{k} = ?" for k in applied)
         conn.execute(f"UPDATE upstreams SET {sets} WHERE name = ?",
                      [*applied.values(), name])
+    if row["key_file"] != merged["key_file"]:
+        delete_managed_key(row["key_file"])
     return get_upstream(conn, name)
 
 
@@ -1152,7 +1245,8 @@ def cmd_upstream_edit(args):
     changes = {"grp": args.group, "address": args.addr, "port": args.port,
                "protocol": args.proto, "path": args.path, "uuid": args.uuid,
                "username": args.username, "password": args.password,
-               "key_file": args.key_file, "method": args.method, "note": args.note}
+               "key_file": args.key_file, "method": args.method, "note": args.note,
+               "key_content": _read_key_content_arg(args)}
     if args.tls:
         changes["tls"] = True
     elif args.no_tls:
@@ -1553,8 +1647,11 @@ def cmd_render(args):
             json.dump(tunnels, f, indent=2)
         spath = os.path.join(os.path.dirname(os.path.abspath(out)), "start-tunnels.sh")
         with open(spath, "w") as f:
-            f.write("#!/bin/sh\n# Hold one ssh -D tunnel per ssh upstream. Run under a\n"
-                    "# supervisor (systemd / compose sidecar) so tunnels restart.\nset -e\n")
+            f.write("#!/bin/sh\nset -e\n"
+                    "# The ssh children must die with this script: an apply\n"
+                    "# restarts the tunnels process on its own and expects\n"
+                    "# the old tunnels gone.\n"
+                    "trap 'kill $(jobs -p) 2>/dev/null; exit 0' TERM INT\n")
             for t in tunnels:
                 f.write(" ".join(t["ssh_command"]) + " &\n")
             f.write("wait\n")
@@ -1607,11 +1704,13 @@ def cmd_render_keys(args):
 DOCKER_SOCK = os.environ.get("XMAGIC_DOCKER_SOCK", "/var/run/docker.sock")
 XRAY_CONTAINER = os.environ.get("XMAGIC_XRAY_CONTAINER", "proxy-xray")
 SSHD_CONTAINER = os.environ.get("XMAGIC_SSHD_CONTAINER", "proxy-sshd")
+TUNNELS_CONTAINER = os.environ.get("XMAGIC_TUNNELS_CONTAINER", "proxy-tunnels")
 # Single-container form: when set, this directory holds one <name>.pid
 # file per gateway process (written by the container entrypoint), and
-# apply restarts the gateway by signalling those processes - in that
-# form any critical process exiting takes the whole container down,
-# so the container comes back up on the new config as a whole.
+# apply restarts a process by writing a restart-<name>.req marker and
+# signalling it - the entrypoint relaunches just that process. An exit
+# without a marker still takes the whole container down, which is also
+# the fallback when a targeted restart cannot be requested.
 PID_DIR = os.environ.get("XMAGIC_PID_DIR", "")
 
 # ------------------------------------------------------------ settings
@@ -1774,7 +1873,11 @@ def render_all(out_dir):
             json.dump(tunnels, f, indent=2)
         spath = os.path.join(out_dir, "start-tunnels.sh")
         with open(spath, "w") as f:
-            f.write("#!/bin/sh\nset -e\n")
+            f.write("#!/bin/sh\nset -e\n"
+                    "# The ssh children must die with this script: an apply\n"
+                    "# restarts the tunnels process on its own and expects\n"
+                    "# the old tunnels gone.\n"
+                    "trap 'kill $(jobs -p) 2>/dev/null; exit 0' TERM INT\n")
             for t in tunnels:
                 f.write(" ".join(t["ssh_command"]) + " &\n")
             f.write("wait\n")
@@ -1801,8 +1904,37 @@ def render_all(out_dir):
             "ssh_tunnels": len(tunnels)}
 
 
-def docker_restart(name):
-    """POST /containers/<name>/restart over the unix socket. None = no sock."""
+def _artifact_hashes(out_dir):
+    """Content hash of each rendered artifact (None when absent).
+
+    Comparing the hashes before and after a render decides which
+    gateway processes actually need a restart - apply restarts only
+    the minimal set whose inputs changed."""
+    hashes = {}
+    for fname in ("config.json", "authorized_keys", "ssh-tunnels.json",
+                  "start-tunnels.sh"):
+        try:
+            with open(os.path.join(out_dir, fname), "rb") as f:
+                hashes[fname] = hashlib.sha256(f.read()).hexdigest()
+        except OSError:
+            hashes[fname] = None
+    return hashes
+
+
+# Which gateway process each rendered artifact feeds:
+# (artifact file, change label, process name).
+ARTIFACT_PROCESS = (("config.json", "config", "xray"),
+                    ("authorized_keys", "keys", "sshd"),
+                    ("ssh-tunnels.json", "tunnels", "tunnels"),
+                    ("start-tunnels.sh", "tunnels", "tunnels"))
+
+
+def docker_restart(name, missing_ok=False):
+    """POST /containers/<name>/restart over the unix socket.
+
+    True = restarted, False = attempted and failed, None = no docker
+    socket - or, with missing_ok, no such container (the tunnels
+    container is optional, so its absence is not a failure)."""
     if not os.path.exists(DOCKER_SOCK):
         return None
     request = (f"POST /containers/{name}/restart?t=5 HTTP/1.1\r\n"
@@ -1813,28 +1945,48 @@ def docker_restart(name):
             sock.connect(DOCKER_SOCK)
             sock.sendall(request.encode())
             status_line = sock.recv(4096).decode("latin1").splitlines()[0]
-        return " 204 " in status_line or " 200 " in status_line
-    except OSError:
+        code = int(status_line.split()[1])
+    except (OSError, ValueError, IndexError):
         return False
+    if code in (200, 204):
+        return True
+    if missing_ok and code == 404:
+        return None
+    return False
 
 
-def pidfile_restart(name):
+def pidfile_signal(name, marker):
     """SIGTERM the process recorded in <PID_DIR>/<name>.pid.
 
-    None = pidfile channel not configured. In the single-container
-    form the entrypoint treats any critical process exiting as fatal
-    to the whole container, so signalling xray / sshd / tunnels makes
-    the container restart as a whole on the freshly rendered config.
-    """
+    With marker=True a restart request (restart-<name>.req, holding
+    the pid) is written first: the single-container entrypoint
+    relaunches just that process when it sees the request, so an
+    apply-requested exit does not take the container down. Without a
+    marker the exit counts as a crash and the entrypoint tears the
+    whole container down - the fallback when a targeted restart
+    cannot even be requested. True also when the process is already
+    gone (a marker still gets it relaunched). None = pidfile channel
+    not configured."""
     if not PID_DIR:
         return None
     try:
         with open(os.path.join(PID_DIR, name + ".pid")) as f:
             pid = int(f.read().strip())
-        os.kill(pid, signal.SIGTERM)
-        return True
     except (OSError, ValueError):
         return False
+    if marker:
+        try:
+            with open(os.path.join(PID_DIR, f"restart-{name}.req"), "w") as f:
+                f.write(str(pid))
+        except OSError:
+            return False
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 def restart_channel():
@@ -1848,21 +2000,58 @@ def restart_channel():
 
 def apply_changes():
     out_dir = os.path.dirname(os.path.abspath(DB_PATH))
+    before = _artifact_hashes(out_dir)
     result = render_all(out_dir)
+    after = _artifact_hashes(out_dir)
+    changed, needed = [], []
+    for fname, label, proc in ARTIFACT_PROCESS:
+        if before[fname] != after[fname]:
+            if label not in changed:
+                changed.append(label)
+            if proc not in needed:
+                needed.append(proc)
     restarted = {}
-    if PID_DIR:
+    container_restart = False
+    if needed and PID_DIR:
         for name in ("xray", "sshd", "tunnels"):
-            outcome = pidfile_restart(name)
+            try:
+                os.unlink(os.path.join(PID_DIR, f"restart-{name}.req"))
+            except OSError:
+                pass
+        for name in needed:
+            restarted[name] = pidfile_signal(name, marker=True)
+        if any(v is False for v in restarted.values()):
+            # A targeted restart could not even be requested - fall
+            # back: clear the markers and signal without them, so the
+            # entrypoint takes the whole container down and the
+            # runtime restarts it on the freshly rendered config.
+            container_restart = True
+            for name in ("xray", "sshd", "tunnels"):
+                try:
+                    os.unlink(os.path.join(PID_DIR, f"restart-{name}.req"))
+                except OSError:
+                    pass
+                pidfile_signal(name, marker=False)
+    elif needed:
+        targets = {"xray": (XRAY_CONTAINER, False),
+                   "sshd": (SSHD_CONTAINER, False),
+                   "tunnels": (TUNNELS_CONTAINER, True)}
+        for name in needed:
+            container, missing_ok = targets[name]
+            outcome = docker_restart(container, missing_ok=missing_ok)
             if outcome is not None:
                 restarted[name] = outcome
-    else:
-        for label, container in (("xray", XRAY_CONTAINER),
-                                 ("sshd", SSHD_CONTAINER)):
-            outcome = docker_restart(container)
-            if outcome is not None:
-                restarted[label] = outcome
+        if any(v is False for v in restarted.values()):
+            # Escalate to bouncing every gateway service container.
+            for name, (container, missing_ok) in targets.items():
+                if name not in restarted:
+                    outcome = docker_restart(container, missing_ok=missing_ok)
+                    if outcome is not None:
+                        restarted[name] = outcome
+    result["changed"] = changed
     result["restarted"] = restarted
-    result["restart_skipped"] = not restarted
+    result["container_restart"] = container_restart
+    result["restart_skipped"] = bool(needed) and not restarted
     return result
 
 
@@ -1870,7 +2059,11 @@ def _applied_line(result):
     line = (f"applied: rendered {result['users']} user(s), "
             f"{result['upstreams']} upstream(s), {result['ssh_keys']} ssh key(s)")
     if result["restart_skipped"]:
-        line += "; no docker socket - restart xray/sshd manually to apply"
+        line += "; no restart channel - restart xray/sshd manually to apply"
+    elif result.get("container_restart"):
+        line += "; a targeted restart failed - the whole container is restarting"
+    elif not result["restarted"]:
+        line += "; rendered output unchanged - nothing restarted"
     else:
         line += "; restarts: " + ", ".join(
             f"{k}={'ok' if v else 'FAILED'}" for k, v in result["restarted"].items())
@@ -2203,6 +2396,9 @@ def main():
     a.add_argument("--path"); a.add_argument("--uuid")
     a.add_argument("--username"); a.add_argument("--password")
     a.add_argument("--key-file", help="ssh upstream: path to the private key file")
+    a.add_argument("--key-content-file",
+                   help="ssh upstream: read the private key from this local file"
+                        " and store it on the node (key_file becomes /keys/<name>.key)")
     a.add_argument("--tls", action="store_true",
                    help="vless-ws/vless/trojan-ws upstream: dial with TLS (SNI = address);"
                         " required by Xray for plaintext protocols to public IPs")
@@ -2213,6 +2409,9 @@ def main():
     a.add_argument("--proto", choices=("vless-ws", "vless", "trojan-ws", "ss", "http", "socks", "ssh"))
     a.add_argument("--group"); a.add_argument("--path"); a.add_argument("--uuid")
     a.add_argument("--username"); a.add_argument("--password"); a.add_argument("--key-file")
+    a.add_argument("--key-content-file",
+                   help="ssh upstream: replace the key with this local file's"
+                        " content, stored on the node")
     a.add_argument("--tls", action="store_true"); a.add_argument("--no-tls", action="store_true")
     a.add_argument("--method"); a.add_argument("--note")
     a.set_defaults(fn=cmd_upstream_edit)

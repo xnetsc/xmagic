@@ -690,8 +690,18 @@ def api_add_upstream(body):
         raise ApiError(400, f"{proto} upstream needs a password")
     if proto in ("http", "socks") and body.get("username") and not body.get("password"):
         raise ApiError(400, f"{proto} upstream with a username also needs a password")
-    if proto == "ssh" and not (body.get("username") and body.get("key_file")):
-        raise ApiError(400, "ssh upstream needs username and key_file")
+    key_content = body.get("key_content")
+    if proto == "ssh" and not (body.get("username")
+                               and (body.get("key_file") or key_content)):
+        raise ApiError(400, "ssh upstream needs a username and a key"
+                            " (key_file path or key_content)")
+    if key_content:
+        try:
+            users_mod.validate_key_content(key_content)
+        except ValueError as exc:
+            raise ApiError(400, str(exc))
+    key_file = (users_mod.managed_key_path(body.get("name") or "")
+                if key_content else body.get("key_file"))
     from datetime import datetime, timezone
     with users_mod.db() as conn:
         try:
@@ -701,7 +711,7 @@ def api_add_upstream(body):
                 " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (body["name"], body.get("group") or "default", body["address"],
                  int(body["port"]), proto, body.get("path"), body.get("uuid"),
-                 body.get("username"), body.get("password"), body.get("key_file"),
+                 body.get("username"), body.get("password"), key_file,
                  1 if body.get("tls") else 0, body.get("method") or "aes-256-gcm",
                  body.get("note"), datetime.now(timezone.utc).isoformat()))
         except users_mod.IntegrityError:
@@ -709,15 +719,18 @@ def api_add_upstream(body):
         except KeyError as exc:
             raise ApiError(400, f"missing field: {exc}")
         row = users_mod.get_upstream(conn, body["name"])
+    if key_content:
+        users_mod.write_upstream_key(body["name"], key_content)
     applied = apply_changes()
     return {"upstream": _upstream_dict(row), "applied": applied}
 
 
 def api_upstream_action(name, action):
     with users_mod.db() as conn:
-        users_mod.get_upstream(conn, name)
+        row = users_mod.get_upstream(conn, name)
         if action == "remove":
             conn.execute("DELETE FROM upstreams WHERE name = ?", (name,))
+            users_mod.delete_managed_key(row["key_file"])
         elif action in ("enable", "disable"):
             conn.execute("UPDATE upstreams SET enabled = ? WHERE name = ?",
                          (1 if action == "enable" else 0, name))
@@ -730,7 +743,7 @@ def api_upstream_action(name, action):
 def api_update_upstream(name, body):
     changes = {k: body.get(k) for k in
                ("grp", "address", "port", "protocol", "path", "uuid", "username",
-                "password", "key_file", "tls", "method", "note")}
+                "password", "key_file", "key_content", "tls", "method", "note")}
     if "group" in body:  # friendlier alias for grp
         changes["grp"] = body["group"]
     with users_mod.db() as conn:
@@ -1257,6 +1270,8 @@ td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
 .form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:.8rem .9rem;margin-top:1rem}
 .form-grid .wide{grid-column:span 2}
 .form-grid .full{grid-column:1/-1}
+.keyrow{display:flex;gap:.5rem;align-items:flex-start}
+.keyrow>input,.keyrow>textarea{flex:1}
 .form-actions{display:flex;gap:.5rem;align-items:center;margin-top:1rem;flex-wrap:wrap}
 .check{display:flex;align-items:center;gap:.45rem;font-size:.88rem;color:var(--text)}
 .check input{width:auto}
@@ -1348,7 +1363,10 @@ td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
               <div><label>用户名</label><input name="username" placeholder="用户名" required></div>
               <div><label>上级分组</label><input name="group" placeholder="默认 default"></div>
               <div><label>备注</label><input name="note" placeholder="可选"></div>
-              <div class="wide"><label>SSH 公钥（可选）</label><input name="ssh_pubkey" placeholder="ssh-ed25519 AAAA…"></div>
+              <div class="wide"><label>SSH 公钥（可选，可粘贴或选文件）</label>
+                <div class="keyrow"><input name="ssh_pubkey" placeholder="ssh-ed25519 AAAA…">
+                <button type="button" class="btn ghost sm" id="btn-pick-pubkey">选文件</button>
+                <input type="file" id="pick-pubkey" class="hidden"></div></div>
             </div>
             <div class="form-actions"><button class="primary">添加用户</button></div>
           </form>
@@ -1374,7 +1392,11 @@ td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
               <div class="wide"><label>UUID</label><input name="uuid" placeholder="VLESS / Trojan UUID"></div>
               <div><label>用户名</label><input name="username" placeholder="用户名"></div>
               <div><label>密码</label><input name="password" placeholder="密码"></div>
-              <div><label>SSH 密钥路径</label><input name="key_file" placeholder="/keys/id_ed25519"></div>
+              <div class="wide"><label>SSH 私钥（粘贴内容或选文件上传，存于节点、不回显）</label>
+                <div class="keyrow"><textarea name="key_content" rows="3" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea>
+                <button type="button" class="btn ghost sm" id="btn-pick-privkey">选文件</button>
+                <input type="file" id="pick-privkey" class="hidden"></div></div>
+              <div><label>或：节点上的密钥路径</label><input name="key_file" placeholder="/keys/id_ed25519"></div>
               <div><label>SS 方法</label><input name="method" placeholder="SS method"></div>
               <div><label>备注</label><input name="note" placeholder="可选"></div>
             </div>
@@ -1512,8 +1534,10 @@ async function api(path, body) {
 function appliedText(a) {
   if (!a) return "";
   let t = `已渲染：${a.users} 用户 / ${a.upstreams} 上级 / ${a.ssh_keys} SSH 公钥`;
-  if (a.restart_skipped) t += "；未挂 Docker socket，未自动重启（需手动重启 xray/sshd）";
-  else t += "；重启：" + Object.entries(a.restarted).map(([k, v]) => k + (v ? "✓" : "✗")).join(" ");
+  if (a.restart_skipped) t += "；有变更待生效：无重启通道（需在节点上手动重启相关进程）";
+  else if (a.container_restart) t += "；单进程重启失败，已回退为整容器重启";
+  else if (!a.restarted || !Object.keys(a.restarted).length) t += "；配置无变化，未重启任何进程";
+  else t += "；已按需重启：" + Object.entries(a.restarted).map(([k, v]) => k + (v ? "✓" : "✗")).join(" ");
   return t; }
 async function refresh() {
   const st = await api("/api/status");
@@ -1645,6 +1669,17 @@ function copyCmd(id, btn) { const el = $(id); el.select();
   else { document.execCommand("copy"); done(); } }
 $("btn-copy-install").onclick = e => copyCmd("cli-install", e.target);
 $("btn-copy-onboard").onclick = e => copyCmd("cli-onboard", e.target);
+// Key fields: picking a local file fills the field with its text, so a
+// key can be uploaded instead of pasted; the form submits the text.
+function wireKeyPicker(btnId, pickId, target) {
+  const btn = $(btnId), pick = $(pickId);
+  if (!btn || !pick || !target) return;
+  btn.onclick = () => pick.click();
+  pick.onchange = () => { const f = pick.files[0]; pick.value = "";
+    if (f) f.text().then(t => { target.value = t.trim(); msg("已读取密钥文件 " + f.name, true); }); };
+}
+wireKeyPicker("btn-pick-pubkey", "pick-pubkey", document.querySelector('#form-user [name="ssh_pubkey"]'));
+wireKeyPicker("btn-pick-privkey", "pick-privkey", document.querySelector('#form-upstream [name="key_content"]'));
 $("form-database").onsubmit = async e => { e.preventDefault();
   try { const r = await api("/api/databases", formJson(e.target));
     msg(`数据库配置 ${r.database.name} 已添加`, true); e.target.reset(); refresh(); }
@@ -1745,7 +1780,7 @@ $("route-cancel").onclick = () => { editingRoute = null; $("form-route").reset()
 $("form-upstream").onsubmit = async e => { e.preventDefault();
   try { if (editingUp) {
       const o = formJson(e.target); delete o.name;
-      for (const k of ["password", "uuid", "username", "key_file", "path"])
+      for (const k of ["password", "uuid", "username", "key_file", "key_content", "path"])
         if (!o[k]) delete o[k];  // blank in edit mode = leave unchanged
       if (!("note" in o)) o.note = "";  // the form was prefilled: blank = cleared
       const r = await api(`/api/upstreams/${editingUp}/update`, o);

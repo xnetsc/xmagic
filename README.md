@@ -72,9 +72,11 @@ and upstream records to keep them distinct upstream.
 
 - The console is part of the deployment (the `admin` container) - no
   scripts need to run on the host. It shares the `data/` volume with
-  the gateway, re-renders after every change, and restarts xray / sshd
-  through the Docker socket (without the socket it renders only, and
-  the UI says so honestly).
+  the gateway, re-renders after every change, and restarts only the
+  affected containers (xray / sshd / tunnels) through the Docker
+  socket (without the socket it renders only, and the UI says so
+  honestly). When the rendered output does not change, nothing is
+  restarted.
 - **Exactly one admin account, Passkey only**: the first Passkey
   registered becomes the admin and registration then closes
   permanently. No passwords or other sign-in methods. User
@@ -252,6 +254,14 @@ python3 users.py setgroup alice team-b    # alice egresses via the team-b pool; 
   `data/ssh-tunnels.json` and `data/start-tunnels.sh`, held open by
   the compose `tunnels` sidecar (`--profile cascade`) running
   `ssh -N -D`.
+- An ssh upstream's private key can be given three ways: `--key-file`
+  with a path to a file already on the node; or by content - pasted
+  into the console or picked as a local file there (remote CLI:
+  `--key-upload <file>`; node CLI: `--key-content-file <file>`). The
+  node stores the content in `data/ssh_client_keys/` (mode 0600),
+  the upstream row records `/keys/<name>.key`, and removing the
+  upstream deletes the stored file. A user's SSH public key can
+  likewise be pasted or picked as a file in the console.
 - Several upstreams in one group form a pool. The strategy comes from
   env `UPSTREAM_STRATEGY`: `roundRobin` (default) / `random` /
   `leastPing` / `leastLoad`, chosen per connection.
@@ -345,13 +355,17 @@ labeled xray and dispatcher images; sshd / admin update manually via
 entrypoint starts admin / xray / sshd / dispatcher / tunnels, there
 is still only one exposed port (XRAY_PORT), and all state lives in
 the single `/data` volume. There is no process supervision: **if any
-critical process exits, the entrypoint takes the rest down with it
-and the container exits with that process's status**, to be revived
-as a whole by the runtime's restart policy - so it must run with a
-restart policy. Config changes (apply) work the same way: render
-first, then signal the gateway processes, and the container restarts
-whole onto the new config (a few seconds of downtime; sign-in
-sessions live in the database and are unaffected).
+critical process exits on its own, the entrypoint takes the rest
+down with it and the container exits with that process's status**,
+to be revived as a whole by the runtime's restart policy - so it
+must run with a restart policy. Config changes (apply) work
+differently: apply compares the rendered artifacts before and
+after, and asks the entrypoint to relaunch only the affected
+processes in place (user / upstream / route changes restart xray
+only, SSH public key changes sshd only, ssh upstream changes the
+tunnels process), leaving the rest uninterrupted. If a relaunched
+process dies again right away (the restart failed), the whole
+container still goes down and the runtime revives it.
 
 ```bash
 docker build -f Dockerfile.single -t xmagic-single .
@@ -424,7 +438,7 @@ suits light self-use; for the full gateway use a VPS + compose.
 - `sniff.py` - first-byte protocol dispatcher (stdlib only)
 - `docker-compose.yml` - xray / dispatcher / sshd / admin / tunnels (optional) / watchtower
 - `Dockerfile.xray`, `Dockerfile.dispatcher`, `Dockerfile.sshd`, `Dockerfile.admin`, `sshd_config`
-- `Dockerfile.single`, `single-entrypoint.sh`, `single-tunnels.sh` - the single-container form (for environments without compose; any critical process exiting takes the whole container down)
+- `Dockerfile.single`, `single-entrypoint.sh`, `single-tunnels.sh` - the single-container form (for environments without compose; any critical process exiting on its own takes the whole container down)
 - `app.json`, `heroku.yml` - Heroku one-click deploy descriptors (single-container form + Postgres business database)
 - `versions.env` - upstream pin (Xray version, maintained automatically by the upstream-check workflow)
 - `.github/workflows/` - `build.yml` (tests + build + push to GHCR + e2e), `upstream-check.yml` (automatic upstream version tracking)

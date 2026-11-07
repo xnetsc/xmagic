@@ -189,7 +189,13 @@ def applied_line(applied):
     line = (f"applied: {applied['users']} user(s), {applied['upstreams']} upstream(s), "
             f"{applied['ssh_keys']} ssh key(s)")
     if applied.get("restart_skipped"):
-        line += "; no docker socket on the node - restart xray/sshd there to apply"
+        line += "; changes pending - no restart channel on the node," \
+                " restart the gateway processes there to apply"
+    elif applied.get("container_restart"):
+        line += "; a targeted restart failed on the node" \
+                " - the whole container is restarting"
+    elif not applied.get("restarted"):
+        line += "; rendered output unchanged - nothing restarted"
     else:
         line += "; restarts: " + ", ".join(
             f"{k}={'ok' if v else 'FAILED'}"
@@ -516,13 +522,28 @@ def cmd_upstreams_list(args):
     emit(args, payload, "\n".join(lines) if lines else "(no upstreams - direct egress)")
 
 
+def _key_upload_content(args):
+    """--key-upload: a private key file on THIS machine. Its content is
+    sent to the node, which stores it (the upstream row then records
+    /keys/<name>.key). None when the flag is absent."""
+    path = getattr(args, "key_upload", None)
+    if not path:
+        return None
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError as exc:
+        die(2, f"cannot read key file {path}: {exc.strerror or exc}")
+
+
 def cmd_upstreams_add(args):
     api, _, _ = authed_api(args)
     payload = api.call("POST", "/api/upstreams", {
         "name": args.name, "address": args.addr, "port": args.port,
         "protocol": args.proto, "group": args.group, "path": args.path,
         "uuid": args.uuid, "username": args.username, "password": args.password,
-        "key_file": args.key_file, "tls": args.tls, "method": args.method,
+        "key_file": args.key_file, "key_content": _key_upload_content(args),
+        "tls": args.tls, "method": args.method,
         "note": args.note})
     emit(args, payload,
          f"upstream {args.name} added\n" + applied_line(payload.get("applied")))
@@ -550,6 +571,9 @@ def cmd_upstreams_edit(args):
         body["tls"] = True
     elif args.no_tls:
         body["tls"] = False
+    content = _key_upload_content(args)
+    if content is not None:
+        body["key_content"] = content
     if not body:
         die(2, "nothing to change: pass at least one --option")
     payload = api.call("POST", f"/api/upstreams/{args.name}/update", body)
@@ -770,6 +794,8 @@ def main():
                    choices=("vless-ws", "vless", "trojan-ws", "ss", "http", "socks", "ssh"))
     a.add_argument("--group"); a.add_argument("--path"); a.add_argument("--uuid")
     a.add_argument("--username"); a.add_argument("--password"); a.add_argument("--key-file")
+    a.add_argument("--key-upload", help="ssh upstream: upload this local private key"
+                                        " file; the node stores it")
     a.add_argument("--tls", action="store_true"); a.add_argument("--method")
     a.add_argument("--note"); a.set_defaults(fn=cmd_upstreams_add)
     for action in ("enable", "disable", "remove"):
@@ -780,6 +806,8 @@ def main():
     a.add_argument("--proto", choices=("vless-ws", "vless", "trojan-ws", "ss", "http", "socks", "ssh"))
     a.add_argument("--group"); a.add_argument("--path"); a.add_argument("--uuid")
     a.add_argument("--username"); a.add_argument("--password"); a.add_argument("--key-file")
+    a.add_argument("--key-upload", help="ssh upstream: replace the key with this"
+                                        " local file; the node stores it")
     a.add_argument("--tls", action="store_true"); a.add_argument("--no-tls", action="store_true")
     a.add_argument("--method"); a.add_argument("--note")
     a.set_defaults(fn=cmd_upstreams_edit)

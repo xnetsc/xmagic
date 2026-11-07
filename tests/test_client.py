@@ -297,6 +297,24 @@ def main():
         rc, out, err = cli("--json", "upstreams", "edit", "up1", "--port", "9999")
         check("upstreams edit via remote CLI",
               rc == 0 and json.loads(out)["upstream"]["port"] == 9999, err + out)
+        up_key = os.path.join(workdir, "upssh.pem")
+        with open(up_key, "w") as f:
+            f.write("-----BEGIN OPENSSH PRIVATE KEY-----\n"
+                    "ZmFrZS11cHNzaA==\n-----END OPENSSH PRIVATE KEY-----\n")
+        stored = os.path.join(workdir, "a", "data", "ssh_client_keys",
+                              "upssh.key")
+        rc, out, err = cli("--json", "upstreams", "add", "upssh",
+                           "--proto", "ssh", "--addr", "10.9.9.10",
+                           "--port", "22", "--username", "tunnel",
+                           "--key-upload", up_key)
+        check("upstreams add ssh with --key-upload stores the key",
+              rc == 0
+              and json.loads(out)["upstream"]["key_file"] == "/keys/upssh.key"
+              and os.path.exists(stored)
+              and "ZmFrZS11cHNzaA==" in open(stored).read(), err + out)
+        rc, out, err = cli("upstreams", "remove", "upssh")
+        check("upstreams remove deletes the uploaded key",
+              rc == 0 and not os.path.exists(stored), err + out)
         rc, out, err = cli("routes", "add", "--kind", "domain",
                            "--pattern", "example.com", "--to", "block")
         check("routes add via remote CLI", rc == 0, err + out)

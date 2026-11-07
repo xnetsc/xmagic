@@ -69,8 +69,9 @@ def main():
     check("apply renders config with CLI users",
           rc == 0 and "applied:" in out and bob.get("vless_uuid", "?") in flat, err)
     rc, out, _ = cli("--json", "apply")
-    check("--json apply reports restart skipped",
-          json.loads(out)["restart_skipped"] is True)
+    check("--json apply with nothing pending restarts nothing",
+          json.loads(out)["restarted"] == {}
+          and json.loads(out)["restart_skipped"] is False)
     rc, out, _ = cli("--json", "settings")
     check("settings default 168h", json.loads(out)["session_ttl_hours"] == 168, out)
     rc, out, _ = cli("settings", "--session-ttl-hours", "48")
@@ -157,37 +158,91 @@ def main():
     check("settings disable direct_allow_private via CLI",
           rc == 0 and "False" in out, out)
 
-    # Pidfile restart channel (single-container form): the pidfiles
-    # point at live stand-in processes; apply must SIGTERM all three
-    # (their exit is what restarts that container form as a whole).
+    # Pidfile restart channel (single-container form): apply restarts
+    # only the processes whose rendered inputs changed - it writes a
+    # restart marker naming the pid, then SIGTERMs exactly those
+    # processes. (The entrypoint relaunches a marked process in place;
+    # a relaunch that dies again takes the whole container down.)
     pid_dir = os.path.join(workdir, "pids")
     os.makedirs(pid_dir)
+    env_pid = dict(env, XMAGIC_PID_DIR=pid_dir)
     standins = {}
-    for name in ("xray", "sshd", "tunnels"):
+
+    def spawn(name):
         proc = subprocess.Popen(["sleep", "60"])
         standins[name] = proc
         with open(os.path.join(pid_dir, name + ".pid"), "w") as f:
             f.write(str(proc.pid))
-    env_pid = dict(env, XMAGIC_PID_DIR=pid_dir)
-    proc = subprocess.run([sys.executable, users_py, "--json", "apply"],
-                          env=env_pid, capture_output=True, text=True)
-    try:
-        applied = json.loads(proc.stdout)
-    except ValueError:
-        applied = {}
-    check("apply signals the gateway processes in pidfile mode",
-          proc.returncode == 0 and applied.get("restart_skipped") is False
-          and applied.get("restarted") == {"xray": True, "sshd": True,
-                                           "tunnels": True},
-          proc.stdout + proc.stderr)
-    exited = []
-    for p in standins.values():
+
+    def pid_apply():
+        proc = subprocess.run([sys.executable, users_py, "--json", "apply"],
+                              env=env_pid, capture_output=True, text=True)
         try:
-            exited.append(p.wait(timeout=10) == -15)
+            return proc, json.loads(proc.stdout)
+        except ValueError:
+            return proc, {}
+
+    def exited(name):
+        try:
+            return standins[name].wait(timeout=10) == -15
         except subprocess.TimeoutExpired:
-            exited.append(False)
-            p.kill()
-    check("signalled processes actually exited (SIGTERM)", all(exited))
+            return False
+
+    cli("apply")  # sync the rendered files before the scenarios
+    for n in ("xray", "sshd", "tunnels"):
+        spawn(n)
+    proc, applied = pid_apply()
+    check("pidfile apply with no changes restarts nothing",
+          proc.returncode == 0 and applied.get("changed") == []
+          and applied.get("restarted") == {}
+          and applied.get("restart_skipped") is False
+          and all(standins[n].poll() is None for n in standins),
+          proc.stdout + proc.stderr)
+    rc, _, err = cli("upstream-add", "edge-1", "--proto", "vless-ws",
+                     "--addr", "203.0.113.9", "--port", "443",
+                     "--uuid", "22222222-2222-4222-8222-222222222222")
+    check("upstream-add for the pidfile scenarios", rc == 0, err)
+    proc, applied = pid_apply()
+    req = os.path.join(pid_dir, "restart-xray.req")
+    check("config change restarts only xray (marker + SIGTERM)",
+          applied.get("restarted") == {"xray": True}
+          and applied.get("changed") == ["config"]
+          and os.path.exists(req)
+          and open(req).read() == str(standins["xray"].pid)
+          and exited("xray")
+          and standins["sshd"].poll() is None
+          and standins["tunnels"].poll() is None,
+          proc.stdout + proc.stderr)
+    spawn("xray")
+    pub_path = os.path.join(workdir, "alice.pub")
+    with open(pub_path, "w") as f:
+        f.write("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPidfileTestKey alice\n")
+    rc, _, err = cli("setkey", "alice", "--ssh-key-file", pub_path)
+    check("setkey for the pidfile scenarios", rc == 0, err)
+    proc, applied = pid_apply()
+    check("key change restarts only sshd",
+          applied.get("restarted") == {"sshd": True}
+          and applied.get("changed") == ["keys"]
+          and exited("sshd")
+          and standins["xray"].poll() is None
+          and standins["tunnels"].poll() is None,
+          proc.stdout + proc.stderr)
+    spawn("sshd")
+    rc, _, err = cli("upstream-add", "tun-1", "--proto", "ssh",
+                     "--addr", "203.0.113.10", "--port", "22",
+                     "--username", "tunnel", "--key-file", "/keys/tun-1.key")
+    check("ssh upstream-add for the pidfile scenarios", rc == 0, err)
+    proc, applied = pid_apply()
+    check("tunnels change restarts xray + tunnels, not sshd",
+          applied.get("restarted") == {"xray": True, "tunnels": True}
+          and "tunnels" in applied.get("changed", [])
+          and exited("xray") and exited("tunnels")
+          and standins["sshd"].poll() is None,
+          proc.stdout + proc.stderr)
+    for p in standins.values():
+        p.kill()
+    cli("upstream-remove", "edge-1")  # scenario rows must not leak into
+    cli("upstream-remove", "tun-1")   # the exact-list checks below
     proc = subprocess.run([sys.executable, users_py, "--json", "status"],
                           env=env_pid, capture_output=True, text=True)
     check("status restart_via is 'container' in pidfile mode",
@@ -196,6 +251,33 @@ def main():
     rc, out, _ = cli("--json", "status")
     check("status restart_via is null without a channel",
           json.loads(out)["restart_via"] is None, out)
+
+    # ssh upstream keys supplied as content are stored on the node.
+    key_path = os.path.join(workdir, "tun-2.pem")
+    with open(key_path, "w") as f:
+        f.write("-----BEGIN OPENSSH PRIVATE KEY-----\n"
+                "ZmFrZS10dW4tMg==\n-----END OPENSSH PRIVATE KEY-----\n")
+    stored = os.path.join(workdir, "data", "ssh_client_keys", "tun-2.key")
+    rc, out, err = cli("--json", "upstream-add", "tun-2", "--proto", "ssh",
+                       "--addr", "203.0.113.11", "--port", "22",
+                       "--username", "tunnel", "--key-content-file", key_path)
+    check("upstream-add with --key-content-file stores the key",
+          rc == 0 and json.loads(out)["key_file"] == "/keys/tun-2.key"
+          and os.path.exists(stored)
+          and "ZmFrZS10dW4tMg==" in open(stored).read()
+          and (os.stat(stored).st_mode & 0o777) == 0o600, err + out)
+    rc, _, err = cli("upstream-add", "tun-bad", "--proto", "ssh",
+                     "--addr", "203.0.113.12", "--port", "22",
+                     "--username", "tunnel", "--key-content-file", pub_path)
+    check("upstream-add rejects non-key content", rc != 0, err)
+    rc, out, err = cli("--json", "upstream-edit", "tun-2",
+                       "--key-content-file", key_path)
+    check("upstream-edit replaces the stored key",
+          rc == 0 and json.loads(out)["key_file"] == "/keys/tun-2.key",
+          err + out)
+    rc, _, err = cli("upstream-remove", "tun-2")
+    check("upstream-remove deletes the stored key",
+          rc == 0 and not os.path.exists(stored), err)
 
     rc, out, _ = cli("--json", "status")
     check("status shows registered admin", json.loads(out)["admin_registered"] is True)

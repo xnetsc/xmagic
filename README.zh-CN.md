@@ -58,7 +58,8 @@ HTTP 代理（CONNECT）、VLESS-WS、VLESS（裸 TCP）、Trojan-WS、裸 Shado
 
 - 后台是部署单元的一部分（`admin` 容器），不存在"宿主机上跑脚本"的依赖；
   它与网关共用 `data/` 卷，每次修改自动重新渲染，并通过 Docker socket
-  重启 xray / sshd 生效（没挂 socket 时只渲染，界面会如实提示）。
+  只重启受影响的容器（xray / sshd / tunnels）生效（没挂 socket 时只渲染，
+  界面会如实提示）。渲染产物没变化时不重启任何进程。
 - **只支持一个管理员账号，且只能用 Passkey**：第一个注册的 Passkey 即管理员，
   注册随即永久关闭；不支持密码或其它登录方式。用户验证（UV）强制开启。
 - 后台没有自己的公网端口：浏览器打开 `http://<节点>:<XRAY_PORT>/` 就是
@@ -201,6 +202,11 @@ python3 users.py setgroup alice team-b    # 让 alice 走 team-b 组的池，不
   ssh 上级在渲染时被映射为一个本地 SOCKS 端口，并生成 `data/ssh-tunnels.json`
   与 `data/start-tunnels.sh`，由 compose 的 `tunnels` sidecar
   （`--profile cascade`）常驻 `ssh -N -D` 保持隧道。
+- ssh 上级的私钥有三种给法：`--key-file` 给节点上已有文件的路径；在控制台
+  里直接粘贴私钥内容或选本地文件上传（远程 CLI 用 `--key-upload <本地文件>`、
+  节点 CLI 用 `--key-content-file <本地文件>`）——内容由节点存进
+  `data/ssh_client_keys/`（权限 0600），上级记录的路径记为 `/keys/<名称>.key`，
+  删除该上级时一并删除。用户的 SSH 公钥同理，可粘贴、也可在控制台选文件填入。
 - 同组多个上级组成一个池，策略由 env `UPSTREAM_STRATEGY` 选：
   `roundRobin`（默认）/ `random` / `leastPing` / `leastLoad`，按**连接**逐个选路。
 - 没有任何上级时，出口就是直连（freedom）。
@@ -274,10 +280,13 @@ sshd / admin 随 `docker compose pull` 手动更新（管理面不自己重启�
 
 `Dockerfile.single` 把全部进程打进一个镜像：入口脚本拉起 admin / xray /
 sshd / 分发器 / 隧道进程，对外仍只有 XRAY_PORT 一个端口，状态全在 /data
-一个卷里。没有进程监控：**任意关键进程退出，入口脚本就把其余进程全部
-带走、整容器以该进程的状态码退出**，靠运行时的重启策略整体拉回。因此
-必须带重启策略运行；配置变更（apply）也是先渲染、再给网关进程发信号，
-借整容器重启生效（数秒中断，管理员会话在库里、不受影响）。
+一个卷里。没有进程监控：**任意关键进程自行退出，入口脚本就把其余进程
+全部带走、整容器以该进程的状态码退出**，靠运行时的重启策略整体拉回，
+因此必须带重启策略运行。配置变更（apply）不同：apply 比较渲染前后的
+产物，只向受影响的进程发出重启请求（改用户 / 上级 / 路由只重启 xray，
+改 SSH 公钥只重启 sshd，改 ssh 上级只重启隧道进程），入口脚本将其原地
+拉起、其余进程不受影响；若拉起后立即退出（重启失败），仍按整容器退出
+处理、由运行时整体拉回。
 
 ```bash
 docker build -f Dockerfile.single -t xmagic-single .
@@ -332,7 +341,7 @@ VLESS-WS / Trojan-WS**；SOCKS5、SSH、裸 Shadowsocks、裸 VLESS-TCP
 - `sniff.py` — 首字节协议分发器（纯标准库）
 - `docker-compose.yml` — xray / dispatcher / sshd / admin / tunnels（可选）/ watchtower
 - `Dockerfile.xray`、`Dockerfile.dispatcher`、`Dockerfile.sshd`、`Dockerfile.admin`、`sshd_config`
-- `Dockerfile.single`、`single-entrypoint.sh`、`single-tunnels.sh` — 单容器形态（无 compose 时用；任一关键进程退出即整容器退出）
+- `Dockerfile.single`、`single-entrypoint.sh`、`single-tunnels.sh` — 单容器形态（无 compose 时用；任一关键进程自行退出即整容器退出）
 - `app.json`、`heroku.yml` — Heroku 一键部署描述（单容器形态 + Postgres 业务库）
 - `versions.env` — 上游钉版（Xray 版本，upstream-check 工作流自动维护）
 - `.github/workflows/` — `build.yml`（测试 + 构建推 GHCR）、`upstream-check.yml`（上游新版自动跟进）

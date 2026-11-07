@@ -247,6 +247,45 @@ def main():
                                 {"password": ""})
         check("upstream edit rejects an empty ss password", status == 400,
               f"got {status}")
+
+        # ssh upstream private keys: pasted/uploaded content is stored
+        # on the node (0600), the row records /keys/<name>.key, and the
+        # content itself is never returned by the API.
+        key_v1 = ("-----BEGIN OPENSSH PRIVATE KEY-----\n"
+                  "ZmFrZS12MQ==\n-----END OPENSSH PRIVATE KEY-----")
+        key_v2 = ("-----BEGIN OPENSSH PRIVATE KEY-----\n"
+                  "ZmFrZS12Mg==\n-----END OPENSSH PRIVATE KEY-----")
+        stored = os.path.join(workdir, "data", "ssh_client_keys", "up-ssh.key")
+        status, body = client.call("POST", "/api/upstreams",
+                                   {"name": "up-ssh", "protocol": "ssh",
+                                    "address": "10.4.4.4", "port": 22,
+                                    "username": "tunnel", "key_content": key_v1})
+        check("ssh upstream with uploaded key content",
+              status == 201 and body["upstream"]["key_file"] == "/keys/up-ssh.key"
+              and os.path.exists(stored)
+              and open(stored).read().strip() == key_v1
+              and (os.stat(stored).st_mode & 0o777) == 0o600,
+              f"{status} {body}")
+        status, body = client.call("GET", "/api/upstreams")
+        check("key content is never listed",
+              status == 200 and "ZmFrZS" not in json.dumps(body), f"{status}")
+        tunnels_script = os.path.join(workdir, "data", "start-tunnels.sh")
+        check("rendered tunnels use the stored key path",
+              os.path.exists(tunnels_script)
+              and "-i /keys/up-ssh.key" in open(tunnels_script).read())
+        status, _ = client.call("POST", "/api/upstreams",
+                                {"name": "up-bad", "protocol": "ssh",
+                                 "address": "10.4.4.5", "port": 22,
+                                 "username": "tunnel", "key_content": "not a key"})
+        check("invalid key content rejected", status == 400, f"got {status}")
+        status, body = client.call("POST", "/api/upstreams/up-ssh/update",
+                                   {"key_content": key_v2})
+        check("key content replaced on edit",
+              status == 200 and open(stored).read().strip() == key_v2,
+              f"{status} {body}")
+        status, body = client.call("POST", "/api/upstreams/up-ssh/remove", {})
+        check("removing the upstream deletes the stored key",
+              status == 200 and not os.path.exists(stored), f"{status} {body}")
         status, body = client.call("POST", "/api/routes/1/update",
                                    {"to": "direct"})
         check("route edit applies",
@@ -465,8 +504,9 @@ def main():
               f"{status} {body}")
 
         status, body = client.call("POST", "/api/apply", {})
-        check("standalone apply endpoint",
-              status == 200 and body["applied"]["restart_skipped"] is True,
+        check("standalone apply endpoint (nothing pending)",
+              status == 200 and body["applied"]["changed"] == []
+              and body["applied"]["restart_skipped"] is False,
               f"{status} {body}")
 
         conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=10)

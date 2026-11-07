@@ -1,13 +1,15 @@
 #!/bin/sh
 # Single-container entrypoint: prepare the data directory, start every
 # gateway process, and stay as PID 1. There is deliberately no process
-# supervisor: if ANY critical process exits, the rest are killed and
-# this script exits with that process's status, so the whole container
-# goes down as one unit (the runtime's restart policy brings it back).
-# Each process records its pid in $XMAGIC_PID_DIR/<name>.pid - that is
-# how apply restarts the gateway in this form: it signals xray / sshd /
-# tunnels, their exit is fatal here, and the container restarts whole
-# on the freshly rendered config.
+# supervisor: if a critical process exits on its own, the rest are
+# killed and this script exits with that process's status, so the
+# whole container goes down as one unit (the runtime's restart policy
+# brings it back). The one exception is an apply-requested restart:
+# apply writes a restart-<name>.req marker holding the pid and then
+# signals exactly the processes whose config changed; the watch loop
+# below relaunches a marked process in place. If the relaunched
+# process dies again (no marker), the restart counts as failed and
+# the container goes down as a whole, as before.
 set -e
 # Platforms that assign the public port (Heroku-style) set PORT; when
 # present it wins - the gateway must listen on exactly that port.
@@ -20,7 +22,11 @@ PID_DIR="${XMAGIC_PID_DIR:-/run/xmagic}"
 mkdir -p "$DATA_DIR/ssh_host_keys" "$DATA_DIR/ssh_client_keys" \
          "$PID_DIR" /etc/ssh/keys /run/sshd
 chmod 755 /run/sshd 2>/dev/null || true
-rm -f "$PID_DIR"/*.pid
+rm -f "$PID_DIR"/*.pid "$PID_DIR"/*.req
+# Uploaded ssh-upstream private keys live in the data dir; the tunnels'
+# ssh commands reference them as /keys/<file>, the same path the
+# compose form's /keys mount provides.
+ln -sfn "$DATA_DIR/ssh_client_keys" /keys
 
 # sshd host keys persist in the data volume (sshd_config points at
 # /etc/ssh/keys - link the persistent copies in).
@@ -81,53 +87,92 @@ EOF
 fi
 
 cd /app
-python3 /app/admin.py &
-echo $! > "$PID_DIR/admin.pid"
-/usr/local/bin/xray run -c "$DATA_DIR/config.json" &
-echo $! > "$PID_DIR/xray.pid"
-# sshd's StrictModes requires every directory above AuthorizedKeysFile
-# to be owned by root or the login user. $DATA_DIR may be a bind mount
-# owned by an unprivileged host user, which sshd refuses outright
-# ("bad ownership or modes for directory /data"), so sshd reads a
-# root-owned copy staged in the pid dir. Apply in this form restarts
-# the whole container, so the copy is re-staged at every boot.
-SSHD_KEYS="$PID_DIR/authorized_keys"
 chmod 0755 "$PID_DIR" # sshd traverses this dir as the login user
-if [ -f "$DATA_DIR/authorized_keys" ]; then
-  cp "$DATA_DIR/authorized_keys" "$SSHD_KEYS"
-  chown root:root "$SSHD_KEYS"; chmod 0644 "$SSHD_KEYS"
-else
-  rm -f "$SSHD_KEYS"
-fi
-/usr/sbin/sshd -D -e -p "${SSH_BE_PORT:-12222}" \
-  -o "AuthorizedKeysFile=$SSHD_KEYS" &
-echo $! > "$PID_DIR/sshd.pid"
-python3 /app/sniff.py &
-echo $! > "$PID_DIR/dispatcher.pid"
-sh /app/single-tunnels.sh &
-echo $! > "$PID_DIR/tunnels.pid"
 
-PIDS=$(cat "$PID_DIR"/*.pid)
+# Each gateway process has a start function so the watch loop can
+# relaunch it in place for an apply-requested restart.
+start_admin() {
+  python3 /app/admin.py &
+  echo $! > "$PID_DIR/admin.pid"
+}
+start_xray() {
+  /usr/local/bin/xray run -c "$DATA_DIR/config.json" &
+  echo $! > "$PID_DIR/xray.pid"
+}
+start_sshd() {
+  # sshd's StrictModes requires every directory above AuthorizedKeysFile
+  # to be owned by root or the login user. $DATA_DIR may be a bind mount
+  # owned by an unprivileged host user, which sshd refuses outright
+  # ("bad ownership or modes for directory /data"), so sshd reads a
+  # root-owned copy staged in the pid dir. The copy is re-staged at
+  # every sshd (re)start, so key changes take effect with an
+  # sshd-only restart.
+  SSHD_KEYS="$PID_DIR/authorized_keys"
+  if [ -f "$DATA_DIR/authorized_keys" ]; then
+    cp "$DATA_DIR/authorized_keys" "$SSHD_KEYS"
+    chown root:root "$SSHD_KEYS"; chmod 0644 "$SSHD_KEYS"
+  else
+    rm -f "$SSHD_KEYS"
+  fi
+  /usr/sbin/sshd -D -e -p "${SSH_BE_PORT:-12222}" \
+    -o "AuthorizedKeysFile=$SSHD_KEYS" &
+  echo $! > "$PID_DIR/sshd.pid"
+}
+start_dispatcher() {
+  python3 /app/sniff.py &
+  echo $! > "$PID_DIR/dispatcher.pid"
+}
+start_tunnels() {
+  sh /app/single-tunnels.sh &
+  echo $! > "$PID_DIR/tunnels.pid"
+}
+
+NAMES="admin xray sshd dispatcher tunnels"
+start_admin
+start_xray
+start_sshd
+start_dispatcher
+start_tunnels
+
+kill_all() {
+  sig="${1:-TERM}"
+  for n in $NAMES; do
+    [ -f "$PID_DIR/$n.pid" ] && kill "-$sig" "$(cat "$PID_DIR/$n.pid")" 2>/dev/null || true
+  done
+}
 
 shutdown() {
-  kill $PIDS 2>/dev/null || true
+  kill_all TERM
   exit "${1:-0}"
 }
 trap 'shutdown 0' TERM INT
 
-# Watch: the first process to exit takes the container with it.
+# Watch: a process whose exit carries a matching restart request
+# (written by apply, holding its pid) is relaunched in place - that is
+# how a config change restarts only the processes it affects. Any
+# other exit - including a relaunched process dying again, i.e. the
+# requested restart failed - takes the whole container down.
 # (`wait` returns the child's status as its own exit code, so it must
 # be guarded with || - under `set -e` an unguarded non-zero wait would
 # kill this script silently before the teardown runs.)
 while :; do
-  for pid in $PIDS; do
+  for name in $NAMES; do
+    pid=$(cat "$PID_DIR/$name.pid" 2>/dev/null) || continue
+    [ -n "$pid" ] || continue
     if ! kill -0 "$pid" 2>/dev/null; then
+      req="$PID_DIR/restart-$name.req"
+      if [ -f "$req" ] && [ "$(cat "$req" 2>/dev/null)" = "$pid" ]; then
+        rm -f "$req"
+        echo "xmagic: restarting $name (apply requested)" >&2
+        start_$name
+        continue
+      fi
       code=0
       wait "$pid" 2>/dev/null || code=$?
-      echo "xmagic: process $pid exited (status $code); shutting down" >&2
-      kill $PIDS 2>/dev/null || true
+      echo "xmagic: process $name ($pid) exited (status $code); shutting down" >&2
+      kill_all TERM
       sleep 1
-      kill -9 $PIDS 2>/dev/null || true
+      kill_all KILL
       exit "$code"
     fi
   done
