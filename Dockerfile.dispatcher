@@ -1,0 +1,6 @@
+# First-byte dispatcher: owns the single public port and routes each
+# connection by its opening bytes (SSH banner / SOCKS5 / HTTP / WS /
+# anything else) to the sshd, the proxy inbounds, or the Xray mux.
+FROM python:3.12-alpine
+COPY sniff.py /app/sniff.py
+CMD ["python3", "/app/sniff.py"]

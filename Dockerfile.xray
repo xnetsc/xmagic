@@ -1,0 +1,7 @@
+# The gateway's Xray core, republished under our own registry path so a
+# deployment tracks a deliberate pin instead of upstream ":latest".
+# No content changes - this is the upstream image, re-tagged. The pin
+# lives in versions.env and is bumped by the upstream-check workflow;
+# CI passes it as a build arg.
+ARG XRAY_VERSION=26.10.31
+FROM ghcr.io/xtls/xray-core:${XRAY_VERSION}

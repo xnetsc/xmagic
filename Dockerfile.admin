@@ -1,0 +1,15 @@
+# Admin console (Passkey-only HTTP UI) + the users.py CLI engine.
+# One image, two entry modes:
+#   docker compose up -d admin                     -> the web console
+#   docker compose run --rm admin python3 /app/users.py <cmd>   -> the CLI
+# The console shares the ./data volume with the gateway: it renders
+# config.json / authorized_keys there and restarts the xray/sshd
+# containers over the mounted Docker socket.
+FROM python:3.12-alpine
+COPY users.py admin.py /app/
+WORKDIR /app
+ENV PROXY_DB=/data/users.db \
+    XMAGIC_ADMIN_BIND=0.0.0.0 \
+    XMAGIC_ADMIN_PORT=8090
+EXPOSE 8090
+CMD ["python3", "/app/admin.py"]

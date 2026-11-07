@@ -1,0 +1,13 @@
+# SSH entry for the gateway node: one system user `proxy`, key-only auth,
+# TCP forwarding on (that's what `ssh -D` needs), shell present but the
+# account is meant for proxying. authorized_keys is rendered by users.py
+# from the same SQLite DB as the Xray config and mounted at runtime.
+FROM alpine:3.20
+RUN apk add --no-cache openssh-server \
+ && adduser -D -s /bin/sh proxy \
+ && passwd -u proxy \
+ && mkdir -p /home/proxy/.ssh /etc/ssh/keys \
+ && chown proxy:proxy /home/proxy/.ssh && chmod 700 /home/proxy/.ssh
+COPY sshd_config /etc/ssh/sshd_config
+EXPOSE 12222
+CMD ["sh", "-c", "for t in rsa ecdsa ed25519; do [ -f /etc/ssh/keys/ssh_host_${t}_key ] || ssh-keygen -t $t -f /etc/ssh/keys/ssh_host_${t}_key -N ''; done; exec /usr/sbin/sshd -D -e -p ${SSH_BE_PORT:-12222}"]

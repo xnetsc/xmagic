@@ -1,0 +1,15 @@
+# Gateway SSH entry - key-only, forwarding-only by intent.
+HostKey /etc/ssh/keys/ssh_host_rsa_key
+HostKey /etc/ssh/keys/ssh_host_ecdsa_key
+HostKey /etc/ssh/keys/ssh_host_ed25519_key
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+AllowUsers proxy
+AuthorizedKeysFile .ssh/authorized_keys
+AllowTcpForwarding yes
+GatewayPorts no
+PermitTunnel no
+X11Forwarding no
+PrintMotd no
