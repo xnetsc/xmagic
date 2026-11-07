@@ -399,7 +399,7 @@ def main():
         with open(copy_path, "w") as f:
             f.write(cli_src)
         with open(os.path.join(upd_dir, "xmagic.py"), "w") as f:
-            f.write(cli_src.replace('VERSION = "1.1.0"',
+            f.write(cli_src.replace('VERSION = "1.2.0"',
                                     'VERSION = "9.9.9"'))
         with open(os.path.join(upd_dir, "bad.py"), "w") as f:
             f.write("not a cli\n")
@@ -420,15 +420,15 @@ def main():
                                     base + "/xmagic.py")
             check("update --check reports the newer version, file untouched",
                   rc == 0 and "9.9.9" in out
-                  and 'VERSION = "1.1.0"' in open(copy_path).read(), err + out)
+                  and 'VERSION = "1.2.0"' in open(copy_path).read(), err + out)
             rc, out, err = cli_copy("update", "--from", base + "/bad.py")
             check("update refuses a download that is not xmagic.py",
-                  rc == 1 and 'VERSION = "1.1.0"' in open(copy_path).read(),
+                  rc == 1 and 'VERSION = "1.2.0"' in open(copy_path).read(),
                   err + out)
             rc, out, err = cli_copy("update", "--from", base + "/xmagic.py")
             check("update replaces the file and keeps a .bak",
                   rc == 0 and 'VERSION = "9.9.9"' in open(copy_path).read()
-                  and 'VERSION = "1.1.0"' in open(copy_path + ".bak").read(),
+                  and 'VERSION = "1.2.0"' in open(copy_path + ".bak").read(),
                   err + out)
             rc, out, err = cli_copy("--version")
             check("updated CLI runs and reports the new version",
@@ -439,7 +439,7 @@ def main():
         # ---- self-update from the node itself: the installed CLI must
         # end up byte-identical to the copy the deployment bundles
         with open(copy_path, "w") as f:
-            f.write(cli_src)  # pristine again (the .bak still holds 1.1.0)
+            f.write(cli_src)  # pristine again (the .bak still holds 1.2.0)
         rc, out, err = cli_copy("update")
         check("update from the node: already identical, nothing replaced",
               rc == 0 and "identical" in out

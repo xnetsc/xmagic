@@ -751,7 +751,7 @@ def _key_upload_content(args):
 
 # ------------------------------------------------------------ self-update
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 CLI_DOWNLOAD_PATH = "/cli/xmagic.py"  # served by every deployed node
 
 
