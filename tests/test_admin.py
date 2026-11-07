@@ -642,6 +642,9 @@ def main():
               and 'id="up-add-btns"' in page
               and 'data-up-tab="list"' in page
               and 'id="up-form-tab"' in page
+              and 'data-user-tab="list"' in page
+              and 'id="user-form-tab"' in page
+              and "data-add-user" in page
               and "（未启用）" in page,
               f"status {resp.status}")
 

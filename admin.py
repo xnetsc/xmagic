@@ -1363,8 +1363,8 @@ td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
   padding:.5rem .95rem;font-size:.9rem;font-weight:600;color:var(--muted);margin-bottom:-1px}
 .tabs .tab:hover{background:none;color:var(--text)}
 .tabs .tab.active{color:var(--accent);border-bottom-color:var(--accent)}
-#form-upstream .form-grid{grid-template-columns:1fr;max-width:560px;margin-top:.2rem}
-#form-upstream .form-grid .wide{grid-column:auto}
+#form-upstream .form-grid, #form-user .form-grid{grid-template-columns:1fr;max-width:560px;margin-top:.2rem}
+#form-upstream .form-grid .wide, #form-user .form-grid .wide{grid-column:auto}
 .keyrow{display:flex;gap:.5rem;align-items:flex-start}
 .keyrow>input,.keyrow>textarea{flex:1}
 .form-actions{display:flex;gap:.5rem;align-items:center;margin-top:1rem;flex-wrap:wrap}
@@ -1452,7 +1452,15 @@ td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
         <div class="card">
           <h2>代理用户</h2>
           <p class="sub">每个用户有一套 Trojan / HTTP 凭证与独立的 Shadowsocks 密码，可选登记 SSH 公钥。VLESS 默认关闭（在「设置」里开启后凭 UUID 接入），公网 SOCKS5 默认关闭。</p>
-          <div class="tbl-wrap"><table id="users-table"></table></div>
+          <div class="add-bar"><span class="lbl">添加用户：</span><button class="btn ghost sm" data-add-user>+ 代理用户</button></div>
+          <div class="tabs" id="user-tabs">
+            <button type="button" class="tab active" data-user-tab="list">用户列表</button>
+            <button type="button" class="tab hidden" data-user-tab="form" id="user-form-tab"></button>
+          </div>
+          <div id="user-panel-list">
+            <div class="tbl-wrap"><table id="users-table"></table></div>
+          </div>
+          <div id="user-panel-form" class="hidden">
           <form id="form-user">
             <div class="form-grid">
               <div><label>用户名</label><input name="username" placeholder="用户名" required></div>
@@ -1464,8 +1472,10 @@ td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
                 <button type="button" class="btn ghost sm" id="btn-gen-userkey">生成密钥对</button>
                 <input type="file" id="pick-pubkey" class="hidden"></div></div>
             </div>
-            <div class="form-actions"><button class="primary">添加用户</button></div>
+            <div class="form-actions"><button class="primary">保存</button>
+              <button type="button" id="user-cancel">取消</button></div>
           </form>
+          </div>
         </div>
       </section>
 
@@ -1473,13 +1483,13 @@ td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
         <div class="card">
           <h2>上级节点</h2>
           <p class="sub">级联上级按用户分组选择，池策略在「设置」里调整。带 * 的凭据字段在编辑时留空表示不改动。</p>
+          <div class="add-bar"><span class="lbl">添加上级：</span><span id="up-add-btns"></span></div>
           <div class="tabs" id="up-tabs">
             <button type="button" class="tab active" data-up-tab="list">上级列表</button>
             <button type="button" class="tab hidden" data-up-tab="form" id="up-form-tab"></button>
           </div>
           <div id="up-panel-list">
             <div class="tbl-wrap"><table id="upstreams-table"></table></div>
-            <div class="add-bar"><span class="lbl">添加上级：</span><span id="up-add-btns"></span></div>
           </div>
           <div id="up-panel-form" class="hidden">
           <form id="form-upstream">
@@ -1895,7 +1905,7 @@ const formJson = form => { const o = {};
 $("form-user").onsubmit = async e => { e.preventDefault();
   try { const r = await api("/api/users", formJson(e.target));
     msg(`用户 ${r.user.username} 已建：uuid ${r.user.vless_uuid}，密码 ${r.user.password}，ss ${r.user.ss_password}。` +
-        appliedText(r.applied), true); e.target.reset(); refresh(); }
+        appliedText(r.applied), true); closeUserFormTab(); refresh(); }
   catch (err) { msg(String(err)); } };
 let editingUp = null, editingRoute = null;
 const setField = (form, name, value) => { const el = form.querySelector(`[name=${name}]`);
@@ -1916,6 +1926,8 @@ document.addEventListener("click", e => {
     $("up-submit").textContent = "保存修改：" + u.name;
     openUpFormTab("编辑上级：" + u.name);
     msg("正在编辑上级 " + u.name + "：密码等字段留空 = 不改动", true); return; }
+  const bu2 = e.target.closest("button[data-add-user]");
+  if (bu2) { $("form-user").reset(); openUserFormTab(); return; }
   const ba = e.target.closest("button[data-add-up]");
   if (ba) { const p = ba.dataset.addUp; const f = $("form-upstream");
     editingUp = null; f.reset(); buildUpProtoOptions(p);
@@ -1960,6 +1972,25 @@ function closeUpFormTab() {
 }
 document.querySelectorAll("#up-tabs .tab").forEach(t =>
   t.addEventListener("click", () => switchUpTab(t.dataset.upTab)));
+function switchUserTab(which) {
+  document.querySelectorAll("#user-tabs .tab").forEach(t =>
+    t.classList.toggle("active", t.dataset.userTab === which));
+  $("user-panel-list").classList.toggle("hidden", which !== "list");
+  $("user-panel-form").classList.toggle("hidden", which !== "form");
+}
+function openUserFormTab() {
+  const tab = $("user-form-tab");
+  tab.textContent = "添加用户"; tab.classList.remove("hidden");
+  switchUserTab("form");
+}
+function closeUserFormTab() {
+  $("form-user").reset();
+  $("user-form-tab").classList.add("hidden");
+  switchUserTab("list");
+}
+document.querySelectorAll("#user-tabs .tab").forEach(t =>
+  t.addEventListener("click", () => switchUserTab(t.dataset.userTab)));
+$("user-cancel").onclick = () => closeUserFormTab();
 function buildUpAddBtns() {
   const list = UP_PROTOS.filter(p =>
     window.__vlessOn || (p !== "vless-ws" && p !== "vless"));
