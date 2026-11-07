@@ -1330,6 +1330,15 @@ td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
 .form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:.8rem .9rem;margin-top:1rem}
 .form-grid .wide{grid-column:span 2}
 .form-grid .full{grid-column:1/-1}
+.add-bar{display:flex;align-items:center;gap:.5rem;flex-wrap:wrap;margin-top:1rem}
+.add-bar .lbl{color:var(--muted);font-size:.85rem}
+.tabs{display:flex;gap:.3rem;border-bottom:1px solid var(--border);margin-bottom:1rem}
+.tabs .tab{border:0;background:none;border-bottom:2px solid transparent;border-radius:0;
+  padding:.5rem .95rem;font-size:.9rem;font-weight:600;color:var(--muted);margin-bottom:-1px}
+.tabs .tab:hover{background:none;color:var(--text)}
+.tabs .tab.active{color:var(--accent);border-bottom-color:var(--accent)}
+#form-upstream .form-grid{grid-template-columns:1fr;max-width:560px;margin-top:.2rem}
+#form-upstream .form-grid .wide{grid-column:auto}
 .keyrow{display:flex;gap:.5rem;align-items:flex-start}
 .keyrow>input,.keyrow>textarea{flex:1}
 .form-actions{display:flex;gap:.5rem;align-items:center;margin-top:1rem;flex-wrap:wrap}
@@ -1438,7 +1447,15 @@ td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
         <div class="card">
           <h2>上级节点</h2>
           <p class="sub">级联上级按用户分组选择，池策略在「设置」里调整。带 * 的凭据字段在编辑时留空表示不改动。</p>
-          <div class="tbl-wrap"><table id="upstreams-table"></table></div>
+          <div class="tabs" id="up-tabs">
+            <button type="button" class="tab active" data-up-tab="list">上级列表</button>
+            <button type="button" class="tab hidden" data-up-tab="form" id="up-form-tab"></button>
+          </div>
+          <div id="up-panel-list">
+            <div class="tbl-wrap"><table id="upstreams-table"></table></div>
+            <div class="add-bar"><span class="lbl">添加上级：</span><span id="up-add-btns"></span></div>
+          </div>
+          <div id="up-panel-form" class="hidden">
           <form id="form-upstream">
             <div class="form-grid">
               <div><label>名称</label><input name="name" placeholder="名称" required></div>
@@ -1468,10 +1485,11 @@ td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
             </div>
             <div class="form-actions">
               <span class="check" data-proto="vless-ws vless trojan-ws"><input type="checkbox" name="tls" id="up-tls"><label for="up-tls">TLS</label></span>
-              <button id="up-submit" class="primary">添加上级</button>
-              <button type="button" id="up-cancel" class="hidden">取消编辑</button>
+              <button id="up-submit" class="primary">保存</button>
+              <button type="button" id="up-cancel">取消</button>
             </div>
           </form>
+          </div>
         </div>
       </section>
 
@@ -1673,7 +1691,7 @@ async function refresh() {
   sf.querySelector("[name=vless_enabled]").checked =
     !!settings.vless_enabled;
   window.__vlessOn = !!settings.vless_enabled;
-  buildUpProtoOptions(); syncUpProto(); syncVlessPaths();
+  buildUpProtoOptions(); buildUpAddBtns(); syncUpProto(); syncVlessPaths();
   sf.querySelector("[name=interconnect_off_groups]").value =
     settings.db_values.interconnect_off_groups || "";
   $("admin-line").textContent = s.admin_registered
@@ -1869,8 +1887,15 @@ document.addEventListener("click", e => {
     f.querySelector("[name=tls]").checked = !!u.tls;
     f.querySelector("[name=name]").disabled = true;
     $("up-submit").textContent = "保存修改：" + u.name;
-    $("up-cancel").classList.remove("hidden");
+    openUpFormTab("编辑上级：" + u.name);
     msg("正在编辑上级 " + u.name + "：密码等字段留空 = 不改动", true); return; }
+  const ba = e.target.closest("button[data-add-up]");
+  if (ba) { const p = ba.dataset.addUp; const f = $("form-upstream");
+    editingUp = null; f.reset(); buildUpProtoOptions(p);
+    f.querySelector("[name=protocol]").value = p; syncUpProto();
+    f.querySelector("[name=name]").disabled = false;
+    $("up-submit").textContent = "保存";
+    openUpFormTab("添加上级 · " + p); return; }
   const br = e.target.closest("button[data-edit-route]");
   if (br) { const r = (window._routes || []).find(x => x.id === Number(br.dataset.editRoute)); if (!r) return;
     switchView("routes");
@@ -1885,10 +1910,35 @@ document.addEventListener("click", e => {
 $("up-cancel").onclick = () => { editingUp = null; const f = $("form-upstream");
   f.reset(); buildUpProtoOptions(); syncUpProto();
   f.querySelector("[name=name]").disabled = false;
-  $("up-submit").textContent = "添加上级"; $("up-cancel").classList.add("hidden"); };
+  closeUpFormTab(); };
 $("route-cancel").onclick = () => { editingRoute = null; $("form-route").reset();
   $("route-submit").textContent = "添加路由"; $("route-cancel").classList.add("hidden"); };
 const UP_PROTOS = ["vless-ws", "vless", "trojan-ws", "ss", "http", "socks", "ssh"];
+const UP_LABELS = {"vless-ws": "VLESS-WS", "vless": "VLESS", "trojan-ws": "Trojan-WS",
+  "ss": "Shadowsocks", "http": "HTTP", "socks": "SOCKS5", "ssh": "SSH"};
+function switchUpTab(which) {
+  document.querySelectorAll("#up-tabs .tab").forEach(t =>
+    t.classList.toggle("active", t.dataset.upTab === which));
+  $("up-panel-list").classList.toggle("hidden", which !== "list");
+  $("up-panel-form").classList.toggle("hidden", which !== "form");
+}
+function openUpFormTab(title) {
+  const tab = $("up-form-tab");
+  tab.textContent = title; tab.classList.remove("hidden");
+  switchUpTab("form");
+}
+function closeUpFormTab() {
+  $("up-form-tab").classList.add("hidden");
+  switchUpTab("list");
+}
+document.querySelectorAll("#up-tabs .tab").forEach(t =>
+  t.addEventListener("click", () => switchUpTab(t.dataset.upTab)));
+function buildUpAddBtns() {
+  const list = UP_PROTOS.filter(p =>
+    window.__vlessOn || (p !== "vless-ws" && p !== "vless"));
+  $("up-add-btns").innerHTML = list.map(p =>
+    `<button class="btn ghost sm" data-add-up="${p}">+ ${UP_LABELS[p]}</button>`).join(" ");
+}
 function buildUpProtoOptions(keep) {
   const sel = $("form-upstream").querySelector("[name=protocol]");
   const cur = keep || sel.value;
@@ -1922,7 +1972,7 @@ $("form-upstream").onsubmit = async e => { e.preventDefault();
       msg("上级已修改。" + appliedText(r.applied), true); $("up-cancel").onclick();
     } else {
       const r = await api("/api/upstreams", formJson(e.target));
-      msg("上级已添加。" + appliedText(r.applied), true); e.target.reset(); syncUpProto(); }
+      msg("上级已添加。" + appliedText(r.applied), true); $("up-cancel").onclick(); }
     refresh(); }
   catch (err) { msg(String(err)); } };
 $("form-route").onsubmit = async e => { e.preventDefault();

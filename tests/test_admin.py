@@ -626,6 +626,9 @@ def main():
               and "公网 SOCKS5 默认关闭" in page
               and '<select name="method"' in page
               and "buildUpProtoOptions" in page
+              and 'id="up-add-btns"' in page
+              and 'data-up-tab="list"' in page
+              and 'id="up-form-tab"' in page
               and "（未启用）" in page,
               f"status {resp.status}")
 
