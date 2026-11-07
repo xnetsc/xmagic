@@ -9,6 +9,12 @@
 # tunnels, their exit is fatal here, and the container restarts whole
 # on the freshly rendered config.
 set -e
+# Platforms that assign the public port (Heroku-style) set PORT; when
+# present it wins - the gateway must listen on exactly that port.
+if [ -n "${PORT:-}" ]; then
+  XRAY_PORT="$PORT"
+  export XRAY_PORT
+fi
 DATA_DIR=$(dirname "${PROXY_DB:-/data/users.db}")
 PID_DIR="${XMAGIC_PID_DIR:-/run/xmagic}"
 mkdir -p "$DATA_DIR/ssh_host_keys" "$DATA_DIR/ssh_client_keys" \
@@ -24,6 +30,40 @@ for t in rsa ecdsa ed25519; do
   ln -sf "$key" "/etc/ssh/keys/ssh_host_${t}_key"
   ln -sf "$key.pub" "/etc/ssh/keys/ssh_host_${t}_key.pub"
 done
+
+# Platforms that hand the app a database URL (Heroku-style DATABASE_URL)
+# get a persistent business database: register it as the "heroku" config
+# and activate it, so identity survives the platform's ephemeral
+# filesystem and restarts. Best effort - without it the node simply
+# stays on the default local SQLite.
+if [ -n "${DATABASE_URL:-}" ]; then
+  python3 - <<'EOF' || true
+import os
+import sys
+
+sys.path.insert(0, "/app")
+import users
+
+url = os.environ["DATABASE_URL"]
+if url.startswith("postgres://"):
+    url = "postgresql://" + url[len("postgres://"):]
+if "sslmode=" not in url:
+    url += ("&" if "?" in url else "?") + "sslmode=require"
+try:
+    names = [c["name"] for c in users.list_db_configs()]
+    if "heroku" not in names:
+        users.add_db_config("heroku", "postgres", url,
+                            "from DATABASE_URL")
+    elif users.resolve_db_config("heroku")["target"] != url:
+        users.edit_db_config("heroku", target=url)
+    if users.active_db_config()["name"] != "heroku":
+        users.switch_db_config("heroku")
+except Exception as exc:  # noqa: BLE001
+    # Type only: driver messages can embed the DSN (and its password).
+    print(f"DATABASE_URL setup failed ({type(exc).__name__}); "
+          "staying on the default database", file=sys.stderr)
+EOF
+fi
 
 # First boot: render an initial (empty but valid) gateway config so
 # xray has a file to start with. Best effort only - the admin console

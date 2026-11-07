@@ -23,7 +23,11 @@
 # config.json / authorized_keys, sshd host keys, ssh client keys) -
 # mount a volume there. Configuration is the same environment as
 # compose (see .env.example), read at container start; changing
-# XRAY_PORT means changing the -p mapping to match.
+# XRAY_PORT means changing the -p mapping to match. Platform
+# adaptation: when PORT is set (Heroku-style) it becomes the public
+# port, and when DATABASE_URL is set the entrypoint registers it as
+# the business database (see single-entrypoint.sh) - that is what the
+# Heroku one-click deploy (app.json + heroku.yml) relies on.
 ARG XRAY_VERSION=26.10.31
 FROM ghcr.io/xtls/xray-core:${XRAY_VERSION} AS xray-core
 
