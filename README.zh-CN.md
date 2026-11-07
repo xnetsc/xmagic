@@ -159,7 +159,8 @@ python3 xmagic.py update           # 从仓库把本 CLI 更新到最新版
   ed25519 密钥对。给用户生成时私钥只留在客户端（控制台是一次性下载，
   节点只存公钥）；给 SSH 上级生成时私钥按托管密钥存于节点。控制台的
   用户列表会给登记了公钥的用户直接显示现成的
-  `ssh -D 1080 -N -p <端口> <用户>@<节点>` 命令——普通 SSH 客户端
+  `ssh -D 1080 -N -i xmagic-<用户名>.key -p <端口> proxy@<节点>` 命令
+  （sshd 登录名恒为 `proxy`，是哪位网关用户由钥决定）——普通 SSH 客户端
   就是可用的代理客户端。
 - `xmagic update` 从仓库自更新：下载先过版本校验与自检（--version
   探针），通过才替换当前文件，旧版保留为 `xmagic.py.bak`
@@ -252,7 +253,7 @@ python3 users.py route-add --kind full --pattern example.com --to intl --user ca
 `settings --interconnect-off-groups`）填入的分组退出互访。
 
 - 暴露：用户用反向转发把服务挂到网关回环，如
-  `ssh -R 127.0.0.1:20005:127.0.0.1:8080 -N -p <端口> <用户>@<节点>`
+  `ssh -R 127.0.0.1:20005:127.0.0.1:8080 -N -i <私钥文件> -p <端口> proxy@<节点>`
   把本机 8080 暴露出来。每人固定一段 16 个端口（20000–21599，
   见控制台用户列表），sshd 按钥逐段限制（authorized_keys 的
   `permitlisten`），谁也占不了别人的端口。

@@ -198,7 +198,9 @@ python3 xmagic.py update           # update this CLI to the latest version from 
   download; the node stores only the public key); for an SSH upstream
   the generated key is stored on the node as its managed key. On the
   console, a user with a registered key shows the ready-made
-  `ssh -D 1080 -N -p <port> <user>@<node>` command - a plain SSH
+  `ssh -D 1080 -N -i xmagic-<user>.key -p <port> proxy@<node>` command
+  (the sshd login name is always `proxy`; the key says which gateway
+  user you are) - a plain SSH
   client is a working proxy client.
 - `xmagic update` self-updates from the repository: the download is
   version-checked and self-tested before it replaces the running
@@ -316,7 +318,7 @@ gateway, LAN-style. It is **on by default**; Settings (or
 `settings --interconnect-off-groups`) lists the groups that opt out.
 
 - Expose: a user holds a reverse forward to the gateway loopback,
-  e.g. `ssh -R 127.0.0.1:20005:127.0.0.1:8080 -N -p <port> <user>@<node>`
+  e.g. `ssh -R 127.0.0.1:20005:127.0.0.1:8080 -N -i <keyfile> -p <port> proxy@<node>`
   publishes their local port 8080. Each user owns a fixed slice of
   16 ports (20000-21599, shown in the console's user list); sshd
   enforces the slice per key (`permitlisten` in authorized_keys), so
