@@ -206,6 +206,25 @@ def main():
           and all(c["flow"] == "xtls-rprx-vision"
                   for c in reality_in["settings"]["clients"]),
           json.dumps(reality_in))
+    # SS over WS rides the same mux as the other WS families: one
+    # backend inbound per path, the bare SS client list, and a mux
+    # fallback entry pointing at it.
+    ssws_in = next((i for i in vcfg["inbounds"] if i["tag"] == "ss-ws-0"),
+                   None)
+    users_now = json.loads(cli("--json", "list")[1])
+    check("ss-ws inbound on by default: /ss-ws path, ss clients, fallback",
+          ssws_in is not None
+          and ssws_in["streamSettings"] == {
+              "network": "ws", "wsSettings": {"path": "/ss-ws"}}
+          and {c["password"] for c in ssws_in["settings"]["clients"]}
+              == {u["ss_password"] for u in users_now}
+          and {c["email"] for c in ssws_in["settings"]["clients"]}
+              == {u["username"] for u in users_now}
+          and {"path": "/ss-ws", "dest": ssws_in["port"]}
+              in vcfg["inbounds"][0]["settings"]["fallbacks"]
+          and st0.get("ss_ws_paths") == ["/ss-ws"]
+          and st0.get("ss_ws_paths_from_db") is False,
+          json.dumps(ssws_in) + out)
     rc, out, err = cli("upstream-add", "upv", "--proto", "vless-ws",
                        "--addr", "10.0.0.9", "--port", "443",
                        "--uuid", "11111111-2222-3333-4444-555555555555")
@@ -258,6 +277,25 @@ def main():
     check("apply renders db ws paths + new ss method",
           rc == 0 and "/x1" in open(config_path).read()
           and "chacha20-ietf-poly1305" in open(config_path).read(), err)
+    rc, out, _ = cli("settings", "--ss-ws-paths", "/s1,/s2")
+    check("settings ss-ws paths set via CLI", rc == 0 and "/s1" in out, out)
+    rc, out, _ = cli("--json", "settings")
+    check("settings --json shows db ss-ws paths",
+          json.loads(out)["ss_ws_paths"] == ["/s1", "/s2"]
+          and json.loads(out)["ss_ws_paths_from_db"] is True, out)
+    rc, out, err = cli("apply")
+    applied_cfg = json.load(open(config_path)) if rc == 0 else {}
+    ssws_tags = [i["tag"] for i in applied_cfg.get("inbounds", [])]
+    ssws_paths = sorted(
+        i["streamSettings"]["wsSettings"]["path"]
+        for i in applied_cfg.get("inbounds", [])
+        if i["tag"].startswith("ss-ws-"))
+    check("apply re-renders ss-ws inbounds for the db paths",
+          rc == 0 and ssws_tags.count("ss-ws-0") == 1
+          and "ss-ws-1" in ssws_tags and ssws_paths == ["/s1", "/s2"],
+          err + json.dumps(ssws_tags))
+    rc, _, _ = cli("settings", "--ss-ws-paths", "")
+    check("settings ss-ws paths cleared back to env", rc == 0)
 
     # ---- parity: same DB through the web console
     server_env = dict(env, XMAGIC_ADMIN_BIND="127.0.0.1",
@@ -667,6 +705,39 @@ JHde4tAsdlXZGG6MF7TiAAAAEHhtYWdpYyBmaXh0dXJlLWIBAgMEBQ==
     rc, _, err = cli("upstream-remove", "up1")
     check("upstream-remove via node CLI", rc == 0
           and dbval("SELECT COUNT(*) FROM upstreams WHERE name='up1'") == 0, err)
+
+    # SS upstreams: a path switches the dial to SS over WS (the CDN
+    # shape), --tls wraps it in TLS with SNI = the upstream address;
+    # without a path the outbound stays bare, with no streamSettings.
+    rc, _, err = cli("upstream-add", "upssw", "--proto", "ss",
+                     "--addr", "cdn.example.com", "--port", "443",
+                     "--password", "pw", "--path", "/ss-ws", "--tls")
+    check("ss upstream with path+tls accepted", rc == 0, err)
+    rc, _, err = cli("upstream-add", "upssbare", "--proto", "ss",
+                     "--addr", "10.0.0.9", "--port", "8388",
+                     "--password", "pw")
+    check("bare ss upstream accepted", rc == 0, err)
+    ssout_path = os.path.join(workdir, "ssout.json")
+    rc, out, err = cli("render", "--out", ssout_path)
+    ocfg = json.load(open(ssout_path)) if rc == 0 else {}
+    by_tag = {o["tag"]: o for o in ocfg.get("outbounds", [])}
+    wss_out = by_tag.get("up-default-upssw", {})
+    bare_out = by_tag.get("up-default-upssbare", {})
+    check("ss upstream with path+tls renders a WSS stream",
+          wss_out.get("streamSettings", {}).get("network") == "ws"
+          and wss_out["streamSettings"]["wsSettings"] == {"path": "/ss-ws"}
+          and wss_out["streamSettings"].get("security") == "tls"
+          and wss_out["streamSettings"]["tlsSettings"]
+              == {"serverName": "cdn.example.com"},
+          err + json.dumps(wss_out))
+    check("bare ss upstream renders no streamSettings",
+          bare_out.get("protocol") == "shadowsocks"
+          and "streamSettings" not in bare_out,
+          err + json.dumps(bare_out))
+    rc, _, err = cli("upstream-remove", "upssw")
+    rc2, _, err2 = cli("upstream-remove", "upssbare")
+    check("ss test upstreams removed again", rc == 0 and rc2 == 0,
+          err + err2)
 
     rc, out, _ = cli("--json", "route-list")
     routes = json.loads(out)

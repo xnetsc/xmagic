@@ -69,9 +69,13 @@ Environment:
   SS_BE_PORT      loopback Shadowsocks backend  (default 12003)
   VLESS_BE_BASE   first loopback VLESS-WS backend port  (default 12100)
   TROJAN_BE_BASE  first loopback Trojan-WS backend port (default 12200)
+  SSWS_BE_BASE    first loopback Shadowsocks-WS backend port (default 12300)
   SSH_TUNNEL_BASE first local port for ssh upstreams    (default 13000)
   VLESS_WS_PATHS  comma-separated WS paths for VLESS (default /vless-ws)
   TROJAN_WS_PATHS comma-separated WS paths for Trojan (default /trojan-ws)
+  SS_WS_PATHS     comma-separated WS paths for Shadowsocks (default /ss-ws;
+                  SS over WS rides the mux like the other WS families but
+                  carries TCP only, no UDP)
                   Xray fallback paths are exact-match only (no wildcards);
                   run `users.py gen-paths N` to mint random alias paths -
                   every listed path is live at once, one backend inbound
@@ -130,6 +134,7 @@ DB_PATH = os.environ.get("PROXY_DB", "./data/users.db")
 PUBLIC_PORT = int(os.environ.get("XRAY_PORT", "8080"))
 VLESS_WS_PATH = os.environ.get("VLESS_WS_PATH", "/vless-ws")
 TROJAN_WS_PATH = os.environ.get("TROJAN_WS_PATH", "/trojan-ws")
+SS_WS_PATH = os.environ.get("SS_WS_PATH", "/ss-ws")
 SS_METHOD = os.environ.get("SS_METHOD", "aes-256-gcm")
 SS_METHODS = ("aes-256-gcm", "aes-128-gcm", "chacha20-ietf-poly1305",
               "2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm",
@@ -140,6 +145,7 @@ BE_SOCKS = int(os.environ.get("BE_SOCKS_PORT", "18082"))
 BE_SS = int(os.environ.get("SS_BE_PORT", "12003"))
 BE_VLESS_BASE = int(os.environ.get("VLESS_BE_BASE", "12100"))
 BE_TROJAN_BASE = int(os.environ.get("TROJAN_BE_BASE", "12200"))
+BE_SSWS_BASE = int(os.environ.get("SSWS_BE_BASE", "12300"))
 BE_REALITY = int(os.environ.get("XRAY_REALITY_PORT", "18083"))
 SSH_TUNNEL_BASE = int(os.environ.get("SSH_TUNNEL_BASE", "13000"))
 
@@ -179,6 +185,14 @@ def trojan_paths(conn=None):
         if raw:
             return _parse_paths(raw, "/trojan-ws")
     return path_list("TROJAN_WS_PATHS", "TROJAN_WS_PATH", "/trojan-ws")
+
+
+def ss_paths(conn=None):
+    if conn is not None:
+        raw = get_setting(conn, "ss_ws_paths")
+        if raw:
+            return _parse_paths(raw, "/ss-ws")
+    return path_list("SS_WS_PATHS", "SS_WS_PATH", "/ss-ws")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -1658,7 +1672,8 @@ def _ws_stream(u, default_paths):
     return ws
 
 
-def upstream_outbound(u, tunnel_port=None, vpaths=None, tpaths=None):
+def upstream_outbound(u, tunnel_port=None, vpaths=None, tpaths=None,
+                      spaths=None):
     tag = f"up-{u['grp']}-{u['name']}"
     if u["protocol"] == "vless":
         stream = {"network": "tcp", "security": "none"}
@@ -1680,9 +1695,15 @@ def upstream_outbound(u, tunnel_port=None, vpaths=None, tpaths=None):
                                            "password": u["password"]}]},
                 "streamSettings": _ws_stream(u, tpaths or trojan_paths())}
     if u["protocol"] == "ss":
-        return {"tag": tag, "protocol": "shadowsocks",
-                "settings": {"servers": [{"address": u["address"], "port": u["port"],
-                                           "password": u["password"], "method": u["method"]}]}}
+        outbound = {"tag": tag, "protocol": "shadowsocks",
+                    "settings": {"servers": [{"address": u["address"], "port": u["port"],
+                                               "password": u["password"], "method": u["method"]}]}}
+        if u["path"]:
+            # A path marks the WS carrier (SS over WS, e.g. dialling a
+            # CDN-fronted node over WSS); with no path the dial stays
+            # the bare protocol, byte for byte as before.
+            outbound["streamSettings"] = _ws_stream(u, spaths or ss_paths())
+        return outbound
     if u["protocol"] == "http":
         # Xray's http outbound takes flat settings (docs: address/port/user/pass),
         # NOT the servers[]+users[] shape - that shape belongs to socks.
@@ -1758,14 +1779,16 @@ def build_egress(conn, users):
     icon = interconnect_groups_members(conn)
     allow_priv = allow_private_direct(conn)
     vpaths, tpaths = vless_paths(conn), trojan_paths(conn)
+    spaths = ss_paths(conn)
     outbounds = []
     ssh_idx = 0
     for u in ups:
         if u["protocol"] == "ssh":
-            outbounds.append(upstream_outbound(u, SSH_TUNNEL_BASE + ssh_idx, vpaths, tpaths))
+            outbounds.append(upstream_outbound(u, SSH_TUNNEL_BASE + ssh_idx,
+                                               vpaths, tpaths, spaths))
             ssh_idx += 1
         else:
-            outbounds.append(upstream_outbound(u, None, vpaths, tpaths))
+            outbounds.append(upstream_outbound(u, None, vpaths, tpaths, spaths))
     direct = {"tag": "direct", "protocol": "freedom"}
     if allow_priv:
         # operator opt-in: an allow finalRule ahead of Xray's default
@@ -1819,6 +1842,7 @@ def build_egress(conn, users):
 def render_config(conn):
     users = enabled_users(conn)
     vpaths, tpaths = vless_paths(conn), trojan_paths(conn)
+    spaths = ss_paths(conn)
     v_on = vless_enabled(conn)
     if not v_on:
         # VLESS off: no WS paths routed, and the mux keeps an empty
@@ -1829,6 +1853,7 @@ def render_config(conn):
                       for u in users] if v_on else [])
     fallbacks = ([{"path": p, "dest": BE_VLESS_BASE + i} for i, p in enumerate(vpaths)]
                  + [{"path": p, "dest": BE_TROJAN_BASE + i} for i, p in enumerate(tpaths)]
+                 + [{"path": p, "dest": BE_SSWS_BASE + i} for i, p in enumerate(spaths)]
                  + [{"dest": BE_SS}])
     accounts = [{"user": u["username"], "pass": u["trojan_password"]} for u in users]
     inbounds = [
@@ -1895,12 +1920,23 @@ def render_config(conn):
                 },
             },
         })
+    ss_clients = [{"password": u["ss_password"], "method": u["ss_method"],
+                   "email": u["username"]} for u in users]
+    for i, p in enumerate(spaths):
+        inbounds.append({
+            "tag": f"ss-ws-{i}", "listen": "127.0.0.1",
+            "port": BE_SSWS_BASE + i,
+            "protocol": "shadowsocks",
+            "settings": {"clients": ss_clients},
+            # WS carries TCP only: no "network" key here (the bare SS
+            # inbound below is the one that also takes UDP).
+            "streamSettings": {"network": "ws", "wsSettings": {"path": p}},
+        })
     inbounds.append({
         "tag": "ss", "listen": "127.0.0.1", "port": BE_SS,
         "protocol": "shadowsocks",
         "settings": {
-            "clients": [{"password": u["ss_password"], "method": u["ss_method"],
-                         "email": u["username"]} for u in users],
+            "clients": ss_clients,
             "network": "tcp,udp",
         },
     })
@@ -1939,6 +1975,7 @@ def cmd_render(args):
         cfg, n, n_up = render_config(conn)
         tunnels = ssh_tunnels(conn)
         vp, tp, strat = vless_paths(conn), trojan_paths(conn), upstream_strategy(conn)
+        sp = ss_paths(conn)
     out = args.out or "./data/config.json"
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     tmp = out + ".tmp"
@@ -1965,12 +2002,12 @@ def cmd_render(args):
     if JSON_OUT:
         print(json.dumps({"out": out, "users": n, "upstreams": n_up,
                           "strategy": strat, "vless_paths": vp,
-                          "trojan_paths": tp,
+                          "trojan_paths": tp, "ss_ws_paths": sp,
                           "ssh_tunnels": len(tunnels)}, indent=2))
         return
     print(f"wrote {out}: dispatcher port {PUBLIC_PORT} -> mux {MUX_PORT}, "
           f"http-in {BE_HTTP}, socks-in {BE_SOCKS}, {n} enabled user(s), "
-          f"vless paths {vp}, trojan paths {tp}, "
+          f"vless paths {vp}, trojan paths {tp}, ss-ws paths {sp}, "
           f"default fallback -> shadowsocks, egress: {egress}"
           + (f", ssh tunnels: {len(tunnels)} (see ssh-tunnels.json)" if tunnels else ""))
 
@@ -2382,6 +2419,8 @@ def settings_info(conn):
         "vless_ws_paths_from_db": get_setting(conn, "vless_ws_paths") is not None,
         "trojan_ws_paths": trojan_paths(conn),
         "trojan_ws_paths_from_db": get_setting(conn, "trojan_ws_paths") is not None,
+        "ss_ws_paths": ss_paths(conn),
+        "ss_ws_paths_from_db": get_setting(conn, "ss_ws_paths") is not None,
         "upstream_strategy": upstream_strategy(conn),
         "upstream_strategy_from_db": get_setting(conn, "upstream_strategy") is not None,
         "ss_method": default_ss_method(conn),
@@ -2433,6 +2472,7 @@ def cmd_settings(args):
             set_setting(conn, "session_ttl_hours", args.session_ttl_hours)
         for key, value in (("vless_ws_paths", args.vless_ws_paths),
                            ("trojan_ws_paths", args.trojan_ws_paths),
+                           ("ss_ws_paths", args.ss_ws_paths),
                            ("upstream_strategy", args.upstream_strategy),
                            ("ss_method", args.ss_method)):
             if value is None:
@@ -2507,6 +2547,8 @@ def cmd_settings(args):
           f"({src[info['vless_ws_paths_from_db']]})")
     print(f"trojan_ws_paths: {','.join(info['trojan_ws_paths'])} "
           f"({src[info['trojan_ws_paths_from_db']]})")
+    print(f"ss_ws_paths: {','.join(info['ss_ws_paths'])} "
+          f"({src[info['ss_ws_paths_from_db']]})")
     print(f"upstream_strategy: {info['upstream_strategy']} "
           f"({src[info['upstream_strategy_from_db']]})")
     print(f"ss_method (new users): {info['ss_method']} "
@@ -3064,6 +3106,7 @@ def main():
     a.add_argument("--session-ttl-hours", type=int)
     a.add_argument("--vless-ws-paths", help="comma-separated; empty string = back to env")
     a.add_argument("--trojan-ws-paths", help="comma-separated; empty string = back to env")
+    a.add_argument("--ss-ws-paths", help="comma-separated; empty string = back to env")
     a.add_argument("--upstream-strategy")
     a.add_argument("--ss-method", help="default method for new users")
     a.add_argument("--interconnect-off-groups",
@@ -3137,7 +3180,8 @@ def main():
                    help="ssh upstream: read the private key from this local file"
                         " and store it on the node (key_file becomes /keys/<name>.key)")
     a.add_argument("--tls", action="store_true",
-                   help="vless-ws/vless/trojan-ws upstream: dial with TLS (SNI = address);"
+                   help="vless-ws/vless/trojan-ws upstream, or ss upstream with"
+                        " --path (SS over WS): dial with TLS (SNI = address);"
                         " required by Xray for plaintext protocols to public IPs")
     a.add_argument("--key-generate", action="store_true",
                    help="ssh upstream: generate a fresh ed25519 keypair on"

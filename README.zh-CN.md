@@ -3,7 +3,7 @@
 [English](README.md) | **中文**
 
 一句话：**一个公共端口，凭协议首字节自动分发**，同时提供 SSH、
-HTTP 代理（CONNECT）、Trojan-WS、VLESS+REALITY、裸 Shadowsocks；
+HTTP 代理（CONNECT）、Trojan-WS、Shadowsocks-WS、VLESS+REALITY、裸 Shadowsocks；
 自身不带加密的协议默认不开：VLESS-WS、VLESS（裸 TCP）（在设置里
 开启）与公网 SOCKS5（`XMAGIC_ENABLE_SOCKS5=1`）；HTTP 留着是因为
 它借道外层 HTTPS，Trojan 设计上强制 TLS，Shadowsocks 自带加密。
@@ -26,6 +26,7 @@ HTTP 代理（CONNECT）、Trojan-WS、VLESS+REALITY、裸 Shadowsocks；
        sshd      SOCKS5 入站   HTTP 入站   Xray fallback 复用器 ──┤   admin 后台
     (公钥认证)   (默认关)  (用户+密码)   ├ 路径命中 → VLESS-WS 后端（可多路径，默认关）
                                             ├ 路径命中 → Trojan-WS 后端（可多路径）
+                                            ├ 路径命中 → Shadowsocks-WS 后端（可多路径）
                                             └ 默认回落 → 裸 Shadowsocks 后端
      TLS ClientHello（0x16 0x03）───────────→ VLESS+REALITY 后端（默认开）
                                    │
@@ -52,6 +53,7 @@ HTTP 代理（CONNECT）、Trojan-WS、VLESS+REALITY、裸 Shadowsocks；
 | VLESS+REALITY | TLS ClientHello 分发 → REALITY 后端（**默认开启**，与 VLESS 开关无关） | —（仅入站） | uuid |
 | Trojan-WS | WS 路径分发 → 后端 | 同左 | 密码 |
 | Shadowsocks | 默认回落 → 后端 | 同左 | 每用户独立密码+method |
+| Shadowsocks-WS | WS 路径分发 → 后端 | 同左（ss 上级带路径即走 WS 拨号，带 TLS 即 WSS） | 每用户独立密码+method |
 
 每个用户在库里是一套凭证：VLESS uuid（VLESS 入站开启时用，REALITY 入站也用它）、
 一个共享密码（Trojan / HTTP / SOCKS 共用）、
@@ -98,7 +100,7 @@ HTTP 代理（CONNECT）、Trojan-WS、VLESS+REALITY、裸 Shadowsocks；
 
 后台「设置」里除了会话有效期，还管几项原本只能写在 .env 里的渲染级配置，
 以及组内互访的分组退出名单（互访默认开启，见下文「组内互访」）：
-VLESS / Trojan 的 WS 路径列表、上级池策略、新用户的默认 SS 方法、REALITY
+VLESS / Trojan / Shadowsocks 的 WS 路径列表、上级池策略、新用户的默认 SS 方法、REALITY
 开关与伪装参数（见下一节）、是否允许直连内网地址。存进库里的值优先生效，
 清空即回退到 .env 的部署默认值；保存
 后自动重新渲染生效。端口类配置不在此列——端口绑在分发器 / sshd 进程上，
@@ -162,6 +164,63 @@ REALITY 是裸 TLS 直达公网口：需要 `XRAY_PORT` 的 **TCP 直达**
 （VPS 直连端口，或裸 TCP 转发）。它无法穿过 TLS 终结型边缘——例如
 平台的 HTTPS 域名（在边缘终结 TLS 后转发 HTTP）——因为客户端的
 TLS 握手必须原封不动地到达 REALITY 入站。
+
+### Shadowsocks over WebSocket 与套 CDN 用法
+
+网关还提供把 Shadowsocks 装进 WebSocket 的入站（简称 SS-WS）：
+与裸 SS 同一份每用户密码与 method，走自己的一组 WS 路径（默认
+`/ss-ws`，可多路径，在设置里与其它 WS 路径列表同样管理）。SS 自带
+加密，这条入站与 SS 家族一致默认开启。承载固有的两个限制：**只
+走 TCP**（WS 不承载 UDP，需要 UDP 用裸 SS 入站）；与本节点其它
+WS 入站一样，明文 WS 只适合内网/隧道内使用，公网上要在前面套一
+层 TLS 终结（下文的 CDN，或任意 TLS 终结器）。
+
+在野的两种客户端方言连的都是这同一个入站：
+
+- **Xray 原生方言**（Xray 本体、v2rayN / v2rayNG / Hiddify）：
+  SS 出站带 `streamSettings`、`network: ws`：
+
+```json
+{
+  "protocol": "shadowsocks",
+  "settings": {"servers": [{"address": "<节点>", "port": 8080,
+    "method": "aes-256-gcm", "password": "<用户 SS 密码>"}]},
+  "streamSettings": {"network": "ws",
+    "wsSettings": {"path": "/ss-ws"}}
+}
+```
+
+  写成分享链接（前面有 TLS 终结时再加 `security=tls`）：
+
+```
+ss://<base64(method:password)>@<节点>:8080?type=ws&path=%2Fss-ws#xmagic-ss-ws
+```
+
+- **SIP003 插件方言**（mihomo / Clash、sing-box、Shadowrocket）：
+  同一个入站同样接 `v2ray-plugin` 客户端的 websocket 模式，插件
+  指向同一条 SS 路径即可：
+
+```yaml
+proxies:
+  - name: xmagic-ss-ws
+    type: ss
+    server: <节点>
+    port: 8080
+    cipher: aes-256-gcm
+    password: "<用户 SS 密码>"
+    plugin: v2ray-plugin
+    plugin-opts: {mode: websocket, host: <节点>, path: /ss-ws, mux: false}
+```
+
+**套 CDN** 是这条入站在公网上的标准形态：把自有域名接入 CDN
+（在 CDN 侧放行 WebSocket），回源指向节点公网口，客户端以
+`wss://<你的域名>`＋SS 路径连入——CDN 终结客户端的 TLS 后，把
+WebSocket 以明文 HTTP 转发回节点。由于 Shadowsocks 协议自身加密
+（目标地址也在加密范围内），CDN 只能看到 SS 密文与连接元数据，
+看不到内容、也看不到目标地址；节点的源站地址也藏在 CDN 后面。
+剩下的暴露面是域名本身：它的名字出现在 TLS 的 SNI 里，域名一旦
+被封这条路就断，需要换新域名。（级联侧同理：`ss` 上级记录带上
+路径与 TLS 后拨号就是 SS over WSS，本节点也能经 CDN 去连上级。）
 
 ## 管理界面二：命令行（与 Web 功能完全一致）
 
@@ -409,7 +468,7 @@ Heroku Postgres（业务库，见上文的平台适配）。部署完成后，�
 `XMAGIC_ADMIN_RPID=<应用域名>`、`XMAGIC_ADMIN_ORIGINS=https://<应用域名>`。
 
 降级范围说清：Heroku 路由只放 HTTP(S)，能用的是**后台、HTTP 代理、
-VLESS-WS / Trojan-WS**；SOCKS5、SSH、裸 Shadowsocks、裸 VLESS-TCP
+VLESS-WS / Trojan-WS / Shadowsocks-WS**；SOCKS5、SSH、裸 Shadowsocks、裸 VLESS-TCP
 这些裸 TCP 协议进不来。另外 Heroku 现在没有免费档（dyno 与 Postgres
 都按月计费），路由对空闲连接有超时，长连接空闲会被切断——这个形态
 适合轻量自用，完整形态仍推荐 VPS + compose。

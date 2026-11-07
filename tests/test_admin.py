@@ -369,6 +369,29 @@ def main():
                                 {"password": ""})
         check("upstream edit rejects an empty ss password", status == 400,
               f"got {status}")
+        status, body = client.call("POST", "/api/upstreams",
+                                   {"name": "up-ssws", "protocol": "ss",
+                                    "address": "cdn.example.com", "port": 443,
+                                    "password": "pw", "path": "/ss-ws",
+                                    "tls": True})
+        check("admin adds an ss upstream with path+tls (SS over WS)",
+              status == 201 and body.get("upstream", {}).get("path")
+              == "/ss-ws" and body["upstream"]["tls"] is True,
+              f"{status} {body}")
+        rendered = json.load(open(config_path))
+        wss_out = next((o for o in rendered["outbounds"]
+                        if o["tag"] == "up-default-up-ssws"), {})
+        check("rendered ss upstream dials WSS to the CDN shape",
+              wss_out.get("streamSettings", {}).get("network") == "ws"
+              and wss_out["streamSettings"]["wsSettings"]
+                  == {"path": "/ss-ws"}
+              and wss_out["streamSettings"].get("security") == "tls"
+              and wss_out["streamSettings"]["tlsSettings"]
+                  == {"serverName": "cdn.example.com"},
+              json.dumps(wss_out))
+        status, _ = client.call("POST", "/api/upstreams/up-ssws/remove", {})
+        check("ss-ws test upstream removed again", status == 200,
+              f"got {status}")
 
         # ssh upstream private keys: pasted/uploaded content is stored
         # on the node (0600), the row records /keys/<name>.key, and the
@@ -498,6 +521,21 @@ def main():
         check("settings: clearing paths falls back to env",
               status == 200 and body["vless_ws_paths"] == ["/vless-ws"]
               and body["vless_ws_paths_from_db"] is False, f"{status} {body}")
+        status, body = client.call("POST", "/api/settings",
+                                   {"ss_ws_paths": "/sw,/sw2"})
+        check("settings: ss-ws paths stored in db",
+              status == 200 and body["ss_ws_paths"] == ["/sw", "/sw2"]
+              and body["ss_ws_paths_from_db"] is True
+              and body["db_values"]["ss_ws_paths"] == "/sw,/sw2",
+              f"{status} {body}")
+        flat = json.dumps(json.load(open(config_path)))
+        check("rendered config uses the db ss-ws paths",
+              '"/sw"' in flat and '"ss-ws-1"' in flat)
+        status, body = client.call("POST", "/api/settings",
+                                   {"ss_ws_paths": ""})
+        check("settings: clearing ss-ws paths falls back to env",
+              status == 200 and body["ss_ws_paths"] == ["/ss-ws"]
+              and body["ss_ws_paths_from_db"] is False, f"{status} {body}")
 
         status, body = client.call("GET", "/api/settings")
         check("settings default session ttl is one week (168h)",
@@ -814,6 +852,9 @@ def main():
               and 'name="reality_short_ids"' in page
               and 'name="reality_public_key"' in page
               and 'id="btn-reality-rotate"' in page
+              and 'name="ss_ws_paths"' in page
+              and 'data-proto="vless-ws trojan-ws ss"' in page
+              and 'data-proto="vless-ws vless trojan-ws ss"' in page
               and "组内互访端口" in page
               and "公网 SOCKS5 默认关闭" in page
               and '<select name="method"' in page

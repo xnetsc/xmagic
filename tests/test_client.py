@@ -683,6 +683,19 @@ def main():
         rc, out, err = cli("upstreams", "add", "tmpup", "--proto", "socks",
                            "--addr", "10.0.0.1", "--port", "1080")
         check("upstreams add tmpup", rc == 0, err + out)
+        rc, out, err = cli("upstreams", "add", "tmpssws", "--proto", "ss",
+                           "--addr", "cdn.example.com", "--port", "443",
+                           "--password", "pw", "--path", "/ss-ws", "--tls")
+        check("upstreams add ss with path+tls via remote CLI",
+              rc == 0, err + out)
+        rc, out, _ = cli("--json", "upstreams", "list")
+        tmpssws = next((u for u in json.loads(out)["upstreams"]
+                        if u["name"] == "tmpssws"), {})
+        check("ss-ws upstream row carries path+tls",
+              tmpssws.get("path") == "/ss-ws"
+              and tmpssws.get("tls") is True, out)
+        rc, out, err = cli("upstreams", "remove", "tmpssws")
+        check("upstreams remove tmpssws", rc == 0, err + out)
         rc, out, err = cli("upstreams", "remove", "tmpup")
         rc2, out, _ = cli("--json", "upstreams", "list")
         check("upstreams remove via remote CLI",
@@ -729,6 +742,20 @@ def main():
         rc2, out, _ = cli("--json", "settings", "show")
         check("settings --no-direct-allow-private",
               rc == 0 and json.loads(out)["direct_allow_private"] is False,
+              err + out)
+        rc, out, err = cli("settings", "set", "--ss-ws-paths", "/p1,/p2")
+        check("settings set ss-ws paths (human output)",
+              rc == 0 and "ss_ws_paths" not in err, err + out)
+        rc, out, _ = cli("--json", "settings", "show")
+        st = json.loads(out)
+        check("settings ss-ws paths read back via remote CLI",
+              st["ss_ws_paths"] == ["/p1", "/p2"]
+              and st["ss_ws_paths_from_db"] is True, out)
+        rc, out, err = cli("settings", "set", "--ss-ws-paths", "")
+        rc2, out, _ = cli("--json", "settings", "show")
+        check("settings ss-ws paths cleared back to env via remote CLI",
+              rc == 0 and json.loads(out)["ss_ws_paths"] == ["/ss-ws"]
+              and json.loads(out)["ss_ws_paths_from_db"] is False,
               err + out)
 
         rc, out, err = cli("node", "remove", "b")

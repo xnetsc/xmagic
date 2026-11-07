@@ -4,7 +4,7 @@
 
 In one line: **one public port, dispatched by the first bytes of each
 connection**, serving SSH, HTTP proxy (CONNECT), Trojan-WS,
-VLESS+REALITY and bare
+Shadowsocks-WS, VLESS+REALITY and bare
 Shadowsocks at the same time. Protocols with no encryption of their
 own are off by default: VLESS-WS / bare VLESS (enable in Settings)
 and public SOCKS5 (`XMAGIC_ENABLE_SOCKS5=1`); HTTP stays because it
@@ -33,6 +33,7 @@ identity engine, so a change made in one shows up in the others.
        sshd    SOCKS5     HTTP      Xray fallback mux -----+        admin
     (key auth)  inbound   inbound    |- path hit -> VLESS-WS backends (multi-path, opt-in)
                                      |- path hit -> Trojan-WS backends (multi-path)
+                                     |- path hit -> Shadowsocks-WS backends (multi-path)
                                      +- default fallback -> bare Shadowsocks
     TLS ClientHello (0x16 0x03) ---> VLESS+REALITY backend (on by default)
                                    |
@@ -63,6 +64,7 @@ identity engine, so a change made in one shows up in the others.
 | VLESS+REALITY | TLS ClientHello dispatch -> REALITY backend (**on by default**, independent of the VLESS switch) | - (inbound only) | uuid |
 | Trojan-WS | WS path dispatch -> backend | same | password |
 | Shadowsocks | default fallback -> backend | same | per-user password + method |
+| Shadowsocks-WS | WS path dispatch -> backend | same (an `ss` upstream with a path dials WS; with TLS it dials WSS) | per-user password + method |
 
 Each user holds one credential set in the database: a VLESS uuid
 (used by the VLESS inbounds when enabled, and by the REALITY
@@ -129,7 +131,8 @@ and upstream records to keep them distinct upstream.
 ### Settings (including render-level configuration)
 
 Besides the session lifetime, Settings holds the render-level options
-that otherwise only exist in `.env`: the VLESS / Trojan WS path lists,
+that otherwise only exist in `.env`: the VLESS / Trojan / Shadowsocks
+WS path lists,
 the upstream pool strategy, the default SS method for new users,
 the REALITY switch and camouflage parameters (next section),
 whether direct egress to private addresses is allowed, and the
@@ -209,6 +212,73 @@ reachability** of `XRAY_PORT` (a VPS port, or a raw TCP forward). It
 cannot pass through a TLS-terminating edge - for example a platform
 HTTPS domain that terminates TLS and forwards HTTP - because the
 client's TLS handshake must reach the REALITY inbound untouched.
+
+### Shadowsocks over WebSocket, and running it behind a CDN
+
+The gateway also serves Shadowsocks carried inside WebSocket
+("SS-WS"): the same per-user SS password and method as the bare
+inbound, on its own WS paths (default `/ss-ws`, multi-path, managed
+in Settings like the other WS path lists). SS encrypts itself, so
+this inbound is on by default like the rest of the SS family. Two
+limits are inherent to the carrier: **TCP only** (no UDP over WS -
+use the bare SS inbound for UDP), and, like the node's other WS
+inbounds, plaintext WS is for intranet / in-tunnel use - on the
+public internet put a TLS front in front of it (a CDN, below, or any
+TLS terminator).
+
+Both client dialects in the wild speak to this one inbound:
+
+- **Xray-native** (Xray itself, v2rayN / v2rayNG / Hiddify): the SS
+  outbound carries `streamSettings` with `network: ws`:
+
+```json
+{
+  "protocol": "shadowsocks",
+  "settings": {"servers": [{"address": "<node>", "port": 8080,
+    "method": "aes-256-gcm", "password": "<user ss password>"}]},
+  "streamSettings": {"network": "ws",
+    "wsSettings": {"path": "/ss-ws"}}
+}
+```
+
+  The same as a share link (add `security=tls` when a TLS front
+  serves the port):
+
+```
+ss://<base64(method:password)>@<node>:8080?type=ws&path=%2Fss-ws#xmagic-ss-ws
+```
+
+- **SIP003 plugin dialect** (mihomo / Clash, sing-box,
+  Shadowrocket): the same server answers a `v2ray-plugin` client in
+  websocket mode - point the plugin at the same SS path:
+
+```yaml
+proxies:
+  - name: xmagic-ss-ws
+    type: ss
+    server: <node>
+    port: 8080
+    cipher: aes-256-gcm
+    password: "<user ss password>"
+    plugin: v2ray-plugin
+    plugin-opts: {mode: websocket, host: <node>, path: /ss-ws, mux: false}
+```
+
+**Behind a CDN** is the standard public-internet shape for this
+inbound: put your own domain on a CDN (WebSocket must be enabled
+there), set the CDN's origin to the node's public port, and have
+clients dial `wss://<your domain>` with the SS path - the CDN
+terminates the client's TLS and forwards the WebSocket to the node
+over plain HTTP. Because Shadowsocks encrypts its own protocol
+(including the destination address), the CDN sees only SS
+ciphertext plus connection metadata - never the content or the
+target addresses. The node's origin address also stays hidden
+behind the CDN. The visible surface that remains is the domain
+itself: its name travels in the TLS SNI, and if the domain gets
+blocked the route is dead - rotate to a fresh domain. (The cascade
+side speaks the same shape: an `ss` upstream record with a path -
+and TLS - dials SS over WSS, so a node can also reach its upstream
+through a CDN.)
 
 ## Management interface 2: command line (identical to web)
 
@@ -521,8 +591,8 @@ restart the dyno, so the console's Passkey is issued for that domain:
 
 The degraded scope, stated plainly: Heroku's router passes only
 HTTP(S), so what works is **the console, the HTTP proxy, and
-VLESS-WS / Trojan-WS**; SOCKS5, SSH, bare Shadowsocks and bare
-VLESS-TCP cannot get in. Heroku also has no free tier anymore (dyno
+VLESS-WS / Trojan-WS / Shadowsocks-WS**; SOCKS5, SSH, bare
+Shadowsocks and bare VLESS-TCP cannot get in. Heroku also has no free tier anymore (dyno
 and Postgres are billed monthly) and its router times out idle
 connections, so idle long-lived connections get cut - this form
 suits light self-use; for the full gateway use a VPS + compose.

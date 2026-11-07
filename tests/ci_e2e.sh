@@ -10,9 +10,10 @@
 # (default latest), E2E_KEEP=1 keeps the temp dir and containers for
 # debugging. The checks, identical for both forms: admin console on
 # the one public port, add-user + apply taking effect, HTTP CONNECT,
-# SOCKS5, VLESS-WS, bare Shadowsocks, VLESS-TCP and VLESS+REALITY
-# through a client Xray, SSH key login + `ssh -D`, and a second user
-# added afterwards.
+# SOCKS5, VLESS-WS, bare Shadowsocks, Shadowsocks-WS (Xray client,
+# and mihomo speaking the SIP003 v2ray-plugin dialect), VLESS-TCP and
+# VLESS+REALITY through a client Xray, SSH key login + `ssh -D`, and
+# a second user added afterwards.
 set -u
 
 # No ambient proxy may leak into the checks: the proxied fetches pass
@@ -121,11 +122,14 @@ import json, sys
 proto, creds_path = sys.argv[1], sys.argv[2]
 pub, cli, work = int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
 creds = json.load(open(creds_path))
-if proto == "ss":
+if proto in ("ss", "ss-ws"):
     out = {"protocol": "shadowsocks",
            "settings": {"servers": [{"address": "127.0.0.1", "port": pub,
                        "method": creds["ss_method"],
                        "password": creds["ss_password"]}]}}
+    if proto == "ss-ws":
+        out["streamSettings"] = {"network": "ws",
+                                 "wsSettings": {"path": "/ss-ws"}}
 else:
     out = {"protocol": "vless",
            "settings": {"vnext": [{"address": "127.0.0.1", "port": pub,
@@ -197,6 +201,45 @@ check_reality() {
   check "client xray vless+reality -> target" "$rc"
 }
 
+mihomo_config() { # -> config path (SIP003 plugin dialect, alice creds)
+  python3 - "$WORK/alice.json" "$PUB" "$CLI_PORT" "$WORK" <<'EOF'
+import json, sys
+creds = json.load(open(sys.argv[1]))
+pub, cli, work = int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+cfg = f"""mixed-port: {cli}
+mode: global
+log-level: warning
+proxies:
+  - name: ssws
+    type: ss
+    server: 127.0.0.1
+    port: {pub}
+    cipher: {creds["ss_method"]}
+    password: "{creds["ss_password"]}"
+    plugin: v2ray-plugin
+    plugin-opts: {{mode: websocket, host: 127.0.0.1, path: /ss-ws, mux: false}}
+proxy-groups:
+  - name: GLOBAL
+    type: select
+    proxies: [ssws]
+"""
+path = f"{work}/mihomo.yaml"
+open(path, "w").write(cfg)
+print(path)
+EOF
+}
+check_via_mihomo() {
+  local cfg out rc
+  cfg=$(mihomo_config)
+  "$WORK/mihomo" -f "$cfg" -d "$WORK/mihomo-home" \
+    > "$WORK/mihomo.log" 2>&1 &
+  CLIENT_PID=$!
+  sleep 3
+  out=$(fetch_retry --socks5-hostname "127.0.0.1:$CLI_PORT" "$TARGET"); rc=$?
+  kill "$CLIENT_PID" 2>/dev/null; CLIENT_PID=""
+  check "mihomo ss+v2ray-plugin (websocket) -> target" "$rc"
+}
+
 # ------------------------------------------------------------ setup
 
 mkdir -p "$WORK/stub"
@@ -213,6 +256,13 @@ ssh-keygen -t ed25519 -f "$WORK/alice_key" -N '' -q
 curl -fsSL -o "$WORK/xray.zip" \
   "https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/Xray-linux-64.zip"
 (cd "$WORK" && unzip -o -q xray.zip xray && chmod +x xray)
+
+# Mihomo client (pinned), for the SIP003 v2ray-plugin dialect check
+# against the SS-WS inbound.
+MIHOMO_VERSION=1.19.33
+curl -fsSL -o "$WORK/mihomo.gz" \
+  "https://github.com/MetaCubeX/mihomo/releases/download/v${MIHOMO_VERSION}/mihomo-linux-amd64-v${MIHOMO_VERSION}.gz"
+gunzip -f "$WORK/mihomo.gz" && chmod +x "$WORK/mihomo"
 
 export DIRECT_ALLOW_PRIVATE=1
 # VLESS and public SOCKS5 are opt-in now (plaintext-by-default
@@ -262,6 +312,8 @@ check "SOCKS5 (alice) -> target" "$?"
 
 check_via_client vless-ws
 check_via_client ss
+check_via_client ss-ws
+check_via_mihomo
 check_via_client vless-tcp
 check_reality
 

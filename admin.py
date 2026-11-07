@@ -984,7 +984,8 @@ def api_get_settings():
         info = users_mod.settings_info(conn)
         info["db_values"] = {
             k: users_mod.get_setting(conn, k) for k in
-            ("vless_ws_paths", "trojan_ws_paths", "upstream_strategy", "ss_method",
+            ("vless_ws_paths", "trojan_ws_paths", "ss_ws_paths",
+             "upstream_strategy", "ss_method",
              "interconnect_off_groups", "reality_dest", "reality_server_names",
              "reality_short_ids")}
     info.update({
@@ -1008,7 +1009,7 @@ def api_set_settings(body):
                                     f"{users_mod.SESSION_TTL_HOURS_MIN}.."
                                     f"{users_mod.SESSION_TTL_HOURS_MAX}")
             users_mod.set_setting(conn, "session_ttl_hours", hours)
-        for key in ("vless_ws_paths", "trojan_ws_paths"):
+        for key in ("vless_ws_paths", "trojan_ws_paths", "ss_ws_paths"):
             if key in body:
                 render_relevant = True
                 value = body[key]
@@ -1721,7 +1722,7 @@ td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
               <div class="wide"><label>地址</label><input name="address" placeholder="主机名或 IP" required></div>
               <div><label>端口</label><input name="port" placeholder="端口" type="number" required></div>
               <div><label>分组</label><input name="group" placeholder="分组"></div>
-              <div data-proto="vless-ws trojan-ws"><label>WS 路径</label><input name="path" placeholder="/path"></div>
+              <div data-proto="vless-ws trojan-ws ss"><label>WS 路径</label><input name="path" placeholder="/path"></div>
               <div class="wide" data-proto="vless-ws vless"><label>UUID</label><input name="uuid" placeholder="VLESS UUID"></div>
               <div data-proto="http socks ssh"><label>用户名</label><input name="username" placeholder="用户名"></div>
               <div data-proto="trojan-ws ss http socks"><label>密码</label><input name="password" placeholder="密码"></div>
@@ -1739,7 +1740,7 @@ td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
               <div><label>备注</label><input name="note" placeholder="可选"></div>
             </div>
             <div class="form-actions">
-              <span class="check" data-proto="vless-ws vless trojan-ws"><input type="checkbox" name="tls" id="up-tls"><label for="up-tls">TLS</label></span>
+              <span class="check" data-proto="vless-ws vless trojan-ws ss"><input type="checkbox" name="tls" id="up-tls"><label for="up-tls">TLS</label></span>
               <button id="up-submit" class="primary">保存</button>
               <button type="button" id="up-cancel">取消</button>
             </div>
@@ -1783,6 +1784,7 @@ td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
               <div><label>新用户默认 SS 方法</label><select name="ss_method"></select></div>
               <div class="wide" id="row-vless-paths"><label>VLESS WS 路径（逗号分隔）</label><input name="vless_ws_paths"></div>
               <div class="wide"><label>Trojan WS 路径（逗号分隔）</label><input name="trojan_ws_paths"></div>
+              <div class="wide"><label>Shadowsocks WS 路径（逗号分隔）</label><input name="ss_ws_paths"></div>
               <div class="wide"><label>REALITY 目标站点 dest（host:port，TLS 1.3 站点）</label><input name="reality_dest"></div>
               <div class="wide"><label>REALITY serverNames（逗号分隔）</label><input name="reality_server_names"></div>
               <div class="wide"><label>REALITY shortIds（逗号分隔，偶数长度 hex，最长 16）</label><input name="reality_short_ids"></div>
@@ -2061,6 +2063,8 @@ async function refresh() {
   sf.querySelector("[name=vless_ws_paths]").placeholder = settings.vless_ws_paths.join(",");
   sf.querySelector("[name=trojan_ws_paths]").value = settings.db_values.trojan_ws_paths || "";
   sf.querySelector("[name=trojan_ws_paths]").placeholder = settings.trojan_ws_paths.join(",");
+  sf.querySelector("[name=ss_ws_paths]").value = settings.db_values.ss_ws_paths || "";
+  sf.querySelector("[name=ss_ws_paths]").placeholder = settings.ss_ws_paths.join(",");
   const strat = sf.querySelector("[name=upstream_strategy]");
   strat.innerHTML = settings.strategies.map(x =>
     `<option ${x === settings.upstream_strategy ? "selected" : ""}>${x}</option>`).join("");
@@ -2513,6 +2517,7 @@ $("form-settings").onsubmit = async e => { e.preventDefault();
       session_ttl_hours: Number(f.querySelector("[name=session_ttl_hours]").value),
       vless_ws_paths: f.querySelector("[name=vless_ws_paths]").value,
       trojan_ws_paths: f.querySelector("[name=trojan_ws_paths]").value,
+      ss_ws_paths: f.querySelector("[name=ss_ws_paths]").value,
       upstream_strategy: f.querySelector("[name=upstream_strategy]").value,
       direct_allow_private: f.querySelector("[name=direct_allow_private]").checked,
       vless_enabled: f.querySelector("[name=vless_enabled]").checked,

@@ -589,6 +589,8 @@ def cmd_settings_show(args):
         f"({src[payload['vless_ws_paths_from_db']]})",
         f"trojan_ws_paths: {','.join(payload['trojan_ws_paths'])} "
         f"({src[payload['trojan_ws_paths_from_db']]})",
+        f"ss_ws_paths: {','.join(payload['ss_ws_paths'])} "
+        f"({src[payload['ss_ws_paths_from_db']]})",
         f"upstream_strategy: {payload['upstream_strategy']} "
         f"({src[payload['upstream_strategy_from_db']]})",
         f"ss_method (new users): {payload['ss_method']} "
@@ -643,7 +645,8 @@ def cmd_settings_set(args):
     api, _, _ = authed_api(args)
     body = {}
     for key in ("session_ttl_hours", "vless_ws_paths", "trojan_ws_paths",
-                "upstream_strategy", "ss_method", "interconnect_off_groups",
+                "ss_ws_paths", "upstream_strategy", "ss_method",
+                "interconnect_off_groups",
                 "reality_dest", "reality_server_names", "reality_short_ids"):
         if getattr(args, key, None) is not None:
             body[key] = getattr(args, key)
@@ -1328,6 +1331,7 @@ def main():
     a.add_argument("--session-ttl-hours", type=int)
     a.add_argument("--vless-ws-paths", help="comma-separated; empty string = env default")
     a.add_argument("--trojan-ws-paths", help="comma-separated; empty string = env default")
+    a.add_argument("--ss-ws-paths", help="comma-separated; empty string = env default")
     a.add_argument("--upstream-strategy")
     a.add_argument("--ss-method")
     a.add_argument("--direct-allow-private", dest="direct_allow_private",
