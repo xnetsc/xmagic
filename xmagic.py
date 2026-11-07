@@ -216,7 +216,6 @@ class _CallbackHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        _CallbackHandler.result = query
         body = ("<!DOCTYPE html><meta charset=utf-8><title>xmagic</title>"
                 "<p>登录完成，可以关闭这个页面，回到命令行。</p>").encode()
         self.send_response(200)
@@ -224,6 +223,11 @@ class _CallbackHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+        # Publish the result only after the response is fully written:
+        # the main thread may exit the process the moment it sees the
+        # result (on a state mismatch it does), which would otherwise
+        # race this handler thread and clip the page body.
+        _CallbackHandler.result = query
 
     def log_message(self, *a):
         pass
