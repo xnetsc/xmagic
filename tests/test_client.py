@@ -170,6 +170,30 @@ def main():
         names = [u["username"] for u in json.loads(out)["users"]]
         check("--json users list on A", names == ["alice"], out)
 
+        rc, out, err = cli("--json", "users", "rotate-uuid", "alice")
+        rotated = json.loads(out).get("user", {}).get("vless_uuid") if rc == 0 else None
+        rc, out, _ = cli("--json", "users", "list")
+        check("users rotate-uuid via remote CLI",
+              bool(rotated)
+              and json.loads(out)["users"][0]["vless_uuid"] == rotated, out)
+        rc, out, err = cli("upstreams", "add", "up1", "--proto", "ss",
+                           "--addr", "10.9.9.9", "--port", "8388",
+                           "--password", "pw")
+        check("upstreams add via remote CLI", rc == 0, err + out)
+        rc, out, err = cli("--json", "upstreams", "edit", "up1", "--port", "9999")
+        check("upstreams edit via remote CLI",
+              rc == 0 and json.loads(out)["upstream"]["port"] == 9999, err + out)
+        rc, out, err = cli("routes", "add", "--kind", "domain",
+                           "--pattern", "example.com", "--to", "block")
+        check("routes add via remote CLI", rc == 0, err + out)
+        rc, out, err = cli("--json", "routes", "edit", "1", "--to", "direct")
+        check("routes edit via remote CLI",
+              rc == 0 and json.loads(out)["route"]["target"] == "direct",
+              err + out)
+        rc, out, err = cli("settings", "set", "--upstream-strategy", "random")
+        check("settings strategy via remote CLI",
+              rc == 0 and "random" in out, err + out)
+
         rc, out, err = cli("settings", "set", "--session-ttl-hours", "24")
         check("settings set via CLI", rc == 0 and "24" in out, err + out)
         rc, out, _ = cli("--json", "settings", "show")

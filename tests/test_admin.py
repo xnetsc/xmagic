@@ -198,8 +198,10 @@ def main():
         check("status: registered + authenticated",
               body["registered"] is True and body["authenticated"] is True)
 
-        status, _ = client.call("POST", "/api/register/options", {})
-        check("second registration refused", status == 403, f"got {status}")
+        stranger = Client()
+        status, _ = stranger.call("POST", "/api/register/options", {})
+        check("second registration refused for strangers", status == 403,
+              f"got {status}")
 
         status, body = client.call("POST", "/api/users", {"username": "alice"})
         check("admin adds a gateway user", status == 201, f"{status} {body}")
@@ -215,6 +217,54 @@ def main():
                                    {"kind": "domain", "pattern": "example.com",
                                     "to": "block"})
         check("admin adds a route", status == 201, f"{status} {body}")
+
+        # --- full-surface parity: user fields, edits, render-level settings
+        status, body = client.call("POST", "/api/users/alice/rotate-uuid", {})
+        check("rotate-uuid issues a fresh uuid",
+              status == 200 and bool(body.get("user", {}).get("vless_uuid")),
+              f"{status} {body}")
+        status, body = client.call("POST", "/api/users/alice/setmethod",
+                                   {"method": "chacha20-ietf-poly1305"})
+        check("setmethod applies", status == 200
+              and body.get("user", {}).get("ss_method") == "chacha20-ietf-poly1305",
+              f"{status} {body}")
+        status, body = client.call("POST", "/api/users/alice/setnote",
+                                   {"note": "primary"})
+        check("setnote applies", status == 200
+              and body.get("user", {}).get("note") == "primary", f"{status} {body}")
+
+        status, body = client.call("POST", "/api/upstreams",
+                                   {"name": "up-a", "protocol": "ss",
+                                    "address": "10.3.3.3", "port": 8388,
+                                    "password": "pw-old"})
+        check("admin adds an upstream", status == 201, f"{status} {body}")
+        status, body = client.call("POST", "/api/upstreams/up-a/update",
+                                   {"port": 9999, "password": "pw-new"})
+        check("upstream edit applies",
+              status == 200 and body.get("upstream", {}).get("port") == 9999
+              and body["upstream"]["password"] == "pw-new", f"{status} {body}")
+        status, _ = client.call("POST", "/api/upstreams/up-a/update",
+                                {"password": ""})
+        check("upstream edit rejects an empty ss password", status == 400,
+              f"got {status}")
+        status, body = client.call("POST", "/api/routes/1/update",
+                                   {"to": "direct"})
+        check("route edit applies",
+              status == 200 and body.get("route", {}).get("target") == "direct",
+              f"{status} {body}")
+
+        status, body = client.call("POST", "/api/settings",
+                                   {"vless_ws_paths": "/cv,/cv2"})
+        check("settings: ws paths stored in db",
+              status == 200 and body["vless_ws_paths"] == ["/cv", "/cv2"]
+              and body["vless_ws_paths_from_db"] is True, f"{status} {body}")
+        flat = json.dumps(json.load(open(config_path)))
+        check("rendered config uses the db ws paths", "/cv" in flat)
+        status, body = client.call("POST", "/api/settings",
+                                   {"vless_ws_paths": ""})
+        check("settings: clearing paths falls back to env",
+              status == 200 and body["vless_ws_paths"] == ["/vless-ws"]
+              and body["vless_ws_paths_from_db"] is False, f"{status} {body}")
 
         status, body = client.call("GET", "/api/settings")
         check("settings default session ttl is one week (168h)",
@@ -283,6 +333,33 @@ def main():
         status, body = client.call("POST", "/api/login/verify",
                                    impostor.assertion(opts["challenge"], "localhost"))
         check("wrong-key assertion rejected", status == 401, f"got {status}")
+
+        # --- admin passkey replacement while authenticated ---
+        old_cookie = client.cookie
+        auth2 = Authenticator()
+        status, opts = client.call("POST", "/api/register/options", {})
+        check("authed admin may start a passkey replacement",
+              status == 200 and "challenge" in opts, f"{status}")
+        status, body = client.call("POST", "/api/register/verify",
+                                   auth2.attestation(opts["challenge"], "localhost"))
+        check("passkey replacement succeeds", status == 200, f"{status} {body}")
+        status, body = client.call("GET", "/api/sessions")
+        check("replacement revokes every other session",
+              status == 200 and len(body["sessions"]) == 1
+              and body["sessions"][0]["current"] is True, f"{status} {body}")
+        stale = Client()
+        stale.cookie = old_cookie
+        status, _ = stale.call("GET", "/api/users")
+        check("pre-replacement session is dead", status == 401, f"got {status}")
+        status, opts = client.call("POST", "/api/login/options", {})
+        status, body = client.call("POST", "/api/login/verify",
+                                   auth.assertion(opts["challenge"], "localhost"))
+        check("old passkey no longer logs in", status in (400, 401),
+              f"got {status}")
+        status, opts = client.call("POST", "/api/login/options", {})
+        status, body = client.call("POST", "/api/login/verify",
+                                   auth2.assertion(opts["challenge"], "localhost"))
+        check("new passkey logs in", status == 200, f"{status} {body}")
 
         proc = subprocess.run([sys.executable, os.path.join(ROOT, "users.py"),
                                "admin-reset"],

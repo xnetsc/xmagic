@@ -79,6 +79,29 @@ def main():
     rc, _, _ = cli("settings", "--session-ttl-hours", "0")
     check("settings rejects 0h", rc != 0)
 
+    # ---- edits + the rest of the user surface + render-level settings
+    rc, out, _ = cli("--json", "upstream-edit", "up1", "--port", "9999")
+    check("--json upstream-edit", rc == 0 and json.loads(out)["port"] == 9999, out)
+    rc, out, _ = cli("--json", "route-edit", "1", "--to", "direct")
+    check("--json route-edit", rc == 0 and json.loads(out)["target"] == "direct", out)
+    rc, _, err = cli("rotate-uuid", "alice")
+    check("rotate-uuid via node CLI", rc == 0, err)
+    rc, _, err = cli("setmethod", "alice", "chacha20-ietf-poly1305")
+    check("setmethod via node CLI", rc == 0, err)
+    rc, _, err = cli("setnote", "alice", "via cli")
+    check("setnote via node CLI", rc == 0, err)
+    rc, _, err = cli("setkey", "alice", "--clear")
+    check("setkey --clear via node CLI", rc == 0, err)
+    rc, out, _ = cli("settings", "--vless-ws-paths", "/x1,/x2")
+    check("settings paths set via CLI", rc == 0 and "/x1" in out, out)
+    rc, out, _ = cli("--json", "settings")
+    check("settings --json shows db paths",
+          json.loads(out)["vless_ws_paths"] == ["/x1", "/x2"], out)
+    rc, out, err = cli("apply")
+    check("apply renders db ws paths + new ss method",
+          rc == 0 and "/x1" in open(config_path).read()
+          and "chacha20-ietf-poly1305" in open(config_path).read(), err)
+
     # ---- parity: same DB through the web console
     server_env = dict(env, XMAGIC_ADMIN_BIND="127.0.0.1",
                       XMAGIC_ADMIN_PORT=str(t.PORT), XMAGIC_ADMIN_RPID="localhost")

@@ -61,6 +61,12 @@ HTTP 代理（CONNECT）、VLESS-WS、VLESS（裸 TCP）、Trojan-WS、裸 Shado
   `XMAGIC_ADMIN_RPID` / `XMAGIC_ADMIN_ORIGINS`。
 - Passkey 丢了没有网页找回通道：在节点上跑 `users.py admin-reset` 清掉凭证
   重新注册——能碰宿主机的人本来就拥有这台机器，这是刻意的破窗设计。
+  还在登录状态时也可以在后台直接**更换 Passkey**（设置区）：更换完成的那一刻，
+  其它所有登录会话立即失效，本页面切到新签发的会话。
+- **管理范围是全部业务数据，不只是新建**：网关用户（换密码、换 UUID、改 SSH
+  公钥 / 分组 / SS 方法 / 备注、启停、删除）、上级（全部字段可编辑，不必删了
+  重加）、目标路由（可编辑）、设置与登录会话——每一项 Web 与两套 CLI 都有，
+  功能一一对应。
 
 ### 登录会话
 
@@ -70,6 +76,13 @@ HTTP 代理（CONNECT）、VLESS-WS、VLESS（裸 TCP）、Trojan-WS、裸 Shado
 - 会话以令牌的 SHA-256 存在库里（原文不落库），后台的「登录会话」页能看到
   每个会话的标识、类型（web/cli）、来源、创建与到期时间，并可**逐个撤销**
   或**撤销其它全部会话**；CLI 同样支持（见下）。
+
+### 设置（含渲染级配置）
+
+后台「设置」里除了会话有效期，还管三项原本只能写在 .env 里的渲染级配置：
+VLESS / Trojan 的 WS 路径列表、上级池策略、新用户的默认 SS 方法。存进库里
+的值优先生效，清空即回退到 .env 的部署默认值；保存后自动重新渲染生效。
+端口类配置不在此列——它们绑在分发器 / sshd 进程上，仍是 .env + compose 的事。
 
 ## 管理界面二：命令行（与 Web 功能完全一致）
 
@@ -81,6 +94,10 @@ HTTP 代理（CONNECT）、VLESS-WS、VLESS（裸 TCP）、Trojan-WS、裸 Shado
 docker compose run --rm admin python3 users.py add alice --ssh-key-file ~/.ssh/id_ed25519.pub
 docker compose run --rm admin python3 users.py upstream-add b1 --addr 1.2.3.4 --port 8080 --proto ss --password ...
 docker compose run --rm admin python3 users.py route-add --kind domain --pattern github.com --to intl
+docker compose run --rm admin python3 users.py upstream-edit b1 --port 8443   # 上级/路由都可编辑
+docker compose run --rm admin python3 users.py route-edit 1 --to direct
+docker compose run --rm admin python3 users.py rotate-uuid alice              # 换 UUID / setmethod / setnote / setkey --clear
+docker compose run --rm admin python3 users.py settings --vless-ws-paths /a,/b  # 渲染级配置（空串 = 回退 .env）
 docker compose run --rm admin python3 users.py apply      # 渲染 + 重启（与网页点保存同一动作）
 docker compose run --rm admin python3 users.py status
 docker compose run --rm admin python3 users.py sessions   # 会话列表，可 sessions-revoke <id> 撤销
@@ -97,7 +114,10 @@ python3 xmagic.py users add alice
 python3 xmagic.py --node tokyo routes add --kind ip --pattern 1.1.1.1 --to intl
 python3 xmagic.py sessions list    # 看这个节点上的全部登录会话
 python3 xmagic.py sessions revoke <id>
+python3 xmagic.py upstreams edit b1 --port 8443      # 与 Web 编辑同一接口
+python3 xmagic.py users rotate-uuid alice
 python3 xmagic.py settings set --session-ttl-hours 24
+python3 xmagic.py settings set --upstream-strategy random --ss-method chacha20-ietf-poly1305
 ```
 
 - 节点注册表在 `~/.xmagic/config.json`；目标节点的选择优先级：
@@ -119,7 +139,8 @@ Xray 的 fallback 路径是**精确匹配，不支持通配符/正则**。等效
 
 ```bash
 python3 users.py gen-paths 8         # 生成随机伪装路径，如 /assets/x3kf9a
-# 把输出填进 .env 的 VLESS_WS_PATHS / TROJAN_WS_PATHS（逗号分隔），重渲染重启
+# 路径填进设置即可（Web 后台「设置」或 users.py settings --vless-ws-paths ...，
+# 立即渲染生效）；只在部署期定死时才写 .env 的 VLESS_WS_PATHS / TROJAN_WS_PATHS
 ```
 
 ## 级联：多上级、分组、选路策略
@@ -224,6 +245,10 @@ sshd / admin 随 `docker compose pull` 手动更新（管理面不自己重启�
 - 双界面一致性：CLI 建的用户在 Web 可见、反之亦然 ✓；`--json` 输出可解析 ✓。
 - 远程 CLI：双节点注册表、参数覆盖配置、按节点存会话、`--session-file` 选会话、
   未登录退出码 3 ✓。
+- 管理完整性：上级编辑（改端口/密码，空密码被拒）✓；路由编辑 ✓；换 UUID /
+  改 SS 方法 / 备注三套界面 ✓；渲染级设置（WS 路径改后渲染出的配置立即带新
+  路径、清空回退 .env）✓；登录状态下更换管理员 Passkey（旧会话全灭、旧
+  Passkey 失效、新 Passkey 可登录）✓。三套测试共 110 项断言全过。
 
 两个实测中定位到的坑（都不是产品缺陷）：沙箱的上游代理密码会定期轮换，长驻进程
 写死旧密码会吃 407（生产环境静态密码不受影响）；多个节点同机测试时回环后端端口

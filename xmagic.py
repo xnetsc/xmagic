@@ -340,9 +340,19 @@ def cmd_apply(args):
 def cmd_settings_show(args):
     api, _, _ = authed_api(args)
     payload = api.call("GET", "/api/settings")
-    emit(args, payload,
-         f"session_ttl_hours: {payload['session_ttl_hours']} "
-         f"({payload['session_ttl_hours'] / 24:g} days)")
+    src = {True: "db", False: "env"}
+    emit(args, payload, "\n".join([
+        f"session_ttl_hours: {payload['session_ttl_hours']} "
+        f"({payload['session_ttl_hours'] / 24:g} days, new sessions only)",
+        f"vless_ws_paths: {','.join(payload['vless_ws_paths'])} "
+        f"({src[payload['vless_ws_paths_from_db']]})",
+        f"trojan_ws_paths: {','.join(payload['trojan_ws_paths'])} "
+        f"({src[payload['trojan_ws_paths_from_db']]})",
+        f"upstream_strategy: {payload['upstream_strategy']} "
+        f"({src[payload['upstream_strategy_from_db']]})",
+        f"ss_method (new users): {payload['ss_method']} "
+        f"({src[payload['ss_method_from_db']]})",
+    ]))
 
 
 def _fmt_ts(epoch):
@@ -374,11 +384,20 @@ def cmd_sessions_revoke_others(args):
 
 def cmd_settings_set(args):
     api, _, _ = authed_api(args)
-    payload = api.call("POST", "/api/settings",
-                       {"session_ttl_hours": args.session_ttl_hours})
+    body = {}
+    for key in ("session_ttl_hours", "vless_ws_paths", "trojan_ws_paths",
+                "upstream_strategy", "ss_method"):
+        if getattr(args, key) is not None:
+            body[key] = getattr(args, key)
+    if not body:
+        die(2, "nothing to set: pass at least one --option (empty string "
+            "clears a value back to the env default)")
+    payload = api.call("POST", "/api/settings", body)
     emit(args, payload,
-         f"session_ttl_hours: {payload['session_ttl_hours']} "
-         "(applies to newly issued sessions)")
+         f"settings saved; session_ttl_hours={payload['session_ttl_hours']}, "
+         f"strategy={payload['upstream_strategy']}, "
+         f"ss_method={payload['ss_method']}\n"
+         + applied_line(payload.get("applied")))
 
 
 def _read_key(args):
@@ -422,12 +441,18 @@ def cmd_users_action(args):
         body["ssh_pubkey"] = _read_key(args)
     elif args.action == "setgroup":
         body["group"] = args.group
+    elif args.action == "setmethod":
+        body["method"] = args.method
+    elif args.action == "setnote":
+        body["note"] = args.note
     payload = api.call("POST", f"/api/users/{args.user}/{args.action}", body)
     human = applied_line(payload.get("applied")) or f"{args.user}: {args.action} done"
     if args.action == "passwd" and payload.get("user"):
         u = payload["user"]
         human = (f"password (trojan/http/socks): {u['password']}\n"
                  f"ss password:     {u['ss_password']}\n" + human)
+    if args.action == "rotate-uuid" and payload.get("user"):
+        human = f"vless uuid:      {payload['user']['vless_uuid']}\n" + human
     emit(args, payload, human)
 
 
@@ -459,6 +484,28 @@ def cmd_upstreams_action(args):
          or f"{args.name}: {args.action} done")
 
 
+def cmd_upstreams_edit(args):
+    api, _, _ = authed_api(args)
+    body = {}
+    for key, attr in (("address", "addr"), ("port", "port"),
+                      ("protocol", "proto"), ("group", "group"),
+                      ("path", "path"), ("uuid", "uuid"),
+                      ("username", "username"), ("password", "password"),
+                      ("key_file", "key_file"), ("method", "method"),
+                      ("note", "note")):
+        if getattr(args, attr) is not None:
+            body[key] = getattr(args, attr)
+    if args.tls:
+        body["tls"] = True
+    elif args.no_tls:
+        body["tls"] = False
+    if not body:
+        die(2, "nothing to change: pass at least one --option")
+    payload = api.call("POST", f"/api/upstreams/{args.name}/update", body)
+    emit(args, payload, f"upstream {args.name} updated\n"
+         + applied_line(payload.get("applied")))
+
+
 def cmd_routes_list(args):
     api, _, _ = authed_api(args)
     payload = api.call("GET", "/api/routes")
@@ -484,6 +531,22 @@ def cmd_routes_action(args):
     payload = api.call("POST", f"/api/routes/{args.id}/{args.action}", {})
     emit(args, payload, applied_line(payload.get("applied"))
          or f"route #{args.id}: {args.action} done")
+
+
+def cmd_routes_edit(args):
+    api, _, _ = authed_api(args)
+    body = {}
+    for key, attr in (("kind", "kind"), ("pattern", "pattern"),
+                      ("to", "to"), ("username", "user"), ("note", "note")):
+        if getattr(args, attr) is not None:
+            body[key] = getattr(args, attr)
+    if not body:
+        die(2, "nothing to change: pass at least one --option")
+    payload = api.call("POST", f"/api/routes/{args.id}/update", body)
+    r = payload["route"]
+    emit(args, payload,
+         f"route #{r['id']} updated: {r['kind']} {r['pattern']} -> {r['target']}\n"
+         + applied_line(payload.get("applied")))
 
 
 # ------------------------------------------------------------ main
@@ -543,7 +606,11 @@ def main():
     ssub = s.add_subparsers(dest="settings_cmd", required=True)
     ssub.add_parser("show", parents=C).set_defaults(fn=cmd_settings_show)
     a = ssub.add_parser("set", parents=C)
-    a.add_argument("--session-ttl-hours", type=int, required=True)
+    a.add_argument("--session-ttl-hours", type=int)
+    a.add_argument("--vless-ws-paths", help="comma-separated; empty string = env default")
+    a.add_argument("--trojan-ws-paths", help="comma-separated; empty string = env default")
+    a.add_argument("--upstream-strategy")
+    a.add_argument("--ss-method")
     a.set_defaults(fn=cmd_settings_set)
 
     u = sub.add_parser("users", parents=C, help="gateway users")
@@ -552,7 +619,7 @@ def main():
     a = usub.add_parser("add", parents=C); a.add_argument("user")
     a.add_argument("--group"); a.add_argument("--ssh-key-file"); a.add_argument("--ssh-pubkey")
     a.add_argument("--note"); a.set_defaults(fn=cmd_users_add)
-    for action in ("passwd", "enable", "disable", "remove"):
+    for action in ("passwd", "enable", "disable", "remove", "rotate-uuid"):
         a = usub.add_parser(action, parents=C); a.add_argument("user")
         a.set_defaults(fn=cmd_users_action, action=action)
     a = usub.add_parser("setkey", parents=C); a.add_argument("user")
@@ -560,6 +627,11 @@ def main():
     a.set_defaults(fn=cmd_users_action, action="setkey")
     a = usub.add_parser("setgroup", parents=C); a.add_argument("user"); a.add_argument("group")
     a.set_defaults(fn=cmd_users_action, action="setgroup")
+    a = usub.add_parser("setmethod", parents=C); a.add_argument("user"); a.add_argument("method")
+    a.set_defaults(fn=cmd_users_action, action="setmethod")
+    a = usub.add_parser("setnote", parents=C); a.add_argument("user")
+    a.add_argument("note", nargs="?")
+    a.set_defaults(fn=cmd_users_action, action="setnote")
 
     up = sub.add_parser("upstreams", parents=C, help="upstream nodes")
     upsub = up.add_subparsers(dest="upstreams_cmd", required=True)
@@ -575,6 +647,14 @@ def main():
     for action in ("enable", "disable", "remove"):
         a = upsub.add_parser(action, parents=C); a.add_argument("name")
         a.set_defaults(fn=cmd_upstreams_action, action=action)
+    a = upsub.add_parser("edit", parents=C); a.add_argument("name")
+    a.add_argument("--addr"); a.add_argument("--port", type=int)
+    a.add_argument("--proto", choices=("vless-ws", "vless", "trojan-ws", "ss", "http", "socks", "ssh"))
+    a.add_argument("--group"); a.add_argument("--path"); a.add_argument("--uuid")
+    a.add_argument("--username"); a.add_argument("--password"); a.add_argument("--key-file")
+    a.add_argument("--tls", action="store_true"); a.add_argument("--no-tls", action="store_true")
+    a.add_argument("--method"); a.add_argument("--note")
+    a.set_defaults(fn=cmd_upstreams_edit)
 
     r = sub.add_parser("routes", parents=C, help="destination routes")
     rsub = r.add_subparsers(dest="routes_cmd", required=True)
@@ -587,6 +667,10 @@ def main():
     for action in ("enable", "disable", "remove"):
         a = rsub.add_parser(action, parents=C); a.add_argument("id", type=int)
         a.set_defaults(fn=cmd_routes_action, action=action)
+    a = rsub.add_parser("edit", parents=C); a.add_argument("id", type=int)
+    a.add_argument("--kind", choices=("domain", "full", "keyword", "regexp", "ip"))
+    a.add_argument("--pattern"); a.add_argument("--to"); a.add_argument("--user")
+    a.add_argument("--note"); a.set_defaults(fn=cmd_routes_edit)
 
     args = p.parse_args()
     args.fn(args)
