@@ -395,23 +395,6 @@ GitHub Actions builds the images and pushes them to GHCR
 
 ## Deployment
 
-Platform reality, stated plainly: **do not deploy on Railway** - its
-AUP explicitly prohibits operating proxies / anonymization services,
-its official answer to self-use requests of this kind is no, and it
-runs automated detection; do not put other projects in the same
-workspace at risk. This project offers no Railway deploy entry.
-**Vercel cannot run it**: it has a functions-only runtime - no
-long-lived container and no raw-TCP ingress - so there is no deploy
-button for it either. **Heroku can run a degraded single-container
-form** (see "One-click deploy"): its router only lets HTTP(S) in, so
-the raw-TCP protocols are unavailable there. For the full gateway use
-a VPS or Oracle Cloud's free tier with compose.
-
-Preferred: Oracle Cloud Always Free (current allowance: ARM 2 OCPU /
-12 GB; sign-up requires a real card in your own name, and the home
-region cannot be changed later). Any VPS that permits a self-use
-proxy works too.
-
 ```bash
 git clone https://github.com/xnetsc/xmagic && cd xmagic
 cp .env.example .env                 # set at least XRAY_PORT and the WS paths
