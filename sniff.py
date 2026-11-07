@@ -5,7 +5,7 @@ Every protocol this node serves is client-speaks-first, so the opening
 bytes identify the protocol unambiguously:
 
   "SSH-" banner                      -> sshd            (SSH_BE_PORT)
-  0x05                               -> SOCKS5 inbound  (BE_SOCKS_PORT)
+  well-formed SOCKS5 greeting        -> SOCKS5 inbound  (BE_SOCKS_PORT)
   "CONNECT ..."                      -> HTTP inbound    (BE_HTTP_PORT)
   other HTTP + "Upgrade: websocket"  -> Xray mux        (XRAY_MUX_PORT)
   other HTTP, absolute-form target   -> HTTP inbound    (BE_HTTP_PORT)
@@ -37,6 +37,7 @@ import select
 import socket
 import sys
 import threading
+import time
 
 LISTEN_PORT = int(os.environ.get("XRAY_PORT", "8080"))
 TARGETS = {
@@ -55,10 +56,27 @@ def log(*a):
     print(*a, file=sys.stdout, flush=True)
 
 
+def _looks_socks(data: bytes) -> bool:
+    """True only for a complete, well-formed SOCKS5 greeting.
+
+    A bare-Shadowsocks stream starts with random salt bytes, so keying
+    on the first byte alone (0x05) would misroute ~1/256 of SS
+    connections here. Requiring the whole greeting shape - plausible
+    method count, the greeting fully present, every offered method a
+    known one - makes a random stream matching it negligible.
+    """
+    if len(data) < 3 or data[0] != 0x05:
+        return False
+    n = data[1]
+    if not 1 <= n <= 16 or len(data) < 2 + n:
+        return False
+    return all(m in (0x00, 0x01, 0x02, 0xFF) for m in data[2:2 + n])
+
+
 def classify(data: bytes) -> str:
     if data.startswith(b"SSH-"):
         return "ssh"
-    if data[:1] == b"\x05":
+    if _looks_socks(data):
         return "socks"
     if data.startswith(b"CONNECT "):
         return "http"
@@ -95,11 +113,53 @@ def pipe(src, dst):
             pass
 
 
+SPECIALS = (b"SSH-", b"CONNECT ") + HTTP_METHODS
+
+
+def _decidable(data: bytes) -> bool:
+    """Can classify() trust this peek, or might more bytes change it?
+
+    TCP may deliver a protocol head split across segments; deciding on
+    a fragment ("GE", "SS", half a SOCKS greeting) would misroute it.
+    Wait until the bytes either match a special prefix in full (HTTP
+    then needs its whole head for the Upgrade decision), provably
+    cannot match any special any more, or complete a SOCKS greeting.
+    """
+    if not data:
+        return False
+    if data[0] == 0x05:
+        if len(data) < 2:
+            return False
+        return data[1] > 16 or len(data) >= 2 + data[1]
+    for tok in SPECIALS:
+        if data.startswith(tok):
+            return b"\r\n\r\n" in data or len(data) >= 4096
+        if tok.startswith(data):
+            return False
+    return True
+
+
+def _peek_head(client) -> bytes:
+    """MSG_PEEK until the head is decidable (1s accumulation cap).
+
+    Polling is deliberate: MSG_PEEK does not consume, so the socket
+    stays readable while any peeked byte remains - select() cannot
+    signal "more arrived". A 20ms poll exits as soon as the head
+    becomes decidable; complete heads (the norm) never wait at all.
+    """
+    data = client.recv(4096, socket.MSG_PEEK)
+    deadline = time.monotonic() + 1.0
+    while data and not _decidable(data) and time.monotonic() < deadline:
+        time.sleep(0.02)
+        data = client.recv(4096, socket.MSG_PEEK)
+    return data
+
+
 def handle(client, addr):
     try:
         client.settimeout(PEEK_TIMEOUT)
         try:
-            data = client.recv(4096, socket.MSG_PEEK)
+            data = _peek_head(client)
         except socket.timeout:
             log(f"{addr}: no first bytes within {PEEK_TIMEOUT}s, closing")
             client.close()

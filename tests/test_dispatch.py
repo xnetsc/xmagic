@@ -100,6 +100,33 @@ def main():
         for name, payload, want in cases:
             got = probe(payload)
             check(name, got == want, f"got {got!r} want {want!r}")
+
+        frag_cases = [
+            ("fragmented browser GET -> admin",
+             [b"GE", b"T / HTTP/1.1\r\nHost: h\r\n\r\n"], b"admin"),
+            ("fragmented WS upgrade -> mux",
+             [b"GET /vless-ws HTTP/1.1\r\nHost: h\r\nUpg",
+              b"rade: websocket\r\n\r\n"], b"mux"),
+            ("fragmented SSH banner -> sshd",
+             [b"SS", b"H-2.0-probe\r\n"], b"ssh"),
+            ("fragmented SOCKS greeting -> socks",
+             [b"\x05", b"\x01\x00"], b"socks"),
+            ("SS salt starting 0x05, bogus greeting -> mux",
+             [b"\x05\x40" + bytes(range(64))], b"mux"),
+            ("SS salt 0x05 + junk method bytes -> mux",
+             [b"\x05\x02\x07\x09" + bytes(range(60))], b"mux"),
+        ]
+        for name, chunks, want in frag_cases:
+            with socket.create_connection(("127.0.0.1", PUBLIC), timeout=5) as c:
+                for ch in chunks:
+                    c.sendall(ch)
+                    time.sleep(0.05)
+                c.settimeout(3)
+                try:
+                    got = c.recv(64)
+                except socket.timeout:
+                    got = b""
+            check(name, got == want, f"got {got!r} want {want!r}")
     finally:
         proc.terminate()
         stop.set()
