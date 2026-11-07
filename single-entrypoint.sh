@@ -85,8 +85,22 @@ python3 /app/admin.py &
 echo $! > "$PID_DIR/admin.pid"
 /usr/local/bin/xray run -c "$DATA_DIR/config.json" &
 echo $! > "$PID_DIR/xray.pid"
+# sshd's StrictModes requires every directory above AuthorizedKeysFile
+# to be owned by root or the login user. $DATA_DIR may be a bind mount
+# owned by an unprivileged host user, which sshd refuses outright
+# ("bad ownership or modes for directory /data"), so sshd reads a
+# root-owned copy staged in the pid dir. Apply in this form restarts
+# the whole container, so the copy is re-staged at every boot.
+SSHD_KEYS="$PID_DIR/authorized_keys"
+chmod 0755 "$PID_DIR" # sshd traverses this dir as the login user
+if [ -f "$DATA_DIR/authorized_keys" ]; then
+  cp "$DATA_DIR/authorized_keys" "$SSHD_KEYS"
+  chown root:root "$SSHD_KEYS"; chmod 0644 "$SSHD_KEYS"
+else
+  rm -f "$SSHD_KEYS"
+fi
 /usr/sbin/sshd -D -e -p "${SSH_BE_PORT:-12222}" \
-  -o "AuthorizedKeysFile=$DATA_DIR/authorized_keys" &
+  -o "AuthorizedKeysFile=$SSHD_KEYS" &
 echo $! > "$PID_DIR/sshd.pid"
 python3 /app/sniff.py &
 echo $! > "$PID_DIR/dispatcher.pid"

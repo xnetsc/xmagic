@@ -14,6 +14,13 @@
 # Xray, SSH key login + `ssh -D`, and a second user added afterwards.
 set -u
 
+# No ambient proxy may leak into the checks: the proxied fetches pass
+# their proxy explicitly (curl -x / --socks5-hostname), and an
+# inherited http_proxy would hijack the direct ones. Do NOT reach for
+# --noproxy '*' instead: it suppresses explicitly requested proxies
+# too, which silently turns every proxied fetch into a direct one.
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY
+
 FORM="${E2E_FORM:?set E2E_FORM=compose or E2E_FORM=single}"
 PREFIX="${E2E_IMAGE_PREFIX:-ghcr.io/xnetsc}"
 TAG="${E2E_IMAGE_TAG:-latest}"
@@ -83,7 +90,7 @@ wait_admin() { # wait_admin <seconds>
 fetch_retry() { # fetch_retry <curl-args...> : body on stdout, retries
   local i out
   for i in 1 2 3 4 5 6 7 8; do
-    out=$(curl --noproxy '*' -s --max-time 10 "$@" 2>/dev/null) \
+    out=$(curl -s --max-time 10 "$@" 2>/dev/null) \
       && [ "$out" = "$BODY" ] && { printf '%s' "$out"; return 0; }
     sleep 2
   done
@@ -142,7 +149,7 @@ check_via_client() { # check_via_client <proto>
   "$WORK/xray" run -c "$cfg" > "$WORK/client.log" 2>&1 &
   CLIENT_PID=$!
   sleep 2
-  out=$(fetch_retry --socks5 "127.0.0.1:$CLI_PORT" "$TARGET"); rc=$?
+  out=$(fetch_retry --socks5-hostname "127.0.0.1:$CLI_PORT" "$TARGET"); rc=$?
   kill "$CLIENT_PID" 2>/dev/null; CLIENT_PID=""
   check "client xray $proto -> target" "$rc"
 }
@@ -201,7 +208,7 @@ ALICE_PW=$(jget "$WORK/alice.json" password)
 
 out=$(fetch_retry -x "http://alice:$ALICE_PW@127.0.0.1:$PUB" "$TARGET")
 check "HTTP CONNECT (alice) -> target" "$?"
-out=$(fetch_retry --socks5 "alice:$ALICE_PW@127.0.0.1:$PUB" "$TARGET")
+out=$(fetch_retry --socks5-hostname "alice:$ALICE_PW@127.0.0.1:$PUB" "$TARGET")
 check "SOCKS5 (alice) -> target" "$?"
 
 check_via_client vless-ws
@@ -214,7 +221,7 @@ ssh -D "$SSH_D_PORT" -N -i "$WORK/alice_key" -p "$PUB" \
   > "$WORK/ssh.log" 2>&1 &
 SSH_PID=$!
 sleep 2
-out=$(fetch_retry --socks5 "127.0.0.1:$SSH_D_PORT" "$TARGET")
+out=$(fetch_retry --socks5-hostname "127.0.0.1:$SSH_D_PORT" "$TARGET")
 check "ssh -D (alice key) -> target" "$?"
 kill "$SSH_PID" 2>/dev/null; SSH_PID=""
 
