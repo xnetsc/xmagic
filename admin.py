@@ -1254,7 +1254,7 @@ label{font-size:.82rem;color:var(--muted);display:block;margin-bottom:.3rem;font
 
 /* ---------- tables ---------- */
 .tbl-wrap{overflow-x:auto;margin:0 -1.25rem;padding:0 1.25rem}
-table{border-collapse:collapse;width:100%;font-size:.86rem}
+table{border-collapse:collapse;width:100%;min-width:700px;font-size:.86rem}
 th{ text-align:left;color:var(--muted);font-size:.74rem;font-weight:600;letter-spacing:.04em;
   text-transform:uppercase;padding:.45rem .6rem;border-bottom:1px solid var(--border);white-space:nowrap}
 td{padding:.55rem .6rem;border-bottom:1px solid #eef1f6;vertical-align:top}
@@ -1428,7 +1428,7 @@ td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
               <button type="button" id="route-cancel" class="hidden">取消编辑</button>
             </div>
           </form>
-          <p class="hint">每次修改都会自动重新渲染配置；若 Docker socket 可用，还会重启 xray / sshd 容器生效。渲染结果见「概览」页状态。</p>
+          <p class="hint">每次修改都会自动重新渲染配置，并按需只重启受影响的进程生效。渲染结果见「概览」页状态。</p>
         </div>
       </section>
 
