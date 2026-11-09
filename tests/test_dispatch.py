@@ -171,8 +171,14 @@ def unit_checks():
     mux_head = bytes.fromhex("000c00290101010000017f0000010059")
     check("mux recognizer accepts the captured session frame",
           sniff._mux_open_state(mux_head) is True)
-    check("mux recognizer waits for the full meta + length",
+    check("mux recognizer waits for the full meta",
           sniff._mux_open_state(mux_head[:10]) is None)
+    check("mux recognizer decides on the meta alone",
+          sniff._mux_open_state(mux_head[:14]) is True)
+    head_nodata = bytearray(mux_head[:14])
+    head_nodata[5] = 0          # option: no OptionData bit
+    check("mux recognizer accepts a data-less New",
+          sniff._mux_open_state(bytes(head_nodata)) is True)
     check("mux recognizer rejects a raw stream head",
           sniff._mux_open_state(bytes(range(64))) is False)
     bad = bytearray(mux_head)
@@ -635,16 +641,21 @@ def main():
                 + len(data).to_bytes(2, "big") + data
 
         def mux_frame(sid, status, data=b""):
-            meta = sid.to_bytes(2, "big") + bytes([status, 2 if data else 0])
-            return len(meta).to_bytes(2, "big") + meta \
-                + len(data).to_bytes(2, "big") + data
+            meta = sid.to_bytes(2, "big") + bytes([status, 1 if data else 0])
+            frame = len(meta).to_bytes(2, "big") + meta
+            if data:
+                frame += len(data).to_bytes(2, "big") + data
+            return frame
 
         def parse_mux(msg):
             ml = int.from_bytes(msg[0:2], "big")
             meta = msg[2:2 + ml]
-            dl = int.from_bytes(msg[2 + ml:4 + ml], "big")
+            data = b""
+            if meta[3] & 0x01:
+                dl = int.from_bytes(msg[2 + ml:4 + ml], "big")
+                data = msg[4 + ml:4 + ml + dl]
             return (int.from_bytes(meta[0:2], "big"), meta[2],
-                    msg[4 + ml:4 + ml + dl])
+                    meta[3], data)
 
         # (a) a raw stream stays on the mux splice, byte-identical,
         # and never touches the SS backend.
@@ -666,15 +677,15 @@ def main():
         be_records.clear()
         c, buf = ws_open("/ss-ws")
         ws_send(c, mux_new(7, b"hello-ss"))
-        sid, status, data = parse_mux(ws_recv(c, buf))
+        sid, status, opt, data = parse_mux(ws_recv(c, buf))
         check("demux: session reply framed for its session",
-              (sid, status, data) == (7, 2, b"HELLO-SS"),
-              f"got {(sid, status, data)!r}")
+              (sid, status, opt, data) == (7, 2, 1, b"HELLO-SS"),
+              f"got {(sid, status, opt, data)!r}")
         ws_send(c, mux_frame(7, 2, b"again"))
-        sid, status, data = parse_mux(ws_recv(c, buf))
+        sid, status, opt, data = parse_mux(ws_recv(c, buf))
         check("demux: keep frame continues the same backend stream",
-              (sid, status, data) == (7, 2, b"AGAIN"),
-              f"got {(sid, status, data)!r}")
+              (sid, status, opt, data) == (7, 2, 1, b"AGAIN"),
+              f"got {(sid, status, opt, data)!r}")
         seen = [r[2] for r in be_records if r[0] == "data"]
         check("demux: backend received the bare stream bytes",
               seen == [b"hello-ss", b"again"], f"got {seen!r}")
@@ -695,13 +706,23 @@ def main():
         ws_send(c, mux_new(10, b"two"))
         got = {}
         for _ in range(2):
-            sid, status, data = parse_mux(ws_recv(c, buf))
+            sid, status, opt, data = parse_mux(ws_recv(c, buf))
             got[sid] = data
         check("demux: interleaved sessions do not cross",
               got == {9: b"ONE", 10: b"TWO"}, f"got {got!r}")
         opens = [r for r in be_records if r[0] == "open"]
         check("demux: one backend connection per session",
               len(opens) == 2, f"records {be_records!r}")
+        # an End (no data segment) for one session, then a Keep
+        # for the other: the stream must stay in sync.
+        ws_send(c, mux_frame(9, 3))
+        ws_send(c, mux_frame(10, 2, b"still"))
+        first = parse_mux(ws_recv(c, buf))
+        sid, status, opt, data = parse_mux(ws_recv(c, buf))
+        check("demux: frames after a data-less End stay in sync",
+              first == (9, 3, 0, b"")
+              and (sid, status, opt, data) == (10, 2, 1, b"STILL"),
+              f"got {first!r} then {(sid, status, opt, data)!r}")
         c.close()
     finally:
         proc.terminate()

@@ -792,10 +792,10 @@ def _mux_open_state(buf):
     meta_len = int.from_bytes(buf[0:2], "big")
     if meta_len < 8 or meta_len > 32:
         return False
-    if len(buf) < 2 + meta_len + 2:
+    if len(buf) < 2 + meta_len:
         return None
     meta = buf[2:2 + meta_len]
-    if meta[2] != _MUX_NEW or meta[3] not in (0x01, 0x03):
+    if meta[2] != _MUX_NEW or meta[3] not in (0x00, 0x01, 0x03):
         return False
     if meta[4] not in (0x01, 0x02):       # network: TCP / UDP
         return False
@@ -1022,7 +1022,11 @@ class _SSDemux:
             self.client.sendall(_ws_server_frame(opcode, payload))
 
     def send_frame(self, sid, status, data):
-        option = 0x02 if data else 0x00
+        # Mux.Cool option bit 0x01 = OptionData (a data segment
+        # follows); 0x02 is OptionError. Data frames must carry
+        # 0x01 - without it the peer treats the frame as meta-only
+        # and the return stream desynchronizes.
+        option = 0x01 if data else 0x00
         meta = sid.to_bytes(2, "big") + bytes([status, option])
         chunks = [data[i:i + 60000]
                   for i in range(0, len(data), 60000)] or [b""]
@@ -1095,15 +1099,19 @@ class _SSDemux:
             meta_len = int.from_bytes(buf[0:2], "big")
             if meta_len < 4 or meta_len > 4096:
                 raise ConnectionError("mux meta length implausible")
-            if len(buf) < 2 + meta_len + 2:
-                return
-            data_len = int.from_bytes(
-                buf[2 + meta_len:4 + meta_len], "big")
-            total = 2 + meta_len + 2 + data_len
-            if len(buf) < total:
-                return
             meta = bytes(buf[2:2 + meta_len])
-            data = bytes(buf[2 + meta_len + 2:total])
+            if meta[3] & 0x01:            # OptionData: a segment follows
+                if len(buf) < 2 + meta_len + 2:
+                    return
+                data_len = int.from_bytes(
+                    buf[2 + meta_len:4 + meta_len], "big")
+                total = 2 + meta_len + 2 + data_len
+                if len(buf) < total:
+                    return
+                data = bytes(buf[2 + meta_len + 2:total])
+            else:
+                total = 2 + meta_len
+                data = b""
             del buf[:total]
             self._frame(meta, data)
 
