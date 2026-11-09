@@ -110,6 +110,11 @@ try:
 except ImportError:
     _demuxaccel = None
 
+if _demuxaccel is not None and os.environ.get("XMAGIC_DEMUX_NOACCEL"):
+    _demuxaccel = None      # A/B switch: force the pure-Python demuxer
+if _demuxaccel is not None and os.environ.get("XMAGIC_DEMUX_TRACE"):
+    _demuxaccel.set_trace(1)
+
 LISTEN_PORT = int(os.environ.get("XRAY_PORT", "8080"))
 TARGETS = {
     "mux": ("127.0.0.1", int(os.environ.get("XRAY_MUX_PORT", "18080"))),

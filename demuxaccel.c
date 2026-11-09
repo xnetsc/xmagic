@@ -247,6 +247,7 @@ struct session {
     ws_reader_t rd;
     buf_t to_be;                  /* request head, then framed data */
     buf_t pending;                /* coalescing toward the client */
+    int traced_rx;
     conn_t *conn;
     session_t *next;
 };
@@ -258,6 +259,7 @@ struct conn {
     ws_reader_t rd;
     buf_t muxbuf;
     buf_t to_client;
+    int trace_left;
     session_t *sessions;
     conn_t *next;
 };
@@ -274,6 +276,15 @@ static worker_t *g_workers;
 static int g_nworkers;
 static unsigned g_rr;
 static pthread_once_t g_once = PTHREAD_ONCE_INIT;
+
+/* Opt-in frame tracing to stderr (the dispatcher's log stream),
+ * enabled from Python via set_trace(1) when XMAGIC_DEMUX_TRACE
+ * is set. Off by default; per-connection event budget keeps the
+ * volume bounded. */
+static int g_trace = 0;
+#define TRACE(...) do { if (g_trace) { \
+    fprintf(stderr, "[accel] " __VA_ARGS__); \
+    fputc('\n', stderr); fflush(stderr); } } while (0)
 
 /* Flush as much of *b (from its cursor) as the socket takes.
  * 0 = fine (maybe partially), -1 = hard error. */
@@ -370,6 +381,8 @@ static void free_session(session_t *s) {
 }
 
 static void close_session(conn_t *c, session_t *s, int send_end) {
+    TRACE("fd=%d close sid=%u state=%d end=%d", c->fd, s->sid,
+          s->state, send_end);
     if (send_end) append_mux(c, s->sid, 3, NULL, 0);
     session_t **pp = &c->sessions;
     while (*pp && *pp != s) pp = &(*pp)->next;
@@ -384,6 +397,7 @@ static session_t *find_session(conn_t *c, uint16_t sid) {
 }
 
 static void destroy_conn(worker_t *w, conn_t *c) {
+    TRACE("fd=%d destroy", c->fd);
     conn_t **pp = &w->conns;
     while (*pp && *pp != c) pp = &(*pp)->next;
     if (*pp) *pp = c->next;
@@ -459,6 +473,11 @@ static void deliver_data(conn_t *c, session_t *s,
 }
 
 static void mux_dispatch(conn_t *c, mux_frame_t *f) {
+    if (c->trace_left > 0) {
+        c->trace_left--;
+        TRACE("fd=%d frame sid=%u st=%d data=%zu", c->fd, f->sid,
+              f->status, f->has_data ? f->data.len : (size_t)0);
+    }
     if (f->status == 1) {                                     /* New */
         session_t *old = find_session(c, f->sid);
         if (old) close_session(c, old, 1);
@@ -503,14 +522,20 @@ static int conn_pump(worker_t *w, conn_t *c) {
             mux_frame_t mf = {0, 0, 0, {NULL, 0, 0, 0}};
             int mst = mux_parse_one(&c->muxbuf, &mf);
             if (mst == 0) { buf_free(&mf.data); break; }
-            if (mst < 0) { buf_free(&mf.data); destroy_conn(w, c); return -1; }
+            if (mst < 0) {
+                TRACE("fd=%d mux parse error", c->fd);
+                buf_free(&mf.data); destroy_conn(w, c); return -1;
+            }
             mux_dispatch(c, &mf);
             buf_free(&mf.data);
         }
         buf_t msg = {NULL, 0, 0, 0};
         int st = ws_extract(&c->rd, &msg);
         if (st == 0) return 0;
-        if (st < 0) { buf_free(&msg); destroy_conn(w, c); return -1; }
+        if (st < 0) {
+            TRACE("fd=%d ws extract error %d", c->fd, st);
+            buf_free(&msg); destroy_conn(w, c); return -1;
+        }
         buf_append(&c->muxbuf, msg.data, msg.len);
         buf_free(&msg);
     }
@@ -545,6 +570,7 @@ static void handle_session(worker_t *w, conn_t *c, session_t *s,
         memmove(s->rd.raw.data, base + head_end, total - head_end);
         s->rd.raw.len = total - head_end; s->rd.raw.off = 0;
         s->state = 1;
+        TRACE("fd=%d sid=%u 101", c->fd, s->sid);
         flush_out(s->fd, &s->to_be);
         if (!s->rd.raw.len) return;
         /* fall through: bytes past the head are backend messages */
@@ -564,6 +590,11 @@ static void handle_session(worker_t *w, conn_t *c, session_t *s,
         if (st == 0) break;
         if (st < 0) { buf_free(&msg); close_session(c, s, 1); return; }
         buf_append(&s->pending, msg.data, msg.len);
+        if (!s->traced_rx) {
+            s->traced_rx = 1;
+            TRACE("fd=%d sid=%u be first msg %zu", c->fd, s->sid,
+                  msg.len);
+        }
         buf_free(&msg);
         if (s->pending.len >= COALESCE_MAX) {
             append_mux(c, s->sid, 2, s->pending.data, s->pending.len);
@@ -809,6 +840,9 @@ static PyObject *py_demux_submit(PyObject *self, PyObject *args) {
         buf_free(&c->rd.raw); buf_free(&c->muxbuf);
         close(cfd); free(c); Py_RETURN_FALSE;
     }
+    c->trace_left = 120;
+    TRACE("submit fd=%d be=%d seed=%zd rest=%zd", cfd, be_port,
+          plen, rlen);
     unsigned slot = __sync_fetch_and_add(&g_rr, 1) % (unsigned)g_nworkers;
     worker_t *w = &g_workers[slot];
     pthread_mutex_lock(&w->qmu);
@@ -822,7 +856,14 @@ static PyObject *py_demux_submit(PyObject *self, PyObject *args) {
     Py_RETURN_TRUE;
 }
 
+static PyObject *py_set_trace(PyObject *self, PyObject *arg) {
+    g_trace = PyObject_IsTrue(arg);
+    Py_RETURN_NONE;
+}
+
 static PyMethodDef methods[] = {
+    {"set_trace", py_set_trace, METH_O,
+     "set_trace(on) -> None: enable per-connection frame tracing"},
     {"parse_ws_frames", py_parse_ws_frames, METH_O,
      "parse_ws_frames(buf) -> ([(fin, opcode, payload)], consumed)"},
     {"parse_mux_frames", py_parse_mux_frames, METH_O,
