@@ -556,6 +556,21 @@ def normalize_ws_head(head: bytes):
     return b"\r\n".join(kept) + b"\r\n\r\n", data
 
 
+def _mask_xor(data: bytes, mask: bytes) -> bytes:
+    """WebSocket masking: XOR with a repeating 4-byte key.
+
+    Computed as one big-integer XOR instead of a per-byte Python
+    loop. The loop was the demultiplexer's dominant CPU cost -
+    on a 0.5-vCPU function it throttled bulk transfers to a
+    crawl and tore them down midway."""
+    n = len(data)
+    if not n:
+        return data
+    key = (mask * (n // 4 + 1))[:n]
+    return (int.from_bytes(data, "little")
+            ^ int.from_bytes(key, "little")).to_bytes(n, "little")
+
+
 def _ws_client_frame(payload: bytes) -> bytes:
     """One masked binary frame, as a WS client would send it."""
     mask = os.urandom(4)
@@ -566,8 +581,7 @@ def _ws_client_frame(payload: bytes) -> bytes:
         hdr = bytes([0x82, 0x80 | 126]) + n.to_bytes(2, "big")
     else:
         hdr = bytes([0x82, 0x80 | 127]) + n.to_bytes(8, "big")
-    body = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
-    return hdr + mask + body
+    return hdr + mask + _mask_xor(payload, mask)
 
 
 def _ws_rewrite(client, data: bytes):
@@ -848,8 +862,7 @@ def _frames_payload(buf):
             break
         payload = bytes(buf[p:p + length])
         if mask is not None:
-            payload = bytes(b ^ mask[i % 4]
-                            for i, b in enumerate(payload))
+            payload = _mask_xor(payload, mask)
         if opcode in (0x0, 0x1, 0x2):
             out += payload
         pos = p + length
@@ -875,16 +888,35 @@ class _WSReader:
     read_message() returns one complete data message (fragmentation
     reassembled); control frames are handled inline - a ping is
     answered through the on_ping callback, a close raises EOFError.
-    """
+
+    Consumption is offset-based: the buffer is not memmoved per
+    message (the old delete-from-the-front made a busy stream
+    quadratic in the buffered size, which a throttled CPU feels
+    immediately)."""
 
     def __init__(self, sock, buf=b"", on_ping=None):
         self.sock = sock
         self.buf = bytearray(buf)
+        self.off = 0
         self.on_ping = on_ping
         self.frag = None
 
+    def _avail(self):
+        return len(self.buf) - self.off
+
+    def _compact(self):
+        if self.off == len(self.buf):
+            self.buf.clear()
+            self.off = 0
+        elif self.off >= 65536:
+            del self.buf[:self.off]
+            self.off = 0
+
     def _fill(self, n):
-        while len(self.buf) < n:
+        while self._avail() < n:
+            if self.off == len(self.buf):
+                self.buf.clear()
+                self.off = 0
             chunk = self.sock.recv(65536)
             if not chunk:
                 raise EOFError("socket closed")
@@ -893,48 +925,89 @@ class _WSReader:
     def read_head(self):
         """Consume an HTTP head (through CRLFCRLF) and return it."""
         while True:
-            idx = self.buf.find(b"\r\n\r\n")
+            idx = self.buf.find(b"\r\n\r\n", self.off)
             if idx >= 0:
-                head = bytes(self.buf[:idx + 4])
-                del self.buf[:idx + 4]
+                head = bytes(self.buf[self.off:idx + 4])
+                self.off = idx + 4
+                self._compact()
                 return head
-            if len(self.buf) > 65536:
+            if self._avail() > 65536:
                 raise ConnectionError("http head too large")
             chunk = self.sock.recv(65536)
             if not chunk:
                 raise EOFError("socket closed during head")
             self.buf += chunk
 
+    def next_message_len(self):
+        """Buffered size of the next complete data message, or
+        None while any of it is still missing - lets a caller
+        drain already-arrived messages without ever blocking."""
+        pos = self.off
+        while True:
+            avail = len(self.buf) - pos
+            if avail < 2:
+                return None
+            b0, b1 = self.buf[pos], self.buf[pos + 1]
+            opcode = b0 & 0x0F
+            length = b1 & 0x7F
+            p = pos + 2
+            if length == 126:
+                if avail < 4:
+                    return None
+                length = int.from_bytes(self.buf[p:p + 2], "big")
+                p += 2
+            elif length == 127:
+                if avail < 10:
+                    return None
+                length = int.from_bytes(self.buf[p:p + 8], "big")
+                p += 8
+            if b1 & 0x80:
+                p += 4
+            if len(self.buf) - p < length:
+                return None
+            p += length
+            if opcode in (0x8, 0x9, 0xA):   # close/ping/pong: walk on
+                if opcode == 0x8:
+                    return p - self.off
+                pos = p
+                continue
+            if b0 & 0x80:                   # FIN: message complete
+                return p - self.off
+            pos = p                         # fragment: keep walking
+
     def read_message(self):
         while True:
             self._fill(2)
-            b0, b1 = self.buf[0], self.buf[1]
+            base = self.off
+            b0, b1 = self.buf[base], self.buf[base + 1]
             fin = b0 & 0x80
             opcode = b0 & 0x0F
             masked = b1 & 0x80
             length = b1 & 0x7F
-            pos = 2
+            pos = base + 2
             if length == 126:
                 self._fill(4)
-                length = int.from_bytes(self.buf[2:4], "big")
-                pos = 4
+                length = int.from_bytes(
+                    self.buf[base + 2:base + 4], "big")
+                pos = base + 4
             elif length == 127:
                 self._fill(10)
-                length = int.from_bytes(self.buf[2:10], "big")
-                pos = 10
+                length = int.from_bytes(
+                    self.buf[base + 2:base + 10], "big")
+                pos = base + 10
             if length > 1 << 24:
                 raise ConnectionError("websocket message too large")
             mask = None
             if masked:
-                self._fill(pos + 4)
+                self._fill(pos - base + 4)
                 mask = bytes(self.buf[pos:pos + 4])
                 pos += 4
-            self._fill(pos + length)
+            self._fill(pos - base + length)
             payload = bytes(self.buf[pos:pos + length])
-            del self.buf[:pos + length]
+            self.off = pos + length
+            self._compact()
             if mask is not None:
-                payload = bytes(b ^ mask[i % 4]
-                                for i, b in enumerate(payload))
+                payload = _mask_xor(payload, mask)
             if opcode == 0x9:                       # ping
                 if self.on_ping is not None:
                     self.on_ping(payload)
@@ -975,6 +1048,20 @@ class _MuxSession:
         try:
             while not self.dead:
                 payload = self.reader.read_message()
+                # Coalesce whatever has already arrived into the
+                # same mux frame: in a bulk transfer the backend
+                # emits many small messages, and one frame per
+                # message costs a lock, a send and two headers
+                # each - on a throttled CPU that tax dominates.
+                # Only complete messages already buffered (or a
+                # frame already in flight on the socket) join in,
+                # so a lone message is never delayed.
+                while len(payload) < 262144:
+                    if self.reader.next_message_len() is None:
+                        r, _, _ = select.select([self.be], [], [], 0)
+                        if not r:
+                            break
+                    payload += self.reader.read_message()
                 self.demux.send_frame(self.sid, _MUX_KEEP, payload)
         except (EOFError, ConnectionError, OSError):
             pass
@@ -1047,6 +1134,7 @@ class _SSDemux:
     def _open_session(self, sid):
         be = socket.create_connection(("127.0.0.1", self.be_port),
                                       timeout=10)
+        be.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         try:
             key = base64.b64encode(os.urandom(16)).decode()
             be.sendall(
@@ -1093,27 +1181,41 @@ class _SSDemux:
                 s.close()
 
     def _drain(self, buf):
-        while True:
-            if len(buf) < 2:
-                return
-            meta_len = int.from_bytes(buf[0:2], "big")
-            if meta_len < 4 or meta_len > 4096:
-                raise ConnectionError("mux meta length implausible")
-            meta = bytes(buf[2:2 + meta_len])
-            if meta[3] & 0x01:            # OptionData: a segment follows
-                if len(buf) < 2 + meta_len + 2:
+        # Cursor-based: the consumed prefix is deleted once, not
+        # memmoved per frame. A frame split across WebSocket
+        # messages simply waits for the rest - the old code read
+        # the meta past the buffered end in that case and died on
+        # an index error, taking the whole mux connection down.
+        pos = 0
+        try:
+            while True:
+                if len(buf) - pos < 2:
                     return
-                data_len = int.from_bytes(
-                    buf[2 + meta_len:4 + meta_len], "big")
-                total = 2 + meta_len + 2 + data_len
-                if len(buf) < total:
+                meta_len = int.from_bytes(buf[pos:pos + 2], "big")
+                if meta_len < 4 or meta_len > 4096:
+                    raise ConnectionError("mux meta length implausible")
+                if len(buf) - pos < 2 + meta_len:
                     return
-                data = bytes(buf[2 + meta_len + 2:total])
-            else:
-                total = 2 + meta_len
-                data = b""
-            del buf[:total]
-            self._frame(meta, data)
+                meta = bytes(buf[pos + 2:pos + 2 + meta_len])
+                if meta[3] & 0x01:        # OptionData: a segment follows
+                    if len(buf) - pos < 2 + meta_len + 2:
+                        return
+                    data_len = int.from_bytes(
+                        buf[pos + 2 + meta_len:pos + 4 + meta_len],
+                        "big")
+                    total = 2 + meta_len + 2 + data_len
+                    if len(buf) - pos < total:
+                        return
+                    data = bytes(buf[pos + 2 + meta_len + 2:
+                                         pos + total])
+                else:
+                    total = 2 + meta_len
+                    data = b""
+                pos += total
+                self._frame(meta, data)
+        finally:
+            if pos:
+                del buf[:pos]
 
     def _frame(self, meta, data):
         sid = int.from_bytes(meta[0:2], "big")
@@ -1266,6 +1368,13 @@ def _serve_ss_ws(client, mux, addr, be_port, path, head_done):
 
     payload, consumed = _frames_payload(bytes(rawbuf))
     takeover.set()
+    try:
+        # Mux frames are small and latency-sensitive; Nagle
+        # batching stalls each one behind the previous ACK,
+        # which reads as uniform slowness on the client.
+        client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
     try:
         mux.close()
     except OSError:
