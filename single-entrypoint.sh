@@ -256,6 +256,31 @@ fi
 ls -la "$DATA_DIR" 2>/dev/null | while IFS= read -r _line; do xlog "boot: data: $_line"; done
 start_admin
 start_xray
+# Hold public traffic until the admin backend listens. The
+# dispatcher accepting a connection is what a platform in front
+# treats as "ready"; if a browser request lands before the admin
+# is up it can only be dropped or 503'd, and on invoke-driven
+# runtimes the dropped form is reported as the process having
+# died mid-request, which recycles the instance and restarts the
+# admin's startup from zero. Bounded: if the admin has not
+# listened within 50s the dispatcher starts anyway (its own log
+# and the boot probe keep the failure visible).
+_admin_port="${ADMIN_BE_PORT:-${XMAGIC_ADMIN_PORT:-18090}}"
+_wait_admin=0
+while [ "$_wait_admin" -lt 50 ]; do
+  if python3 -c 'import socket, sys; s = socket.socket(); s.settimeout(2); sys.exit(0 if s.connect_ex(("127.0.0.1", int(sys.argv[1]))) == 0 else 1)' "$_admin_port" 2>/dev/null; then
+    xlog "boot: admin port $_admin_port listening after ${_wait_admin}s"
+    break
+  fi
+  sleep 2
+  _wait_admin=$((_wait_admin + 2))
+  case $_wait_admin in
+    10|20|30|40) xlog "boot: still waiting for admin port (${_wait_admin}s)" ;;
+  esac
+done
+if [ "$_wait_admin" -ge 50 ]; then
+  xlog "boot: admin port NOT listening after 50s; starting dispatcher anyway"
+fi
 [ "$SSH_ON" = 1 ] && start_sshd
 start_dispatcher
 [ "$SSH_ON" = 1 ] && start_tunnels

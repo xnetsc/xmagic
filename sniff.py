@@ -199,6 +199,32 @@ def handle(client, addr):
             backend = socket.create_connection((host, port), timeout=10)
         except OSError as e:
             log(f"{addr}: backend {kind} ({host}:{port}) unreachable: {e}")
+            if kind == "admin":
+                # The client sent a plain-HTTP browser request whose
+                # bytes are still unconsumed (peek only). Answer 503
+                # instead of dropping the connection: the platform in
+                # front (and the browser) then sees a backend that is
+                # still starting, not a dead process. On
+                # invoke-driven runtimes a dropped connection is
+                # reported as the process having exited mid-request,
+                # which gets the instance recycled before the admin
+                # has finished starting - a starvation loop.
+                try:
+                    # Consume the request head first: closing a
+                    # socket with unread received data resets the
+                    # connection, which would destroy the 503
+                    # before the client reads it.
+                    client.recv(4096)
+                    body = b"xmagic admin is starting; retry in a moment.\n"
+                    client.sendall(
+                        b"HTTP/1.1 503 Service Unavailable\r\n"
+                        b"Content-Type: text/plain; charset=utf-8\r\n"
+                        b"Retry-After: 2\r\n"
+                        b"Connection: close\r\n"
+                        b"Content-Length: " + str(len(body)).encode()
+                        + b"\r\n\r\n" + body)
+                except OSError:
+                    pass
             client.close()
             return
         client.settimeout(None)

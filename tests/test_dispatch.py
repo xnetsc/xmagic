@@ -63,7 +63,7 @@ def probe(payload):
         c.settimeout(3)
         try:
             return c.recv(64)
-        except socket.timeout:
+        except (socket.timeout, ConnectionResetError):
             return b""
 
 
@@ -166,6 +166,36 @@ def main():
         got = probe(b"SSH-2.0-probe\r\n")
         check("SSH banner -> sshd (XMAGIC_ENABLE_SSH=1)",
               got == b"ssh", f"got {got!r}")
+
+        # phase 3: admin backend down -> a browser request is
+        # answered 503 (not dropped); other protocols still drop.
+        proc.terminate()
+        proc.wait(timeout=5)
+        for _ in range(50):
+            try:
+                socket.create_connection(("127.0.0.1", PUBLIC),
+                                         timeout=0.3).close()
+                time.sleep(0.1)
+            except OSError:
+                break
+        dead = str(BASE + 60)
+        proc = subprocess.Popen(
+            [sys.executable, os.path.join(ROOT, "sniff.py")],
+            env=dict(env, ADMIN_BE_PORT=dead, BE_HTTP_PORT=dead),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        for _ in range(50):
+            try:
+                socket.create_connection(("127.0.0.1", PUBLIC),
+                                         timeout=0.3).close()
+                break
+            except OSError:
+                time.sleep(0.1)
+        got = probe(b"GET / HTTP/1.1\r\nHost: h\r\n\r\n")
+        check("browser GET with admin down -> 503, not a drop",
+              got.startswith(b"HTTP/1.1 503"), f"got {got!r}")
+        got = probe(b"CONNECT example.com:443 HTTP/1.1\r\n\r\n")
+        check("CONNECT with http backend down -> dropped, no 503",
+              got == b"", f"got {got!r}")
     finally:
         proc.terminate()
         stop.set()
