@@ -398,6 +398,43 @@ def main():
         check("ss-ws test upstream removed again", status == 200,
               f"got {status}")
 
+        status, body = client.call("POST", "/api/upstreams",
+                                   {"name": "up-vmbad", "protocol": "vmess-ws",
+                                    "address": "10.0.0.9", "port": 443})
+        check("vmess-ws upstream without a uuid refused by the API",
+              status == 400, f"{status} {body}")
+        status, body = client.call("POST", "/api/upstreams",
+                                   {"name": "up-vmbare", "protocol": "vmess",
+                                    "address": "10.0.0.9", "port": 10086,
+                                    "uuid": "11111111-2222-3333-4444-"
+                                            "555555555555"})
+        check("bare vmess upstream refused while vmess TCP is off",
+              status == 400, f"{status} {body}")
+        status, body = client.call("POST", "/api/upstreams",
+                                   {"name": "up-vmws", "protocol": "vmess-ws",
+                                    "address": "cdn.example.com", "port": 443,
+                                    "uuid": "22222222-3333-4444-5555-"
+                                            "666666666666", "tls": True})
+        check("admin adds a vmess-ws upstream with tls",
+              status == 201 and body.get("upstream", {}).get("protocol")
+              == "vmess-ws" and body["upstream"]["tls"] is True,
+              f"{status} {body}")
+        rendered = json.load(open(config_path))
+        vmws_out = next((o for o in rendered["outbounds"]
+                         if o["tag"] == "up-default-up-vmws"), {})
+        vmws_ss = vmws_out.get("streamSettings", {})
+        check("rendered vmess-ws upstream dials WSS with the vmess path",
+              vmws_out.get("protocol") == "vmess"
+              and vmws_ss.get("network") == "ws"
+              and vmws_ss.get("wsSettings", {}).get("path") == "/vmess-ws"
+              and vmws_ss.get("security") == "tls"
+              and vmws_ss.get("tlsSettings", {}).get("serverName")
+                  == "cdn.example.com",
+              json.dumps(vmws_out))
+        status, _ = client.call("POST", "/api/upstreams/up-vmws/remove", {})
+        check("vmess-ws test upstream removed again", status == 200,
+              f"got {status}")
+
         # ssh upstream private keys: pasted/uploaded content is stored
         # on the node (0600), the row records /keys/<name>.key, and the
         # content itself is never returned by the API.
@@ -745,8 +782,8 @@ def main():
               f"{status} {body}")
 
         status, body = client.call("GET", "/api/settings")
-        check("settings: reality on by default with client parameters",
-              status == 200 and body["reality_enabled"] is True
+        check("settings: reality off by default, client parameters ready",
+              status == 200 and body["reality_enabled"] is False
               and body["reality_dest"] == "www.microsoft.com:443"
               and body["reality_server_names"] == ["www.microsoft.com"]
               and len(body["reality_short_ids"]) == 1
@@ -820,6 +857,52 @@ def main():
               and body["applied"]["restart_skipped"] is False,
               f"{status} {body}")
 
+        # VMess settings + the bare-form toggles through the API: the
+        # paths store like the other families, the switches default
+        # off, and an apply renders each bare inbound only while on.
+        status, body = client.call("GET", "/api/settings")
+        check("settings: vmess paths + bare toggles default off",
+              status == 200 and body["vmess_ws_paths"] == ["/vmess-ws"]
+              and body["vmess_tcp_enabled"] is False
+              and body["ss_tcp_enabled"] is False
+              and body["http_enabled"] is False, f"{status} {body}")
+        status, body = client.call("POST", "/api/settings",
+                                   {"vmess_ws_paths": "/vm1,/vm2",
+                                    "vmess_tcp_enabled": True,
+                                    "ss_tcp_enabled": True,
+                                    "http_enabled": True})
+        check("settings: vmess paths + bare toggles stored",
+              status == 200 and body["vmess_ws_paths"] == ["/vm1", "/vm2"]
+              and body["vmess_tcp_enabled"] is True
+              and body["ss_tcp_enabled"] is True
+              and body["http_enabled"] is True, f"{status} {body}")
+        status, body = client.call("POST", "/api/apply", {})
+        rendered = json.load(open(config_path))
+        atags = [i["tag"] for i in rendered["inbounds"]]
+        apaths = sorted(i["streamSettings"]["wsSettings"]["path"]
+                        for i in rendered["inbounds"]
+                        if i["tag"].startswith("vmess-ws-"))
+        check("apply renders the enabled bare forms + db vmess paths",
+              status == 200 and "vmess" in atags and "ss" in atags
+              and "http-in" in atags and apaths == ["/vm1", "/vm2"],
+              f"{status} {atags} {apaths}")
+        status, body = client.call("POST", "/api/settings",
+                                   {"vmess_ws_paths": "",
+                                    "vmess_tcp_enabled": False,
+                                    "ss_tcp_enabled": False,
+                                    "http_enabled": False})
+        check("settings: bare toggles back off, paths cleared",
+              status == 200 and body["vmess_tcp_enabled"] is False
+              and body["vmess_ws_paths"] == ["/vmess-ws"],
+              f"{status} {body}")
+        status, body = client.call("POST", "/api/apply", {})
+        rendered = json.load(open(config_path))
+        atags = [i["tag"] for i in rendered["inbounds"]]
+        check("apply drops the bare forms again once switched off",
+              status == 200 and "vmess" not in atags
+              and "ss" not in atags and "http-in" not in atags
+              and "vmess-ws-0" in atags, f"{status} {atags}")
+
         conn = http.client.HTTPConnection("127.0.0.1", PORT, timeout=10)
         conn.request("GET", "/")
         resp = conn.getresponse()
@@ -858,8 +941,13 @@ def main():
               and 'name="reality_public_key"' in page
               and 'id="btn-reality-rotate"' in page
               and 'name="ss_ws_paths"' in page
-              and 'data-proto="vless-ws trojan-ws ss"' in page
-              and 'data-proto="vless-ws vless trojan-ws ss"' in page
+              and 'name="vmess_ws_paths"' in page
+              and 'name="vmess_tcp_enabled"' in page
+              and 'name="ss_tcp_enabled"' in page
+              and 'name="http_enabled"' in page
+              and 'data-proto="vless-ws trojan-ws ss vmess-ws"' in page
+              and 'data-proto="vless-ws vless trojan-ws ss vmess-ws vmess"'
+                  in page
               and "组内互访端口" in page
               and "公网 SOCKS5 默认关闭" in page
               and '<select name="method"' in page

@@ -591,12 +591,20 @@ def cmd_settings_show(args):
         f"({src[payload['trojan_ws_paths_from_db']]})",
         f"ss_ws_paths: {','.join(payload['ss_ws_paths'])} "
         f"({src[payload['ss_ws_paths_from_db']]})",
+        f"vmess_ws_paths: {','.join(payload['vmess_ws_paths'])} "
+        f"({src[payload['vmess_ws_paths_from_db']]})",
         f"upstream_strategy: {payload['upstream_strategy']} "
         f"({src[payload['upstream_strategy_from_db']]})",
         f"ss_method (new users): {payload['ss_method']} "
         f"({src[payload['ss_method_from_db']]})",
         f"vless_enabled: {payload['vless_enabled']} "
         f"({src[payload['vless_enabled_from_db']]})",
+        f"vmess_tcp_enabled: {payload['vmess_tcp_enabled']} "
+        f"({src[payload['vmess_tcp_enabled_from_db']]})",
+        f"ss_tcp_enabled: {payload['ss_tcp_enabled']} "
+        f"({src[payload['ss_tcp_enabled_from_db']]})",
+        f"http_enabled: {payload['http_enabled']} "
+        f"({src[payload['http_enabled_from_db']]})",
         f"ssh_enabled: {payload.get('ssh_enabled', True)} (environment)",
         f"reality_enabled: {payload['reality_enabled']} "
         f"({src[payload['reality_enabled_from_db']]})",
@@ -646,13 +654,20 @@ def cmd_settings_set(args):
     api, _, _ = authed_api(args)
     body = {}
     for key in ("session_ttl_hours", "vless_ws_paths", "trojan_ws_paths",
-                "ss_ws_paths", "upstream_strategy", "ss_method",
+                "ss_ws_paths", "vmess_ws_paths", "upstream_strategy",
+                "ss_method",
                 "interconnect_off_groups",
                 "reality_dest", "reality_server_names", "reality_short_ids"):
         if getattr(args, key, None) is not None:
             body[key] = getattr(args, key)
     if getattr(args, "vless_enabled", None) is not None:
         body["vless_enabled"] = args.vless_enabled
+    if getattr(args, "vmess_tcp_enabled", None) is not None:
+        body["vmess_tcp_enabled"] = args.vmess_tcp_enabled
+    if getattr(args, "ss_tcp_enabled", None) is not None:
+        body["ss_tcp_enabled"] = args.ss_tcp_enabled
+    if getattr(args, "http_enabled", None) is not None:
+        body["http_enabled"] = args.http_enabled
     if getattr(args, "reality_enabled", None) is not None:
         body["reality_enabled"] = args.reality_enabled
     if getattr(args, "reality_rotate_key", False):
@@ -1334,6 +1349,7 @@ def main():
     a.add_argument("--vless-ws-paths", help="comma-separated; empty string = env default")
     a.add_argument("--trojan-ws-paths", help="comma-separated; empty string = env default")
     a.add_argument("--ss-ws-paths", help="comma-separated; empty string = env default")
+    a.add_argument("--vmess-ws-paths", help="comma-separated; empty string = env default")
     a.add_argument("--upstream-strategy")
     a.add_argument("--ss-method")
     a.add_argument("--direct-allow-private", dest="direct_allow_private",
@@ -1352,9 +1368,30 @@ def main():
     a.add_argument("--no-vless-enabled", dest="vless_enabled",
                    action="store_false",
                    help="do not render the VLESS inbounds")
+    a.add_argument("--vmess-tcp-enabled", dest="vmess_tcp_enabled",
+                   action="store_true", default=None,
+                   help="render the bare-VMess (plain TCP) inbound"
+                        " (off by default; VMess-WS is always on)")
+    a.add_argument("--no-vmess-tcp-enabled", dest="vmess_tcp_enabled",
+                   action="store_false",
+                   help="do not render the bare-VMess inbound")
+    a.add_argument("--ss-tcp-enabled", dest="ss_tcp_enabled",
+                   action="store_true", default=None,
+                   help="render the bare-Shadowsocks (plain TCP) inbound"
+                        " (off by default; SS-WS is always on)")
+    a.add_argument("--no-ss-tcp-enabled", dest="ss_tcp_enabled",
+                   action="store_false",
+                   help="do not render the bare-Shadowsocks inbound")
+    a.add_argument("--http-enabled", dest="http_enabled",
+                   action="store_true", default=None,
+                   help="render the HTTP-proxy (CONNECT) inbound"
+                        " (off by default)")
+    a.add_argument("--no-http-enabled", dest="http_enabled",
+                   action="store_false",
+                   help="do not render the HTTP-proxy inbound")
     a.add_argument("--reality-enabled", dest="reality_enabled",
                    action="store_true", default=None,
-                   help="render the REALITY inbound (on by default)")
+                   help="render the REALITY inbound (off by default)")
     a.add_argument("--no-reality-enabled", dest="reality_enabled",
                    action="store_false",
                    help="do not render the REALITY inbound")
@@ -1434,7 +1471,7 @@ def main():
     a = upsub.add_parser("add", parents=C); a.add_argument("name")
     a.add_argument("--addr", required=True); a.add_argument("--port", type=int, required=True)
     a.add_argument("--proto", required=True,
-                   choices=("vless-ws", "vless", "trojan-ws", "ss", "http", "socks", "ssh"))
+                   choices=("vless-ws", "vless", "trojan-ws", "ss", "vmess-ws", "vmess", "http", "socks", "ssh"))
     a.add_argument("--group"); a.add_argument("--path"); a.add_argument("--uuid")
     a.add_argument("--username"); a.add_argument("--password"); a.add_argument("--key-file")
     a.add_argument("--key-upload", help="ssh upstream: upload this local private key"
@@ -1449,7 +1486,7 @@ def main():
         a.set_defaults(fn=cmd_upstreams_action, action=action)
     a = upsub.add_parser("edit", parents=C); a.add_argument("name")
     a.add_argument("--addr"); a.add_argument("--port", type=int)
-    a.add_argument("--proto", choices=("vless-ws", "vless", "trojan-ws", "ss", "http", "socks", "ssh"))
+    a.add_argument("--proto", choices=("vless-ws", "vless", "trojan-ws", "ss", "vmess-ws", "vmess", "http", "socks", "ssh"))
     a.add_argument("--group"); a.add_argument("--path"); a.add_argument("--uuid")
     a.add_argument("--username"); a.add_argument("--password"); a.add_argument("--key-file")
     a.add_argument("--key-upload", help="ssh upstream: replace the key with this"

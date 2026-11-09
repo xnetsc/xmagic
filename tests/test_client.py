@@ -270,6 +270,21 @@ def main():
                            "--addr", "10.9.9.9", "--port", "8388",
                            "--password", "pw")
         check("upstreams add via remote CLI", rc == 0, err + out)
+        rc, out, err = cli("upstreams", "add", "upvmws", "--proto",
+                           "vmess-ws", "--addr", "10.9.9.11",
+                           "--port", "443", "--uuid",
+                           "11111111-2222-3333-4444-555555555555",
+                           "--tls")
+        check("upstreams add vmess-ws via remote CLI", rc == 0, err + out)
+        rc, out, err = cli("upstreams", "remove", "upvmws")
+        check("upstreams remove vmess-ws via remote CLI", rc == 0,
+              err + out)
+        rc, out, err = cli("upstreams", "add", "upvmbare", "--proto",
+                           "vmess", "--addr", "10.9.9.12",
+                           "--port", "10086", "--uuid",
+                           "11111111-2222-3333-4444-555555555555")
+        check("upstreams add bare vmess refused while vmess TCP is off",
+              rc != 0, err + out)
         rc, out, err = cli("--json", "upstreams", "edit", "up1", "--port", "9999")
         check("upstreams edit via remote CLI",
               rc == 0 and json.loads(out)["upstream"]["port"] == 9999, err + out)
@@ -372,10 +387,30 @@ def main():
         check("settings set --no-vless-enabled via remote CLI",
               rc == 0 and json.loads(out)["vless_enabled"] is False,
               err + out)
+        rc, out, err = cli("--json", "settings", "set",
+                           "--vmess-ws-paths", "/rm1,/rm2")
+        check("settings set --vmess-ws-paths via remote CLI",
+              rc == 0 and json.loads(out)["vmess_ws_paths"]
+              == ["/rm1", "/rm2"], err + out)
+        rc, out, err = cli("--json", "settings", "set",
+                           "--vmess-ws-paths", "")
+        check("settings set --vmess-ws-paths '' clears to the default",
+              rc == 0 and json.loads(out)["vmess_ws_paths"]
+              == ["/vmess-ws"], err + out)
+        for flag, key in (("--vmess-tcp-enabled", "vmess_tcp_enabled"),
+                          ("--ss-tcp-enabled", "ss_tcp_enabled"),
+                          ("--http-enabled", "http_enabled")):
+            rc, out, err = cli("--json", "settings", "set", flag)
+            check(f"settings set {flag} via remote CLI",
+                  rc == 0 and json.loads(out)[key] is True, err + out)
+            rc, out, err = cli("--json", "settings", "set",
+                               "--no-" + flag[2:])
+            check(f"settings set --no-{flag[2:]} via remote CLI",
+                  rc == 0 and json.loads(out)[key] is False, err + out)
         rc, out, err = cli("--json", "settings", "show")
         st = json.loads(out)
         check("settings show carries the reality client parameters",
-              rc == 0 and st["reality_enabled"] is True
+              rc == 0 and st["reality_enabled"] is False
               and st["reality_dest"] == "www.microsoft.com:443"
               and st["reality_server_names"] == ["www.microsoft.com"]
               and len(st["reality_short_ids"]) == 1

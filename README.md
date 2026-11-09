@@ -3,16 +3,17 @@
 [中文](README.zh-CN.md) | **English**
 
 In one line: **one public port, dispatched by the first bytes of each
-connection**, serving SSH, HTTP proxy (CONNECT), Trojan-WS,
-Shadowsocks-WS, VLESS+REALITY and bare
-Shadowsocks at the same time. Protocols with no encryption of their
-own are off by default: VLESS-WS / bare VLESS (enable in Settings)
-and public SOCKS5 (`XMAGIC_ENABLE_SOCKS5=1`); HTTP stays because it
-rides the outer HTTPS, Trojan mandates TLS by design, and
-Shadowsocks carries its own cipher. SSH is off by default too — it
-encrypts itself, but it is an optional entry: sshd and the SSH
-upstreams run only with `XMAGIC_ENABLE_SSH=1`, and while it is off,
-SSH-shaped configuration is refused in the console and the CLIs.
+connection**, serving Trojan-WS, Shadowsocks-WS and VMess-WS at the
+same time - the WebSocket carriers are the default-on set. Everything
+that rides bare TCP is opt-in: bare Shadowsocks, bare VMess and
+VLESS+REALITY (enable in Settings), as is the HTTP proxy (CONNECT;
+many environments cannot forward CONNECT at all). Protocols with no
+encryption of their own are off by default too: VLESS-WS / bare VLESS
+(enable in Settings) and public SOCKS5 (`XMAGIC_ENABLE_SOCKS5=1`).
+SSH is off by default as well — it encrypts itself, but it is an
+optional entry: sshd and the SSH upstreams run only with
+`XMAGIC_ENABLE_SSH=1`, and while it is off, SSH-shaped configuration
+is refused in the console and the CLIs.
 A node can also cascade to multiple upstreams: whatever protocol it
 accepts inbound, it can also speak outbound. The upstream for a
 connection is chosen by user group, or by destination domain/IP via
@@ -35,10 +36,12 @@ identity engine, so a change made in one shows up in the others.
         |          |       HTTP            |              |             |
        sshd    SOCKS5     HTTP      Xray fallback mux -----+        admin
     (key auth)  inbound   inbound    |- path hit -> VLESS-WS backends (multi-path, opt-in)
-                                     |- path hit -> Trojan-WS backends (multi-path)
+                        (opt-in)     |- path hit -> Trojan-WS backends (multi-path)
                                      |- path hit -> Shadowsocks-WS backends (multi-path)
-                                     +- default fallback -> bare Shadowsocks
-    TLS ClientHello (0x16 0x03) ---> VLESS+REALITY backend (on by default)
+                                     |- path hit -> VMess-WS backends (multi-path)
+                                     +- default fallback -> bare Shadowsocks (opt-in)
+    TLS ClientHello (0x16 0x03) ---> VLESS+REALITY backend (opt-in)
+    VMess AEAD AuthID (validated) -> bare VMess backend (opt-in)
                                    |
               egress: direct, or an upstream pool (per-user groups, balancing)
 ```
@@ -61,17 +64,20 @@ identity engine, so a change made in one shows up in the others.
 | --- | --- | --- | --- |
 | SSH | sshd (**off by default**: `XMAGIC_ENABLE_SSH=1` to enable); `ssh -D` gives SOCKS5 | `ssh -N -D` tunnel mapped to a local SOCKS outbound | public key (both directions) |
 | SOCKS5 | Xray socks inbound (public branch **off by default**: plaintext, `XMAGIC_ENABLE_SOCKS5=1` to enable) | Xray socks outbound | username + password (may be empty) |
-| HTTP proxy | Xray http inbound (CONNECT) | Xray http outbound | Basic (may be empty) |
+| HTTP proxy | Xray http inbound (CONNECT) (**off by default**: many environments cannot forward CONNECT; enable in Settings) | Xray http outbound | Basic (may be empty) |
 | VLESS-WS | WS path dispatch -> backend (**off by default**: VLESS has no encryption of its own; enable in Settings) | same | uuid |
 | VLESS (bare TCP) | dispatcher -> mux main inbound (**off by default**) | same | uuid |
-| VLESS+REALITY | TLS ClientHello dispatch -> REALITY backend (**on by default**, independent of the VLESS switch) | - (inbound only) | uuid |
+| VLESS+REALITY | TLS ClientHello dispatch -> REALITY backend (**off by default**: it rides bare TCP, which many environments cannot forward; independent of the VLESS switch; enable in Settings) | - (inbound only) | uuid |
 | Trojan-WS | WS path dispatch -> backend | same | password |
-| Shadowsocks | default fallback -> backend | same | per-user password + method |
+| Shadowsocks | default fallback -> backend (**off by default**: bare TCP; enable in Settings - Shadowsocks-WS is unaffected) | same | per-user password + method |
 | Shadowsocks-WS | WS path dispatch -> backend | same (an `ss` upstream with a path dials WS; with TLS it dials WSS) | per-user password + method |
+| VMess (bare TCP) | dispatcher validates the AEAD AuthID against the user ids -> backend (**off by default**: bare TCP; enable in Settings) | same | uuid (the user's VLESS uuid) |
+| VMess-WS | WS path dispatch -> backend | same (a `vmess-ws` upstream dials WS; with TLS it dials WSS) | uuid (the user's VLESS uuid) |
 
 Each user holds one credential set in the database: a VLESS uuid
-(used by the VLESS inbounds when enabled, and by the REALITY
-inbound), one shared password (Trojan / HTTP /
+(used by the VLESS inbounds when enabled, by the REALITY
+inbound, and as the VMess ID - VMess here is AEAD only,
+alterId 0), one shared password (Trojan / HTTP /
 SOCKS), a separate Shadowsocks
 password, and an optional SSH public key. Upstreams are stored with
 the credentials the upstream node issued under the same model -
@@ -154,6 +160,17 @@ this gateway does not terminate) and the dispatcher's public
 SOCKS5 branch (env `XMAGIC_ENABLE_SOCKS5=1`; SOCKS5 is plaintext
 and, not being HTTP, cannot ride the outer HTTPS either).
 
+The same opt-in shape covers everything that rides bare TCP,
+because many environments can only forward HTTP(S) / WebSocket
+traffic: bare Shadowsocks (`ss_tcp_enabled`), bare VMess
+(`vmess_tcp_enabled`), VLESS+REALITY (`reality_enabled`) and the
+HTTP proxy (`http_enabled`) are all off by default and enabled in
+Settings. The default-on set is the WebSocket carriers only:
+Trojan-WS, Shadowsocks-WS and VMess-WS. VMess support is AEAD
+only (alterId 0; upstream Xray marks VMess deprecated, kept here
+for compatibility with existing clients), and its AuthID check
+needs the client and server clocks within about 120 seconds.
+
 SSH support is off by default as well (env `XMAGIC_ENABLE_SSH=1`,
 read at node start, env-only — no console/CLI toggle). While off,
 the sshd and tunnels processes are not started (compose form: the
@@ -170,16 +187,18 @@ rule, an anti-SSRF measure). Turn it on when the node must reach its
 own LAN services; the rendered freedom outbound then carries an allow
 finalRule for the private ranges.
 
-### VLESS+REALITY inbound (on by default)
+### VLESS+REALITY inbound (opt-in)
 
 REALITY gives the gateway an inbound whose wire looks like an ordinary
 TLS 1.3 session to a real website: the handshake borrows the
 camouflage target site's certificate and parameters, and a connection
 that does not authenticate as REALITY is forwarded to that real site,
-so probing the port yields the genuine site. Unlike the bare VLESS
-inbounds, REALITY carries its own encryption and camouflage, so it is
-**on by default and independent of the VLESS switch** - turning
-VLESS off does not turn REALITY off, and vice versa. Clients use
+so probing the port yields the genuine site. REALITY carries its own
+encryption and camouflage, but it rides bare TCP - and in most
+environments only HTTP(S) / WebSocket traffic can be forwarded in -
+so it is **off by default and independent of the VLESS switch**:
+turning VLESS off does not turn REALITY off, and vice versa. Enable
+it in Settings (`reality_enabled`). Clients use
 their existing per-user UUID with flow `xtls-rprx-vision`.
 
 Settings (web console, `users.py settings`, remote CLI
@@ -232,9 +251,10 @@ The gateway also serves Shadowsocks carried inside WebSocket
 ("SS-WS"): the same per-user SS password and method as the bare
 inbound, on its own WS paths (default `/ss-ws`, multi-path, managed
 in Settings like the other WS path lists). SS encrypts itself, so
-this inbound is on by default like the rest of the SS family. Two
+this inbound is on by default; the bare SS inbound is a separate
+opt-in (it rides bare TCP - Settings `ss_tcp_enabled`). Two
 limits are inherent to the carrier: **TCP only** (no UDP over WS -
-use the bare SS inbound for UDP), and, like the node's other WS
+enable the bare SS inbound for UDP), and, like the node's other WS
 inbounds, plaintext WS is for intranet / in-tunnel use - on the
 public internet put a TLS front in front of it (a CDN, below, or any
 TLS terminator).
@@ -448,8 +468,8 @@ python3 users.py upstream-add b3 --addr node3.example.com --port 22 --proto ssh 
 python3 users.py setgroup alice team-b    # alice egresses via the team-b pool; unset = default pool
 ```
 
-- `--proto` is one of vless-ws / vless / trojan-ws / ss / http /
-  socks / ssh. An ssh upstream renders as a local SOCKS port plus
+- `--proto` is one of vless-ws / vless / trojan-ws / ss / vmess-ws /
+  vmess / http / socks / ssh. An ssh upstream renders as a local SOCKS port plus
   `data/ssh-tunnels.json` and `data/start-tunnels.sh`, held open by
   the compose `tunnels` sidecar (`--profile cascade`) running
   `ssh -N -D`.

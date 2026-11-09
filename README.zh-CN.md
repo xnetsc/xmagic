@@ -2,11 +2,12 @@
 
 [English](README.md) | **中文**
 
-一句话：**一个公共端口，凭协议首字节自动分发**，同时提供 SSH、
-HTTP 代理（CONNECT）、Trojan-WS、Shadowsocks-WS、VLESS+REALITY、裸 Shadowsocks；
-自身不带加密的协议默认不开：VLESS-WS、VLESS（裸 TCP）（在设置里
-开启）与公网 SOCKS5（`XMAGIC_ENABLE_SOCKS5=1`）；HTTP 留着是因为
-它借道外层 HTTPS，Trojan 设计上强制 TLS，Shadowsocks 自带加密。
+一句话：**一个公共端口，凭协议首字节自动分发**，默认同时提供
+Trojan-WS、Shadowsocks-WS、VMess-WS——默认开的只有 WS 形态。
+走裸 TCP 的一律选择加入：裸 Shadowsocks、裸 VMess、VLESS+REALITY
+（在设置里开启），HTTP 代理（CONNECT）也是（很多环境根本转发不了
+CONNECT）；自身不带加密的协议同样默认不开：VLESS-WS、VLESS（裸 TCP）
+（在设置里开启）与公网 SOCKS5（`XMAGIC_ENABLE_SOCKS5=1`）。
 SSH 也默认不开——它自带加密，关的是这个可选入口：`XMAGIC_ENABLE_SSH=1`
 才启动 sshd 与 SSH 上级，关闭期间 SSH 相关配置一律拒绝。
 节点自身还能作为下级节点去连多个上级（级联），入站会什么协议、出站就支持
@@ -26,11 +27,13 @@ SSH 也默认不开——它自带加密，关的是这个可选入口：`XMAGIC
      "SSH-" 横幅   0x05    CONNECT /    WebSocket     源形式 HTTP     其余字节
         │          │       绝对形式 HTTP   Upgrade      （浏览器）        │
        sshd      SOCKS5 入站   HTTP 入站   Xray fallback 复用器 ──┤   admin 后台
-    (公钥认证)   (默认关)  (用户+密码)   ├ 路径命中 → VLESS-WS 后端（可多路径，默认关）
+    (公钥认证)   (默认关)  (默认关)   ├ 路径命中 → VLESS-WS 后端（可多路径，默认关）
                                             ├ 路径命中 → Trojan-WS 后端（可多路径）
                                             ├ 路径命中 → Shadowsocks-WS 后端（可多路径）
-                                            └ 默认回落 → 裸 Shadowsocks 后端
-     TLS ClientHello（0x16 0x03）───────────→ VLESS+REALITY 后端（默认开）
+                                            ├ 路径命中 → VMess-WS 后端（可多路径）
+                                            └ 默认回落 → 裸 Shadowsocks 后端（默认关）
+     TLS ClientHello（0x16 0x03）───────────→ VLESS+REALITY 后端（默认关）
+     VMess AEAD AuthID（校验通过）────────→ 裸 VMess 后端（默认关）
                                    │
                         出口：直连，或上级池（按用户分组、负载均衡）
 ```
@@ -49,15 +52,18 @@ SSH 也默认不开——它自带加密，关的是这个可选入口：`XMAGIC
 | --- | --- | --- | --- |
 | SSH | sshd（**默认关闭**：`XMAGIC_ENABLE_SSH=1` 开启），`ssh -D` 得 SOCKS5 | `ssh -N -D` 隧道映射为本地 SOCKS 出站 | 公钥（双向都是） |
 | SOCKS5 | Xray socks 入站（公网分支**默认关闭**：明文协议，`XMAGIC_ENABLE_SOCKS5=1` 开启） | Xray socks 出站 | 用户名+密码（可空） |
-| HTTP 代理 | Xray http 入站（CONNECT） | Xray http 出站 | Basic（可空） |
+| HTTP 代理 | Xray http 入站（CONNECT）（**默认关闭**：很多环境转发不了 CONNECT，在设置里开启） | Xray http 出站 | Basic（可空） |
 | VLESS-WS | WS 路径分发 → 后端（**默认关闭**：VLESS 自身不加密，在设置里开启） | 同左 | uuid |
 | VLESS（裸 TCP） | 分发器 → 复用器主入站直达（**默认关闭**） | 同左 | uuid |
-| VLESS+REALITY | TLS ClientHello 分发 → REALITY 后端（**默认开启**，与 VLESS 开关无关） | —（仅入站） | uuid |
+| VLESS+REALITY | TLS ClientHello 分发 → REALITY 后端（**默认关闭**：走裸 TCP、很多环境转发不进来；与 VLESS 开关无关，在设置里开启） | —（仅入站） | uuid |
 | Trojan-WS | WS 路径分发 → 后端 | 同左 | 密码 |
-| Shadowsocks | 默认回落 → 后端 | 同左 | 每用户独立密码+method |
+| Shadowsocks | 默认回落 → 后端（**默认关闭**：裸 TCP，在设置里开启；SS-WS 不受影响） | 同左 | 每用户独立密码+method |
 | Shadowsocks-WS | WS 路径分发 → 后端 | 同左（ss 上级带路径即走 WS 拨号，带 TLS 即 WSS） | 每用户独立密码+method |
+| VMess（裸 TCP） | 分发器按 AEAD AuthID 校验用户 id → 后端（**默认关闭**：裸 TCP，在设置里开启） | 同左 | uuid（与 VLESS 同一个） |
+| VMess-WS | WS 路径分发 → 后端 | 同左（vmess-ws 上级走 WS 拨号，带 TLS 即 WSS） | uuid（与 VLESS 同一个） |
 
-每个用户在库里是一套凭证：VLESS uuid（VLESS 入站开启时用，REALITY 入站也用它）、
+每个用户在库里是一套凭证：VLESS uuid（VLESS 入站开启时用，REALITY 入站也用它，
+同时就是 VMess 的 ID——这里的 VMess 只支持 AEAD、alterId 0）、
 一个共享密码（Trojan / HTTP / SOCKS 共用）、
 独立的 SS 密码、可选的 SSH 公钥。连上级时存的也是对方按同一模型签发的凭证——
 **两段认证各管一段**：用户连本节点用本节点签发的凭证（在本节点终结）；本节点连
@@ -114,6 +120,15 @@ VLESS / Trojan / Shadowsocks 的 WS 路径列表、上级池策略、新用户�
 分支（环境变量 `XMAGIC_ENABLE_SOCKS5=1`；SOCKS5 是明文，且不是
 HTTP、借不了外层 HTTPS 的道）。
 
+走裸 TCP 的形态同样一律选择加入（很多环境只能转发 HTTP(S) /
+WebSocket 流量）：裸 Shadowsocks（`ss_tcp_enabled`）、裸 VMess
+（`vmess_tcp_enabled`）、VLESS+REALITY（`reality_enabled`）与
+HTTP 代理（`http_enabled`）都默认关、在设置里开启。默认开的只有
+WS 形态：Trojan-WS、Shadowsocks-WS、VMess-WS。VMess 只支持
+AEAD（alterId 0；上游 Xray 已把 VMess 标为弃用，这里为兼容既有
+客户端保留），其 AuthID 校验要求客户端与服务端时钟相差在约
+120 秒内。
+
 SSH 支持同样默认关（环境变量 `XMAGIC_ENABLE_SSH=1`，节点启动时
 读取、只认环境变量，控制台与 CLI 里没有开关）。关闭时 sshd 与
 隧道进程不启动（compose 形态下 sshd 服务在 `ssh` profile 后面），
@@ -126,14 +141,15 @@ dispatcher 不分流 SSH 横幅，用户的 SSH 公钥、SSH 上级与节点密�
 防 SSRF）；节点需要访问自家局域网服务时才打开，打开后渲染出的 freedom
 出站会带一条放行内网段的 finalRule。
 
-### VLESS+REALITY 入站（默认开）
+### VLESS+REALITY 入站（默认关，选择加入）
 
 REALITY 让网关多一条外观与真实网站 TLS 1.3 会话无异的入站：握手借用
 伪装目标站点的证书与参数，未能通过 REALITY 认证的连接会被直接转发到
-该真站——拿探测打这个端口，看到的就是真站本身。与裸 VLESS 不同，
-REALITY 自带加密与伪装，因此**默认开启，且与 VLESS 开关相互独立**：
-关掉 VLESS 不会关掉 REALITY，反之亦然。客户端用各用户已有的 UUID，
-flow 为 `xtls-rprx-vision`。
+该真站——拿探测打这个端口，看到的就是真站本身。REALITY 自带加密与
+伪装，但它走裸 TCP——而多数环境只能转发 HTTP(S) / WebSocket
+流量——因此**默认关闭，且与 VLESS 开关相互独立**：关掉 VLESS 不会
+关掉 REALITY，反之亦然；要用时在设置里开启（`reality_enabled`）。
+客户端用各用户已有的 UUID，flow 为 `xtls-rprx-vision`。
 
 设置项（Web 后台、`users.py settings`、远程 CLI `settings set` 三面
 一致，库里的值胜过 `REALITY_*` 环境变量）：开关、伪装目标 `dest`
@@ -179,8 +195,9 @@ TLS 握手必须原封不动地到达 REALITY 入站。
 网关还提供把 Shadowsocks 装进 WebSocket 的入站（简称 SS-WS）：
 与裸 SS 同一份每用户密码与 method，走自己的一组 WS 路径（默认
 `/ss-ws`，可多路径，在设置里与其它 WS 路径列表同样管理）。SS 自带
-加密，这条入站与 SS 家族一致默认开启。承载固有的两个限制：**只
-走 TCP**（WS 不承载 UDP，需要 UDP 用裸 SS 入站）；与本节点其它
+加密，这条入站默认开启；裸 SS 入站是另一个开关（走裸 TCP，设置
+里的 `ss_tcp_enabled`）。承载固有的两个限制：**只
+走 TCP**（WS 不承载 UDP，需要 UDP 就开启裸 SS 入站）；与本节点其它
 WS 入站一样，明文 WS 只适合内网/隧道内使用，公网上要在前面套一
 层 TLS 终结（下文的 CDN，或任意 TLS 终结器）。
 
@@ -355,7 +372,7 @@ python3 users.py upstream-add b3 --addr node3.example.com --port 22 --proto ssh 
 python3 users.py setgroup alice team-b    # 让 alice 走 team-b 组的池，不设走 default 池
 ```
 
-- `--proto` 可选 vless-ws / vless / trojan-ws / ss / http / socks / ssh；
+- `--proto` 可选 vless-ws / vless / trojan-ws / ss / vmess-ws / vmess / http / socks / ssh；
   ssh 上级在渲染时被映射为一个本地 SOCKS 端口，并生成 `data/ssh-tunnels.json`
   与 `data/start-tunnels.sh`，由 compose 的 `tunnels` sidecar
   （`--profile cascade`）常驻 `ssh -N -D` 保持隧道。

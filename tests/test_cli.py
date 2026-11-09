@@ -181,32 +181,106 @@ def main():
           all(i["tag"] != "vless-ws-0" for i in vcfg["inbounds"])
           and vcfg["inbounds"][0]["settings"]["clients"] == [],
           json.dumps([i["tag"] for i in vcfg["inbounds"]]))
-    # Policy pin: REALITY is an independent inbound with its own
-    # switch - it must never drag the plaintext protocols back on.
-    # With reality on (the default) and vless off (the default), the
-    # render holds a reality inbound and NO vless-ws inbound, and the
-    # mux still authenticates nobody.
-    reality_in = next((i for i in vcfg["inbounds"] if i["tag"] == "reality"),
-                      None)
-    rc, out, _ = cli("--json", "settings")
-    st0 = json.loads(out) if rc == 0 else {}
-    check("reality on + vless off: reality inbound present, no vless-ws,"
-          " mux clients empty (independent switches)",
+    # --- protocol defaults: only the WS carriers render by default.
+    # VMess-WS is on (self-encrypted); the bare-TCP forms (bare
+    # VMess, bare SS, REALITY) and the HTTP proxy are opt-in.
+    # REALITY stays an independent inbound with its own switch - it
+    # must never drag the plaintext protocols back on.
+    tags = [i["tag"] for i in vcfg["inbounds"]]
+    st0 = json.loads(cli("--json", "settings")[1])
+    user_uuids = [u["vless_uuid"]
+                  for u in json.loads(cli("--json", "list")[1])]
+    vmessws_in = next(
+        (i for i in vcfg["inbounds"] if i["tag"] == "vmess-ws-0"), None)
+    vmux_fb = [f for f in vcfg["inbounds"][0]["settings"]["fallbacks"]
+               if f.get("path") == "/vmess-ws"]
+    check("vmess-ws on by default: inbound + mux fallback, ids are the"
+          " users' uuids, alterId 0",
+          vmessws_in is not None
+          and vmessws_in["protocol"] == "vmess"
+          and vmessws_in["port"] == 12400
+          and vmessws_in["streamSettings"]["wsSettings"]["path"]
+          == "/vmess-ws"
+          and [c.get("id") for c in
+               vmessws_in["settings"]["clients"]] == user_uuids
+          and all(c.get("alterId") == 0
+                  for c in vmessws_in["settings"]["clients"])
+          and vmux_fb and vmux_fb[0]["dest"] == 12400
+          and st0["vmess_ws_paths"] == ["/vmess-ws"]
+          and st0["vmess_ws_paths_from_db"] is False,
+          json.dumps(tags))
+    check("bare forms off by default: no vmess / ss / reality / http-in"
+          " inbound, settings report all four off",
+          "vmess" not in tags and "ss" not in tags
+          and "reality" not in tags and "http-in" not in tags
+          and st0["vmess_tcp_enabled"] is False
+          and st0["ss_tcp_enabled"] is False
+          and st0["http_enabled"] is False
+          and st0["reality_enabled"] is False
+          and st0["vless_enabled"] is False,
+          json.dumps(tags) + json.dumps(st0))
+
+    # each bare form renders once its own switch is on
+    bare_path = os.path.join(workdir, "bare.json")
+    rc, out, _ = cli("settings", "--vmess-tcp", "on")
+    check("settings --vmess-tcp on", rc == 0
+          and "vmess_tcp_enabled: True" in out, out)
+    cli("render", "--out", bare_path)
+    bcfg = json.load(open(bare_path))
+    vmess_in = next((i for i in bcfg["inbounds"]
+                     if i["tag"] == "vmess"), None)
+    check("vmess bare inbound rendered once enabled: ids + alterId 0",
+          vmess_in is not None and vmess_in["port"] == 18084
+          and [c.get("id") for c in
+               vmess_in["settings"]["clients"]] == user_uuids
+          and all(c.get("alterId") == 0
+                  for c in vmess_in["settings"]["clients"]),
+          json.dumps(vmess_in))
+    rc, out, _ = cli("settings", "--ss-tcp", "on")
+    check("settings --ss-tcp on", rc == 0
+          and "ss_tcp_enabled: True" in out, out)
+    cli("render", "--out", bare_path)
+    bcfg = json.load(open(bare_path))
+    check("ss bare inbound rendered once enabled",
+          any(i["tag"] == "ss" and i["port"] == 12003
+              for i in bcfg["inbounds"]),
+          json.dumps([i["tag"] for i in bcfg["inbounds"]]))
+    rc, out, _ = cli("settings", "--http", "on")
+    check("settings --http on", rc == 0
+          and "http_enabled: True" in out, out)
+    cli("render", "--out", bare_path)
+    bcfg = json.load(open(bare_path))
+    check("http inbound rendered once enabled",
+          any(i["tag"] == "http-in" for i in bcfg["inbounds"]),
+          json.dumps([i["tag"] for i in bcfg["inbounds"]]))
+    rc, out, _ = cli("settings", "--reality", "on")
+    check("settings --reality on", rc == 0
+          and "reality_enabled: True" in out, out)
+    cli("render", "--out", bare_path)
+    bcfg = json.load(open(bare_path))
+    reality_in = next((i for i in bcfg["inbounds"]
+                       if i["tag"] == "reality"), None)
+    check("reality renders once enabled while vless stays off:"
+          " reality inbound, no vless-ws, mux clients empty",
           reality_in is not None
+          and reality_in["protocol"] == "vless"
+          and reality_in["streamSettings"]["security"] == "reality"
+          and reality_in["streamSettings"]["realitySettings"]["target"]
+          == "www.microsoft.com:443"
           and all(not i["tag"].startswith("vless-ws")
-                  for i in vcfg["inbounds"])
-          and vcfg["inbounds"][0]["settings"]["clients"] == []
-          and st0.get("reality_enabled") is True
-          and st0.get("vless_enabled") is False,
-          json.dumps([i["tag"] for i in vcfg["inbounds"]]) + out)
+                  for i in bcfg["inbounds"])
+          and bcfg["inbounds"][0]["settings"]["clients"] == [],
+          json.dumps([i["tag"] for i in bcfg["inbounds"]]))
     check("reality inbound clients are the users, with vision flow",
           reality_in is not None
           and {c["id"] for c in reality_in["settings"]["clients"]}
-              == {u["vless_uuid"] for u in json.loads(
-                      cli("--json", "list")[1])}
+              == set(user_uuids)
           and all(c["flow"] == "xtls-rprx-vision"
                   for c in reality_in["settings"]["clients"]),
           json.dumps(reality_in))
+    # back to the defaults for the rest of the suite
+    cli("settings", "--vmess-tcp", "off", "--ss-tcp", "off",
+        "--http", "off", "--reality", "off")
     # SS over WS rides the same mux as the other WS families: one
     # backend inbound per path, the bare SS client list, and a mux
     # fallback entry pointing at it.
@@ -235,6 +309,21 @@ def main():
                        "--addr", "10.0.0.9", "--port", "8388",
                        "--password", "pw", "--method", "aes-999-bogus")
     check("bogus ss method refused at add time", rc != 0, out + err)
+    rc, out, err = cli("upstream-add", "badvmws", "--proto", "vmess-ws",
+                       "--addr", "10.0.0.9", "--port", "443")
+    check("upstream-add vmess-ws without --uuid fails",
+          rc != 0, out + err)
+    rc, out, err = cli("upstream-add", "badvm", "--proto", "vmess",
+                       "--addr", "10.0.0.9", "--port", "10086",
+                       "--uuid", "11111111-2222-3333-4444-555555555555")
+    check("upstream-add bare vmess refused while vmess TCP is off",
+          rc != 0 and "vmess-tcp" in err, out + err)
+    rc, out, err = cli("upstream-add", "okvmws", "--proto", "vmess-ws",
+                       "--addr", "10.0.0.9", "--port", "443",
+                       "--uuid", "11111111-2222-3333-4444-555555555555")
+    check("upstream-add vmess-ws is not gated by vmess TCP",
+          rc == 0, out + err)
+    cli("upstream-remove", "okvmws")
     rc, out, _ = cli("settings", "--vless", "on")
     check("settings --vless on (VLESS is opt-in)",
           rc == 0 and "vless_enabled: True" in out, out)
@@ -297,6 +386,26 @@ def main():
           err + json.dumps(ssws_tags))
     rc, _, _ = cli("settings", "--ss-ws-paths", "")
     check("settings ss-ws paths cleared back to env", rc == 0)
+    rc, out, _ = cli("settings", "--vmess-ws-paths", "/m1,/m2")
+    check("settings vmess-ws paths set via CLI",
+          rc == 0 and "/m1" in out, out)
+    rc, out, _ = cli("--json", "settings")
+    check("settings --json shows db vmess-ws paths",
+          json.loads(out)["vmess_ws_paths"] == ["/m1", "/m2"]
+          and json.loads(out)["vmess_ws_paths_from_db"] is True, out)
+    rc, out, err = cli("apply")
+    applied_cfg = json.load(open(config_path)) if rc == 0 else {}
+    mvws_tags = [i["tag"] for i in applied_cfg.get("inbounds", [])]
+    mvws_paths = sorted(
+        i["streamSettings"]["wsSettings"]["path"]
+        for i in applied_cfg.get("inbounds", [])
+        if i["tag"].startswith("vmess-ws-"))
+    check("apply re-renders vmess-ws inbounds for the db paths",
+          rc == 0 and mvws_tags.count("vmess-ws-0") == 1
+          and "vmess-ws-1" in mvws_tags and mvws_paths == ["/m1", "/m2"],
+          err + json.dumps(mvws_tags))
+    rc, _, _ = cli("settings", "--vmess-ws-paths", "")
+    check("settings vmess-ws paths cleared back to env", rc == 0)
 
     # ---- parity: same DB through the web console
     server_env = dict(env, XMAGIC_ADMIN_BIND="127.0.0.1",
@@ -740,6 +849,51 @@ JHde4tAsdlXZGG6MF7TiAAAAEHhtYWdpYyBmaXh0dXJlLWIBAgMEBQ==
     check("ss test upstreams removed again", rc == 0 and rc2 == 0,
           err + err2)
 
+    # VMess upstreams mirror VLESS: vnext users carry the uuid with
+    # alterId 0 / security auto; bare rides plain TCP (TLS optional),
+    # vmess-ws rides the WS paths like the other WS families.
+    rc, _, err = cli("settings", "--vmess-tcp", "on")
+    check("vmess-tcp enabled for the bare upstream adds", rc == 0, err)
+    rc, _, err = cli("upstream-add", "upvm", "--proto", "vmess",
+                     "--addr", "10.0.0.9", "--port", "10086",
+                     "--uuid", "11111111-2222-3333-4444-555555555555")
+    check("bare vmess upstream accepted once enabled", rc == 0, err)
+    rc, _, err = cli("upstream-add", "upvmws", "--proto", "vmess-ws",
+                     "--addr", "cdn.example.com", "--port", "443",
+                     "--uuid", "22222222-3333-4444-5555-666666666666",
+                     "--tls")
+    check("vmess-ws upstream with tls accepted", rc == 0, err)
+    rc, out, err = cli("render", "--out", ssout_path)
+    ocfg = json.load(open(ssout_path)) if rc == 0 else {}
+    by_tag = {o["tag"]: o for o in ocfg.get("outbounds", [])}
+    vm_out = by_tag.get("up-default-upvm", {})
+    vm_user = (vm_out.get("settings", {}).get("vnext", [{}])[0]
+               .get("users", [{}])[0])
+    check("bare vmess outbound: vnext user id/alterId/security, tcp",
+          vm_out.get("protocol") == "vmess"
+          and vm_user.get("id")
+              == "11111111-2222-3333-4444-555555555555"
+          and vm_user.get("alterId") == 0
+          and vm_user.get("security") == "auto"
+          and vm_out.get("streamSettings", {}).get("network") == "tcp"
+          and vm_out.get("streamSettings", {}).get("security") == "none",
+          err + json.dumps(vm_out))
+    vmws_out = by_tag.get("up-default-upvmws", {})
+    vmws_ss = vmws_out.get("streamSettings", {})
+    check("vmess-ws outbound: ws path + tls + serverName",
+          vmws_out.get("protocol") == "vmess"
+          and vmws_ss.get("network") == "ws"
+          and vmws_ss.get("wsSettings", {}).get("path") == "/vmess-ws"
+          and vmws_ss.get("security") == "tls"
+          and vmws_ss.get("tlsSettings", {}).get("serverName")
+              == "cdn.example.com",
+          err + json.dumps(vmws_out))
+    rc, _, err = cli("upstream-remove", "upvm")
+    rc2, _, err2 = cli("upstream-remove", "upvmws")
+    check("vmess test upstreams removed again", rc == 0 and rc2 == 0,
+          err + err2)
+    cli("settings", "--vmess-tcp", "off")
+
     rc, out, _ = cli("--json", "route-list")
     routes = json.loads(out)
     check("--json route-list shows the route",
@@ -837,6 +991,42 @@ JHde4tAsdlXZGG6MF7TiAAAAEHhtYWdpYyBmaXh0dXJlLWIBAgMEBQ==
     check("key-content rotation relaunches tunnels on apply",
           applied.get("changed") == ["tunnels"], err + out)
     rc, _, _ = cli("upstream-remove", "uptun")
+
+    # ---- sqlite migration: an upstreams CHECK without 'vmess' is
+    # rebuilt on first open and the stored rows survive
+    mig_db = os.path.join(workdir, "mig.db")
+    raw = sqlite3.connect(mig_db)
+    raw.execute("""CREATE TABLE upstreams (
+      id INTEGER PRIMARY KEY,
+      name TEXT UNIQUE NOT NULL,
+      grp TEXT NOT NULL DEFAULT 'default',
+      address TEXT NOT NULL,
+      port INTEGER NOT NULL,
+      protocol TEXT NOT NULL CHECK (protocol IN ('vless-ws', 'vless',
+        'trojan-ws', 'ss', 'http', 'socks', 'ssh')),
+      path TEXT, uuid TEXT, username TEXT, password TEXT,
+      key_file TEXT,
+      tls INTEGER NOT NULL DEFAULT 0,
+      method TEXT NOT NULL DEFAULT 'aes-256-gcm',
+      enabled INTEGER NOT NULL DEFAULT 1,
+      note TEXT,
+      created_at TEXT NOT NULL DEFAULT '')""")
+    raw.execute("INSERT INTO upstreams (name, address, port, protocol)"
+                " VALUES ('old', '10.0.0.1', 8388, 'ss')")
+    raw.commit()
+    raw.close()
+    proc = subprocess.run([sys.executable, users_py, "--json", "list"],
+                          env=dict(os.environ, PROXY_DB=mig_db),
+                          capture_output=True, text=True)
+    raw = sqlite3.connect(mig_db)
+    mig_ddl = raw.execute("SELECT sql FROM sqlite_master WHERE name ="
+                          " 'upstreams'").fetchone()[0]
+    mig_rows = raw.execute("SELECT COUNT(*) FROM upstreams"
+                           ).fetchone()[0]
+    raw.close()
+    check("migration: upstreams CHECK rebuilt with vmess, rows survive",
+          proc.returncode == 0 and "'vmess'" in mig_ddl
+          and mig_rows == 1, mig_ddl)
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     return 1 if FAIL else 0

@@ -130,6 +130,14 @@ if proto in ("ss", "ss-ws"):
     if proto == "ss-ws":
         out["streamSettings"] = {"network": "ws",
                                  "wsSettings": {"path": "/ss-ws"}}
+elif proto in ("vmess", "vmess-ws"):
+    out = {"protocol": "vmess",
+           "settings": {"vnext": [{"address": "127.0.0.1", "port": pub,
+                       "users": [{"id": creds["vless_uuid"],
+                                  "alterId": 0, "security": "auto"}]}]}}
+    if proto == "vmess-ws":
+        out["streamSettings"] = {"network": "ws",
+                                 "wsSettings": {"path": "/vmess-ws"}}
 else:
     out = {"protocol": "vless",
            "settings": {"vnext": [{"address": "127.0.0.1", "port": pub,
@@ -272,6 +280,13 @@ export XMAGIC_ENABLE_SOCKS5=1
 # SSH is opt-in too; the e2e enables it to keep exercising the
 # sshd paths (key login, ssh -D) in both forms.
 export XMAGIC_ENABLE_SSH=1
+# The bare-TCP forms (bare SS, bare VMess), REALITY and the HTTP
+# proxy are opt-in as well; enable them so the checks below keep
+# exercising those paths (bare ss, bare vmess, reality, CONNECT).
+export SS_TCP_ENABLED=1
+export VMESS_TCP_ENABLED=1
+export REALITY_ENABLED=1
+export HTTP_ENABLED=1
 if [ "$FORM" = compose ]; then
   export XRAY_PORT=$PUB
   for img in xray dispatcher sshd admin; do
@@ -294,6 +309,10 @@ else
     -e VLESS_ENABLED=1 \
     -e XMAGIC_ENABLE_SOCKS5=1 \
     -e XMAGIC_ENABLE_SSH=1 \
+    -e SS_TCP_ENABLED=1 \
+    -e VMESS_TCP_ENABLED=1 \
+    -e REALITY_ENABLED=1 \
+    -e HTTP_ENABLED=1 \
     "$PREFIX/xmagic-single:$TAG" > "$WORK/up.log" 2>&1
   check "single container starts" "$?"
 fi
@@ -317,6 +336,8 @@ check "SOCKS5 (alice) -> target" "$?"
 check_via_client vless-ws
 check_via_client ss
 check_via_client ss-ws
+check_via_client vmess
+check_via_client vmess-ws
 check_via_mihomo
 check_via_client vless-tcp
 check_reality

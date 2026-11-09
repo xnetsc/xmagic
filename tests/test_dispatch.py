@@ -12,10 +12,12 @@ anything else -> mux. Each stub backend answers with its own name, so
 the client's received bytes prove the routing.
 """
 import base64
+import json
 import os
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -68,7 +70,80 @@ def probe(payload):
             return b""
 
 
+def unit_checks():
+    """In-process checks of the dispatcher's pure-Python pieces: the
+    AES block cipher, VMess AuthID recognition against a rendered
+    config, and the HTTP-proxy on/off read from the same config."""
+    sys.path.insert(0, ROOT)
+    import sniff
+
+    key = bytes.fromhex("000102030405060708090a0b0c0d0e0f")
+    plain = bytes.fromhex("00112233445566778899aabbccddeeff")
+    cipher = bytes.fromhex("69c4e0d86a7b0430d8cdb78070b4c55a")
+    check("AES-128 encrypt passes the FIPS-197 vector",
+          sniff._aes128_encrypt_block(key, plain) == cipher)
+    check("AES-128 decrypt passes the FIPS-197 vector",
+          sniff._aes128_decrypt_block(key, cipher) == plain)
+
+    vector_uuid = "22222222-3333-4444-5555-666666666666"
+    vector_ts = 1794000000
+    authid = bytes.fromhex("fb691713b812d08fcd4c12625ec8ab25")
+
+    tmp = tempfile.mkdtemp(prefix="xmagic-sniff-unit-")
+
+    def use_config(cfg):
+        path = os.path.join(tmp, f"cfg-{len(os.listdir(tmp))}.json")
+        with open(path, "w") as f:
+            json.dump(cfg, f)
+        os.environ["XMAGIC_XRAY_CONFIG"] = path
+        sniff._CONFIG_CACHE["key"] = None
+        return path
+
+    def vmess_cfg(tag, uuid):
+        return {"inbounds": [{
+            "tag": tag, "protocol": "vmess",
+            "settings": {"clients": [{"id": uuid}]}}]}
+
+    use_config(vmess_cfg("vmess", vector_uuid))
+    check("vmess ids come from the bare inbound",
+          sniff._vmess_ids() == {vector_uuid})
+    check("AuthID vector accepted for its user at its timestamp",
+          sniff._looks_vmess(authid, now=vector_ts))
+    check("AuthID vector rejected once stale",
+          not sniff._looks_vmess(authid, now=vector_ts + 10000))
+    flipped = bytes([authid[0] ^ 1]) + authid[1:]
+    check("AuthID vector with a flipped byte rejected",
+          not sniff._looks_vmess(flipped, now=vector_ts))
+    check("dispatcher waits for a full AuthID before deciding",
+          not sniff._decidable(b"\x09" * 8)
+          and sniff._decidable(b"\x09" * 16))
+
+    use_config(vmess_cfg("vmess", "33333333-4444-5555-6666-777777777777"))
+    check("AuthID vector rejected for a different user",
+          not sniff._looks_vmess(authid, now=vector_ts))
+
+    use_config(vmess_cfg("vmess-ws-0", vector_uuid))
+    check("vmess-ws inbounds alone do not arm recognition",
+          sniff._vmess_ids() == set()
+          and not sniff._looks_vmess(authid, now=vector_ts))
+
+    connect = b"CONNECT example.com:443 HTTP/1.1\r\n\r\n"
+    check("CONNECT fails closed at the mux while HTTP is off",
+          sniff.classify(connect) == "mux")
+    with_http = vmess_cfg("vmess-ws-0", vector_uuid)
+    with_http["inbounds"].append({"tag": "http-in", "protocol": "http"})
+    use_config(with_http)
+    check("CONNECT routes to the HTTP inbound while HTTP is on",
+          sniff.classify(connect) == "http")
+    os.environ["XMAGIC_XRAY_CONFIG"] = os.path.join(tmp, "missing.json")
+    sniff._CONFIG_CACHE["key"] = None
+    check("unreadable config keeps the legacy HTTP routing",
+          sniff.classify(connect) == "http")
+    del os.environ["XMAGIC_XRAY_CONFIG"]
+
+
 def main():
+    unit_checks()
     stop = threading.Event()
     threads = [threading.Thread(target=stub, args=(n, p, stop), daemon=True)
                for n, p in PORTS.items()]

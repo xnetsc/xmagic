@@ -186,7 +186,7 @@ start_sshd() {
 }
 start_dispatcher() {
   xlog "starting dispatcher"
-  python3 /app/sniff.py &
+  XMAGIC_XRAY_CONFIG="$DATA_DIR/config.json" python3 /app/sniff.py &
   echo $! > "$PID_DIR/dispatcher.pid"
 }
 start_tunnels() {

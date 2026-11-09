@@ -912,6 +912,8 @@ def api_add_upstream(body):
         raise ApiError(400, f"method must be one of {users_mod.SS_METHODS}")
     if proto in ("vless-ws", "vless") and not body.get("uuid"):
         raise ApiError(400, f"{proto} upstream needs a uuid")
+    if proto in ("vmess-ws", "vmess") and not body.get("uuid"):
+        raise ApiError(400, f"{proto} upstream needs a uuid")
     if proto in ("trojan-ws", "ss") and not body.get("password"):
         raise ApiError(400, f"{proto} upstream needs a password")
     if proto in ("http", "socks") and body.get("username") and not body.get("password"):
@@ -936,6 +938,10 @@ def api_add_upstream(body):
         if proto in ("vless-ws", "vless") and not users_mod.vless_enabled(conn):
             raise ApiError(400, "vless upstreams are disabled together with"
                                 " the vless protocol (enable vless first)")
+        if proto == "vmess" and not users_mod.vmess_tcp_enabled(conn):
+            raise ApiError(400, "vmess (bare TCP) upstreams are disabled"
+                                " together with the bare-vmess inbound"
+                                " (enable vmess-tcp first)")
         if proto == "ssh" and not users_mod.ssh_enabled():
             raise ApiError(400, "ssh upstreams are disabled together with"
                                 " ssh support (XMAGIC_ENABLE_SSH is not 1;"
@@ -1060,6 +1066,7 @@ def api_get_settings():
         info["db_values"] = {
             k: users_mod.get_setting(conn, k) for k in
             ("vless_ws_paths", "trojan_ws_paths", "ss_ws_paths",
+             "vmess_ws_paths",
              "upstream_strategy", "ss_method",
              "interconnect_off_groups", "reality_dest", "reality_server_names",
              "reality_short_ids")}
@@ -1084,7 +1091,8 @@ def api_set_settings(body):
                                     f"{users_mod.SESSION_TTL_HOURS_MIN}.."
                                     f"{users_mod.SESSION_TTL_HOURS_MAX}")
             users_mod.set_setting(conn, "session_ttl_hours", hours)
-        for key in ("vless_ws_paths", "trojan_ws_paths", "ss_ws_paths"):
+        for key in ("vless_ws_paths", "trojan_ws_paths", "ss_ws_paths",
+                    "vmess_ws_paths"):
             if key in body:
                 render_relevant = True
                 value = body[key]
@@ -1117,6 +1125,36 @@ def api_set_settings(body):
                                       "1" if value else "0")
             else:
                 raise ApiError(400, "vless_enabled must be a boolean")
+        if "vmess_tcp_enabled" in body:
+            render_relevant = True
+            value = body["vmess_tcp_enabled"]
+            if value is None:
+                users_mod.delete_setting(conn, "vmess_tcp_enabled")
+            elif isinstance(value, bool):
+                users_mod.set_setting(conn, "vmess_tcp_enabled",
+                                      "1" if value else "0")
+            else:
+                raise ApiError(400, "vmess_tcp_enabled must be a boolean")
+        if "ss_tcp_enabled" in body:
+            render_relevant = True
+            value = body["ss_tcp_enabled"]
+            if value is None:
+                users_mod.delete_setting(conn, "ss_tcp_enabled")
+            elif isinstance(value, bool):
+                users_mod.set_setting(conn, "ss_tcp_enabled",
+                                      "1" if value else "0")
+            else:
+                raise ApiError(400, "ss_tcp_enabled must be a boolean")
+        if "http_enabled" in body:
+            render_relevant = True
+            value = body["http_enabled"]
+            if value is None:
+                users_mod.delete_setting(conn, "http_enabled")
+            elif isinstance(value, bool):
+                users_mod.set_setting(conn, "http_enabled",
+                                      "1" if value else "0")
+            else:
+                raise ApiError(400, "http_enabled must be a boolean")
         if "reality_enabled" in body:
             render_relevant = True
             value = body["reality_enabled"]
@@ -1815,13 +1853,13 @@ td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
               <div><label>名称</label><input name="name" placeholder="名称" required></div>
               <div><label>协议</label><select name="protocol">
                 <option>vless-ws</option><option>vless</option><option>trojan-ws</option>
-                <option>ss</option><option>http</option><option>socks</option><option>ssh</option>
+                <option>ss</option><option>vmess-ws</option><option>vmess</option><option>http</option><option>socks</option><option>ssh</option>
               </select></div>
               <div class="wide"><label>地址</label><input name="address" placeholder="主机名或 IP" required></div>
               <div><label>端口</label><input name="port" placeholder="端口" type="number" required></div>
               <div><label>分组</label><input name="group" placeholder="分组"></div>
-              <div data-proto="vless-ws trojan-ws ss"><label>WS 路径</label><input name="path" placeholder="/path"></div>
-              <div class="wide" data-proto="vless-ws vless"><label>UUID</label><input name="uuid" placeholder="VLESS UUID"></div>
+              <div data-proto="vless-ws trojan-ws ss vmess-ws"><label>WS 路径</label><input name="path" placeholder="/path"></div>
+              <div class="wide" data-proto="vless-ws vless vmess-ws vmess"><label>UUID</label><input name="uuid" placeholder="UUID"></div>
               <div data-proto="http socks ssh"><label>用户名</label><input name="username" placeholder="用户名"></div>
               <div data-proto="trojan-ws ss http socks"><label>密码</label><input name="password" placeholder="密码"></div>
               <div class="wide" data-proto="ssh"><label>SSH 私钥（粘贴内容或选文件上传，存于节点、不回显）</label>
@@ -1838,7 +1876,7 @@ td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
               <div><label>备注</label><input name="note" placeholder="可选"></div>
             </div>
             <div class="form-actions">
-              <span class="check" data-proto="vless-ws vless trojan-ws ss"><input type="checkbox" name="tls" id="up-tls"><label for="up-tls">TLS</label></span>
+              <span class="check" data-proto="vless-ws vless trojan-ws ss vmess-ws vmess"><input type="checkbox" name="tls" id="up-tls"><label for="up-tls">TLS</label></span>
               <button id="up-submit" class="primary">保存</button>
               <button type="button" id="up-cancel">取消</button>
             </div>
@@ -1883,6 +1921,7 @@ td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
               <div class="wide" id="row-vless-paths"><label>VLESS WS 路径（逗号分隔）</label><input name="vless_ws_paths"></div>
               <div class="wide"><label>Trojan WS 路径（逗号分隔）</label><input name="trojan_ws_paths"></div>
               <div class="wide"><label>Shadowsocks WS 路径（逗号分隔）</label><input name="ss_ws_paths"></div>
+              <div class="wide"><label>VMess WS 路径（逗号分隔）</label><input name="vmess_ws_paths"></div>
               <div class="wide"><label>REALITY 目标站点 dest（host:port，TLS 1.3 站点）</label><input name="reality_dest"></div>
               <div class="wide"><label>REALITY serverNames（逗号分隔）</label><input name="reality_server_names"></div>
               <div class="wide"><label>REALITY shortIds（逗号分隔，偶数长度 hex，最长 16）</label><input name="reality_short_ids"></div>
@@ -1892,7 +1931,10 @@ td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
             <div class="form-actions">
               <span class="check"><input type="checkbox" name="direct_allow_private" id="set-dap"><label for="set-dap">允许直连内网地址</label></span>
               <span class="check"><input type="checkbox" name="vless_enabled" id="set-vless"><label for="set-vless">启用 VLESS 入站（默认关：协议自身不加密）</label></span>
-              <span class="check"><input type="checkbox" name="reality_enabled" id="set-reality"><label for="set-reality">启用 REALITY 入站（默认开：VLESS + REALITY，与 VLESS 开关无关）</label></span>
+              <span class="check"><input type="checkbox" name="vmess_tcp_enabled" id="set-vmess-tcp"><label for="set-vmess-tcp">启用 VMess 裸 TCP（默认关；VMess-WS 不受影响）</label></span>
+              <span class="check"><input type="checkbox" name="ss_tcp_enabled" id="set-ss-tcp"><label for="set-ss-tcp">启用 Shadowsocks 裸 TCP（默认关；SS-WS 不受影响）</label></span>
+              <span class="check"><input type="checkbox" name="http_enabled" id="set-http"><label for="set-http">启用 HTTP 代理（CONNECT，默认关）</label></span>
+              <span class="check"><input type="checkbox" name="reality_enabled" id="set-reality"><label for="set-reality">启用 REALITY 入站（默认关：裸 TCP 形态，与 VLESS 开关无关）</label></span>
               <button type="button" id="btn-reality-rotate">轮换 REALITY 密钥</button>
               <button class="primary">保存</button>
             </div>
@@ -1906,10 +1948,12 @@ td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
           互访，如同在同一局域网；不想互访的分组填到上面即关闭该组互访。非同组成员拨回环一律拦截。<br>
           默认不加密的协议不开：VLESS 入站默认关闭（协议自身不加密，需要时勾选上面的开关开启）；
           公网 SOCKS5 默认关闭（明文且不能借道 HTTPS，靠部署环境变量 XMAGIC_ENABLE_SOCKS5=1 开启）。<br>
+          默认开启的只剩 WS 形态（Trojan-WS / SS-WS / VMess-WS）：裸 TCP 形态（裸 SS、裸 VMess、REALITY）
+          与 HTTP 代理（CONNECT）都默认关闭，需要时勾选上面的开关开启。<br>
           <span id="set-ssh-state">SSH 支持：读取中。</span>
           SSH 关闭时 sshd 与隧道进程不启动，SSH 公钥、SSH 上级与组内互访都不可用，控制台不能开启它。
           Trojan（设计上强制 TLS）、Shadowsocks（自带加密）、HTTP 代理（借道外层 HTTPS）不受影响。<br>
-          REALITY 入站默认开启且与 VLESS 开关独立：客户端以 VLESS + REALITY（flow xtls-rprx-vision、
+          REALITY 入站默认关闭（裸 TCP 形态，与裸 SS / 裸 VMess 一样需手动开启）且与 VLESS 开关独立：客户端以 VLESS + REALITY（flow xtls-rprx-vision、
           fingerprint chrome）直连公网口，参数取上面的 dest / serverNames / shortIds 与公钥加上用户自己的 UUID；
           轮换密钥后旧公钥立即失效，客户端需同步更新。REALITY 需要裸 TCP 直达公网口，
           经 TLS 终结型边缘（如平台的 HTTPS 域名）无法透传。</p>
@@ -2167,6 +2211,8 @@ async function refresh() {
   sf.querySelector("[name=trojan_ws_paths]").placeholder = settings.trojan_ws_paths.join(",");
   sf.querySelector("[name=ss_ws_paths]").value = settings.db_values.ss_ws_paths || "";
   sf.querySelector("[name=ss_ws_paths]").placeholder = settings.ss_ws_paths.join(",");
+  sf.querySelector("[name=vmess_ws_paths]").value = settings.db_values.vmess_ws_paths || "";
+  sf.querySelector("[name=vmess_ws_paths]").placeholder = settings.vmess_ws_paths.join(",");
   const strat = sf.querySelector("[name=upstream_strategy]");
   strat.innerHTML = settings.strategies.map(x =>
     `<option ${x === settings.upstream_strategy ? "selected" : ""}>${x}</option>`).join("");
@@ -2178,6 +2224,13 @@ async function refresh() {
   sf.querySelector("[name=vless_enabled]").checked =
     !!settings.vless_enabled;
   window.__vlessOn = !!settings.vless_enabled;
+  sf.querySelector("[name=vmess_tcp_enabled]").checked =
+    !!settings.vmess_tcp_enabled;
+  window.__vmessTcpOn = !!settings.vmess_tcp_enabled;
+  sf.querySelector("[name=ss_tcp_enabled]").checked =
+    !!settings.ss_tcp_enabled;
+  sf.querySelector("[name=http_enabled]").checked =
+    !!settings.http_enabled;
   window.__sshOn = !!settings.ssh_enabled;
   syncSshAvailability();
   sf.querySelector("[name=reality_enabled]").checked =
@@ -2524,9 +2577,10 @@ $("up-cancel").onclick = () => { editingUp = null; const f = $("form-upstream");
   closeUpFormTab(); };
 $("route-cancel").onclick = () => { editingRoute = null; $("form-route").reset();
   $("route-submit").textContent = "添加路由"; $("route-cancel").classList.add("hidden"); };
-const UP_PROTOS = ["vless-ws", "vless", "trojan-ws", "ss", "http", "socks", "ssh"];
+const UP_PROTOS = ["vless-ws", "vless", "trojan-ws", "ss", "vmess-ws", "vmess", "http", "socks", "ssh"];
 const UP_LABELS = {"vless-ws": "VLESS-WS", "vless": "VLESS", "trojan-ws": "Trojan-WS",
-  "ss": "Shadowsocks", "http": "HTTP", "socks": "SOCKS5", "ssh": "SSH"};
+  "ss": "Shadowsocks", "vmess-ws": "VMess-WS", "vmess": "VMess",
+  "http": "HTTP", "socks": "SOCKS5", "ssh": "SSH"};
 function switchUpTab(which) {
   document.querySelectorAll("#up-tabs .tab").forEach(t =>
     t.classList.toggle("active", t.dataset.upTab === which));
@@ -2579,6 +2633,7 @@ function syncSshAvailability() {
 function buildUpAddBtns() {
   const list = UP_PROTOS.filter(p =>
     (window.__vlessOn || (p !== "vless-ws" && p !== "vless")) &&
+    (window.__vmessTcpOn || p !== "vmess") &&
     (window.__sshOn || p !== "ssh"));
   $("up-add-btns").innerHTML = list.map(p =>
     `<button class="btn ghost sm" data-add-up="${p}">+ ${UP_LABELS[p]}</button>`).join(" ");
@@ -2588,6 +2643,7 @@ function buildUpProtoOptions(keep) {
   const cur = keep || sel.value;
   const list = UP_PROTOS.filter(p =>
     ((window.__vlessOn || (p !== "vless-ws" && p !== "vless")) &&
+     (window.__vmessTcpOn || p !== "vmess") &&
      (window.__sshOn || p !== "ssh")) || p === keep);
   sel.innerHTML = list.map(p => `<option>${p}</option>`).join("");
   sel.value = list.includes(cur) ? cur : list[0];
@@ -2637,9 +2693,13 @@ $("form-settings").onsubmit = async e => { e.preventDefault();
       vless_ws_paths: f.querySelector("[name=vless_ws_paths]").value,
       trojan_ws_paths: f.querySelector("[name=trojan_ws_paths]").value,
       ss_ws_paths: f.querySelector("[name=ss_ws_paths]").value,
+      vmess_ws_paths: f.querySelector("[name=vmess_ws_paths]").value,
       upstream_strategy: f.querySelector("[name=upstream_strategy]").value,
       direct_allow_private: f.querySelector("[name=direct_allow_private]").checked,
       vless_enabled: f.querySelector("[name=vless_enabled]").checked,
+      vmess_tcp_enabled: f.querySelector("[name=vmess_tcp_enabled]").checked,
+      ss_tcp_enabled: f.querySelector("[name=ss_tcp_enabled]").checked,
+      http_enabled: f.querySelector("[name=http_enabled]").checked,
       reality_enabled: f.querySelector("[name=reality_enabled]").checked,
       reality_dest: f.querySelector("[name=reality_dest]").value,
       reality_server_names: f.querySelector("[name=reality_server_names]").value,

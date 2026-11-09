@@ -15,6 +15,10 @@ likewise. Credential model per user (one identity, several protocol secrets):
     (CONNECT) and SOCKS5 inbounds, all of which speak username+password;
   * a separate Shadowsocks password (+method) -- SS clients pair it with
     the method, so it stays its own secret;
+  * the VLESS uuid once more -- VMess (AEAD only, alterId 0) reuses it
+    as its ID, over WebSocket (on by default: VMess carries its own
+    encryption) or bare TCP (off by default; the vmess_tcp_enabled
+    setting / VMESS_TCP_ENABLED env renders that inbound);
   * an optional OpenSSH public key -- for the node's real SSH entry:
     sshd on the same host accepts the key, `ssh -D` gives a SOCKS5 proxy.
 
@@ -25,13 +29,20 @@ tunnels process is started, and SSH-shaped configuration is refused);
 a
 well-formed SOCKS5 greeting -> SOCKS5 inbound (only when
 XMAGIC_ENABLE_SOCKS5=1 - SOCKS5 is plaintext and off by default);
-a TLS ClientHello (0x16 0x03) -> the VLESS+REALITY inbound (on by
-default - REALITY carries its own encryption and camouflage);
+a TLS ClientHello (0x16 0x03) -> the VLESS+REALITY inbound (off by
+default like the other bare-TCP forms - REALITY carries its own
+encryption and camouflage, but it rides bare TCP);
 HTTP CONNECT / absolute-form -> HTTP-proxy inbound; HTTP with a
 WebSocket Upgrade -> the Xray fallback mux (WS paths, then bare
 Shadowsocks as the default); origin-form HTTP -> the admin console;
-anything else -> the mux as well (bare Shadowsocks, and VLESS-TCP
-direct only when VLESS is enabled - it is off by default).
+anything else -> the mux as well (bare Shadowsocks only when the
+ss_tcp_enabled setting renders its inbound - off by default, the
+mux default fallback then fails closed - and VLESS-TCP
+direct only when VLESS is enabled - it is off by default). A stream
+whose first 16 bytes validate as a VMess AEAD AuthID for one of the
+node's user ids goes to the bare-VMess backend instead - only while
+bare VMess is enabled (the dispatcher reads the ids from the rendered
+config, which holds the bare-VMess inbound only then).
 
 Usage:
   users.py init
@@ -62,7 +73,7 @@ Environment:
   BE_HTTP_PORT    loopback HTTP-proxy inbound   (default 18081)
   BE_SOCKS_PORT   loopback SOCKS5 inbound       (default 18082)
   XRAY_REALITY_PORT loopback REALITY inbound    (default 18083)
-  REALITY_ENABLED render the REALITY inbound (default on; a DB setting wins)
+  REALITY_ENABLED render the REALITY inbound (default off; a DB setting wins)
   REALITY_DEST    REALITY camouflage target host:port
                   (default www.microsoft.com:443; a DB setting wins)
   REALITY_SERVER_NAMES  comma-separated REALITY server names
@@ -73,12 +84,22 @@ Environment:
   VLESS_BE_BASE   first loopback VLESS-WS backend port  (default 12100)
   TROJAN_BE_BASE  first loopback Trojan-WS backend port (default 12200)
   SSWS_BE_BASE    first loopback Shadowsocks-WS backend port (default 12300)
+  VMESS_BE_PORT   loopback bare-VMess backend     (default 18084)
+  VMESSWS_BE_BASE first loopback VMess-WS backend port (default 12400)
   SSH_TUNNEL_BASE first local port for ssh upstreams    (default 13000)
   VLESS_WS_PATHS  comma-separated WS paths for VLESS (default /vless-ws)
   TROJAN_WS_PATHS comma-separated WS paths for Trojan (default /trojan-ws)
   SS_WS_PATHS     comma-separated WS paths for Shadowsocks (default /ss-ws;
                   SS over WS rides the mux like the other WS families but
                   carries TCP only, no UDP)
+  VMESS_WS_PATHS  comma-separated WS paths for VMess (default /vmess-ws)
+  VMESS_TCP_ENABLED  1 renders the bare-VMess (plain TCP) inbound too
+                  (default off; a DB setting wins over the env)
+  SS_TCP_ENABLED  1 renders the bare-Shadowsocks (plain TCP) inbound
+                  (default off; a DB setting wins over the env; the
+                  SS-WS inbounds render either way)
+  HTTP_ENABLED    1 renders the HTTP-proxy (CONNECT) inbound (default
+                  off; a DB setting wins over the env)
                   Xray fallback paths are exact-match only (no wildcards);
                   run `users.py gen-paths N` to mint random alias paths -
                   every listed path is live at once, one backend inbound
@@ -91,7 +112,8 @@ Environment:
 Cascade: this node can itself be a client of other nodes. `upstream-add`
 records an upstream plus the credential its operator issued (same auth
 model on both sides). Upstream protocol may be anything this node can
-speak as a client: vless-ws, vless (plain TCP), trojan-ws, ss, http
+speak as a client: vless-ws, vless (plain TCP), trojan-ws, ss,
+vmess-ws, vmess (bare TCP), http
 (CONNECT, optional Basic auth), socks (optional user/pass), or ssh - for
 ssh the render maps the upstream to a loopback SOCKS port and writes
 ssh-tunnels.json (+ start-tunnels.sh) next to the config; an ssh client
@@ -138,6 +160,7 @@ PUBLIC_PORT = int(os.environ.get("XRAY_PORT", "8080"))
 VLESS_WS_PATH = os.environ.get("VLESS_WS_PATH", "/vless-ws")
 TROJAN_WS_PATH = os.environ.get("TROJAN_WS_PATH", "/trojan-ws")
 SS_WS_PATH = os.environ.get("SS_WS_PATH", "/ss-ws")
+VMESS_WS_PATH = os.environ.get("VMESS_WS_PATH", "/vmess-ws")
 SS_METHOD = os.environ.get("SS_METHOD", "aes-256-gcm")
 SS_METHODS = ("aes-256-gcm", "aes-128-gcm", "chacha20-ietf-poly1305",
               "2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm",
@@ -149,6 +172,8 @@ BE_SS = int(os.environ.get("SS_BE_PORT", "12003"))
 BE_VLESS_BASE = int(os.environ.get("VLESS_BE_BASE", "12100"))
 BE_TROJAN_BASE = int(os.environ.get("TROJAN_BE_BASE", "12200"))
 BE_SSWS_BASE = int(os.environ.get("SSWS_BE_BASE", "12300"))
+BE_VMESS = int(os.environ.get("VMESS_BE_PORT", "18084"))
+BE_VMESSWS_BASE = int(os.environ.get("VMESSWS_BE_BASE", "12400"))
 BE_REALITY = int(os.environ.get("XRAY_REALITY_PORT", "18083"))
 SSH_TUNNEL_BASE = int(os.environ.get("SSH_TUNNEL_BASE", "13000"))
 
@@ -197,6 +222,14 @@ def ss_paths(conn=None):
             return _parse_paths(raw, "/ss-ws")
     return path_list("SS_WS_PATHS", "SS_WS_PATH", "/ss-ws")
 
+
+def vmess_paths(conn=None):
+    if conn is not None:
+        raw = get_setting(conn, "vmess_ws_paths")
+        if raw:
+            return _parse_paths(raw, "/vmess-ws")
+    return path_list("VMESS_WS_PATHS", "VMESS_WS_PATH", "/vmess-ws")
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY,
@@ -217,7 +250,7 @@ CREATE TABLE IF NOT EXISTS upstreams (
   grp TEXT NOT NULL DEFAULT 'default',
   address TEXT NOT NULL,
   port INTEGER NOT NULL,
-  protocol TEXT NOT NULL CHECK (protocol IN ('vless-ws', 'vless', 'trojan-ws', 'ss', 'http', 'socks', 'ssh')),
+  protocol TEXT NOT NULL CHECK (protocol IN ('vless-ws', 'vless', 'trojan-ws', 'ss', 'vmess-ws', 'vmess', 'http', 'socks', 'ssh')),
   path TEXT,
   uuid TEXT,
   username TEXT,
@@ -572,12 +605,13 @@ def ensure_schema(conn):
                      " INTEGER NOT NULL DEFAULT 0")
     if ucols and conn.dialect == "sqlite":
         # SQLite cannot alter a CHECK constraint; rebuild the table if the
-        # protocol whitelist predates 'ssh' or the bare 'vless' protocol
-        # ('vless-ws' in the DDL does not contain the quoted 'vless').
+        # protocol whitelist predates 'ssh', the bare 'vless' protocol
+        # ('vless-ws' in the DDL does not contain the quoted 'vless')
+        # or the vmess protocols.
         ddl = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type='table'"
             " AND name='upstreams'").fetchone()[0]
-        if "'ssh'" not in ddl or "'vless'" not in ddl:
+        if "'ssh'" not in ddl or "'vless'" not in ddl or "'vmess'" not in ddl:
             cols = ("id, name, grp, address, port, protocol, path, uuid,"
                     " username, password, key_file, tls, method, enabled,"
                     " note, created_at")
@@ -1234,6 +1268,8 @@ def cmd_upstream_add(args):
             f"xmagic upstream {args.name}")[0]
     if args.proto in ("vless-ws", "vless") and not args.uuid:
         sys.exit(f"{args.proto} upstream needs --uuid (the uuid the upstream operator issued you)")
+    if args.proto in ("vmess-ws", "vmess") and not args.uuid:
+        sys.exit(f"{args.proto} upstream needs --uuid (the uuid the upstream operator issued you)")
     if args.proto in ("trojan-ws", "ss") and not args.password:
         sys.exit(f"{args.proto} upstream needs --password")
     if args.proto in ("http", "socks") and args.username and not args.password:
@@ -1247,6 +1283,10 @@ def cmd_upstream_add(args):
         if args.proto in ("vless-ws", "vless") and not vless_enabled(conn):
             sys.exit("vless upstreams are disabled together with the vless"
                      " protocol (run: users.py settings --vless on)")
+        if args.proto == "vmess" and not vmess_tcp_enabled(conn):
+            sys.exit("vmess (bare TCP) upstreams are disabled together"
+                     " with the bare-vmess inbound (run: users.py"
+                     " settings --vmess-tcp on)")
         if args.proto == "ssh" and not ssh_enabled():
             sys.exit("ssh upstreams are disabled together with ssh"
                      " support (XMAGIC_ENABLE_SSH is not 1; set it to 1"
@@ -1317,7 +1357,7 @@ def cmd_upstream_remove(args):
 
 UPSTREAM_FIELDS = ("grp", "address", "port", "protocol", "path", "uuid",
                    "username", "password", "key_file", "tls", "method", "note")
-UPSTREAM_PROTOCOLS = ("vless-ws", "vless", "trojan-ws", "ss", "http", "socks", "ssh")
+UPSTREAM_PROTOCOLS = ("vless-ws", "vless", "trojan-ws", "ss", "vmess-ws", "vmess", "http", "socks", "ssh")
 
 
 def validate_upstream_values(values):
@@ -1326,6 +1366,8 @@ def validate_upstream_values(values):
     if proto not in UPSTREAM_PROTOCOLS:
         raise ValueError(f"protocol must be one of {UPSTREAM_PROTOCOLS}, got {proto!r}")
     if proto in ("vless-ws", "vless") and not values.get("uuid"):
+        raise ValueError(f"{proto} upstream needs a uuid")
+    if proto in ("vmess-ws", "vmess") and not values.get("uuid"):
         raise ValueError(f"{proto} upstream needs a uuid")
     if proto in ("trojan-ws", "ss") and not values.get("password"):
         raise ValueError(f"{proto} upstream needs a password")
@@ -1345,6 +1387,11 @@ def update_upstream(conn, name, changes):
             and not vless_enabled(conn)):
         raise ValueError("vless upstreams are disabled together with the"
                          " vless protocol (enable vless first)")
+    if (changes.get("protocol") == "vmess"
+            and not vmess_tcp_enabled(conn)):
+        raise ValueError("vmess (bare TCP) upstreams are disabled"
+                         " together with the bare-vmess inbound"
+                         " (enable vmess-tcp first)")
     if changes.get("protocol") == "ssh" and not ssh_enabled():
         raise ValueError("ssh upstreams are disabled together with ssh"
                          " support (XMAGIC_ENABLE_SSH is not 1; set it"
@@ -1696,7 +1743,7 @@ def _ws_stream(u, default_paths):
 
 
 def upstream_outbound(u, tunnel_port=None, vpaths=None, tpaths=None,
-                      spaths=None):
+                      spaths=None, mpaths=None):
     tag = f"up-{u['grp']}-{u['name']}"
     if u["protocol"] == "vless":
         stream = {"network": "tcp", "security": "none"}
@@ -1727,6 +1774,22 @@ def upstream_outbound(u, tunnel_port=None, vpaths=None, tpaths=None,
             # the bare protocol, byte for byte as before.
             outbound["streamSettings"] = _ws_stream(u, spaths or ss_paths())
         return outbound
+    if u["protocol"] == "vmess":
+        stream = {"network": "tcp", "security": "none"}
+        if "tls" in u.keys() and u["tls"]:
+            stream["security"] = "tls"
+            stream["tlsSettings"] = {"serverName": u["address"]}
+        return {"tag": tag, "protocol": "vmess",
+                "settings": {"vnext": [{"address": u["address"], "port": u["port"],
+                                         "users": [{"id": u["uuid"], "alterId": 0,
+                                                    "security": "auto"}]}]},
+                "streamSettings": stream}
+    if u["protocol"] == "vmess-ws":
+        return {"tag": tag, "protocol": "vmess",
+                "settings": {"vnext": [{"address": u["address"], "port": u["port"],
+                                         "users": [{"id": u["uuid"], "alterId": 0,
+                                                    "security": "auto"}]}]},
+                "streamSettings": _ws_stream(u, mpaths or vmess_paths())}
     if u["protocol"] == "http":
         # Xray's http outbound takes flat settings (docs: address/port/user/pass),
         # NOT the servers[]+users[] shape - that shape belongs to socks.
@@ -1803,15 +1866,17 @@ def build_egress(conn, users):
     allow_priv = allow_private_direct(conn)
     vpaths, tpaths = vless_paths(conn), trojan_paths(conn)
     spaths = ss_paths(conn)
+    mpaths = vmess_paths(conn)
     outbounds = []
     ssh_idx = 0
     for u in ups:
         if u["protocol"] == "ssh":
             outbounds.append(upstream_outbound(u, SSH_TUNNEL_BASE + ssh_idx,
-                                               vpaths, tpaths, spaths))
+                                               vpaths, tpaths, spaths, mpaths))
             ssh_idx += 1
         else:
-            outbounds.append(upstream_outbound(u, None, vpaths, tpaths, spaths))
+            outbounds.append(upstream_outbound(u, None, vpaths, tpaths,
+                                               spaths, mpaths))
     direct = {"tag": "direct", "protocol": "freedom"}
     if allow_priv:
         # operator opt-in: an allow finalRule ahead of Xray's default
@@ -1866,6 +1931,7 @@ def render_config(conn):
     users = enabled_users(conn)
     vpaths, tpaths = vless_paths(conn), trojan_paths(conn)
     spaths = ss_paths(conn)
+    mpaths = vmess_paths(conn)
     v_on = vless_enabled(conn)
     if not v_on:
         # VLESS off: no WS paths routed, and the mux keeps an empty
@@ -1877,6 +1943,7 @@ def render_config(conn):
     fallbacks = ([{"path": p, "dest": BE_VLESS_BASE + i} for i, p in enumerate(vpaths)]
                  + [{"path": p, "dest": BE_TROJAN_BASE + i} for i, p in enumerate(tpaths)]
                  + [{"path": p, "dest": BE_SSWS_BASE + i} for i, p in enumerate(spaths)]
+                 + [{"path": p, "dest": BE_VMESSWS_BASE + i} for i, p in enumerate(mpaths)]
                  + [{"dest": BE_SS}])
     accounts = [{"user": u["username"], "pass": u["trojan_password"]} for u in users]
     inbounds = [
@@ -1888,17 +1955,21 @@ def render_config(conn):
                 "decryption": "none", "fallbacks": fallbacks},
             "streamSettings": {"network": "tcp", "security": "none"},
         },
-        {
+    ]
+    if http_enabled(conn):
+        # The dispatcher routes CONNECT / absolute-form here only
+        # while this inbound is in the render (it reads the same
+        # config), so off means those requests fail closed at the mux.
+        inbounds.append({
             "tag": "http-in", "listen": "127.0.0.1", "port": BE_HTTP,
             "protocol": "http",
             "settings": {"accounts": accounts, "allowTransparent": False},
-        },
-        {
-            "tag": "socks-in", "listen": "127.0.0.1", "port": BE_SOCKS,
-            "protocol": "socks",
-            "settings": {"auth": "password", "accounts": accounts, "udp": True},
-        },
-    ]
+        })
+    inbounds.append({
+        "tag": "socks-in", "listen": "127.0.0.1", "port": BE_SOCKS,
+        "protocol": "socks",
+        "settings": {"auth": "password", "accounts": accounts, "udp": True},
+    })
     for i, p in enumerate(vpaths):
         inbounds.append({
             "tag": f"vless-ws-{i}", "listen": "127.0.0.1", "port": BE_VLESS_BASE + i,
@@ -1955,14 +2026,41 @@ def render_config(conn):
             # inbound below is the one that also takes UDP).
             "streamSettings": {"network": "ws", "wsSettings": {"path": p}},
         })
-    inbounds.append({
-        "tag": "ss", "listen": "127.0.0.1", "port": BE_SS,
-        "protocol": "shadowsocks",
-        "settings": {
-            "clients": ss_clients,
-            "network": "tcp,udp",
-        },
-    })
+    if ss_tcp_enabled(conn):
+        # The mux's default fallback keeps pointing at BE_SS either
+        # way: while this inbound is not rendered, bare SS fails
+        # closed at the (unbound) backend port.
+        inbounds.append({
+            "tag": "ss", "listen": "127.0.0.1", "port": BE_SS,
+            "protocol": "shadowsocks",
+            "settings": {
+                "clients": ss_clients,
+                "network": "tcp,udp",
+            },
+        })
+    # VMess (AEAD only, alterId 0) reuses the user's uuid as its ID.
+    # The WS carrier is on by default (VMess encrypts itself); the
+    # bare-TCP inbound renders only with vmess_tcp_enabled - the
+    # dispatcher recognizes bare VMess streams by their AuthID and
+    # routes them here, and it finds the ids in this inbound, so a
+    # render without it leaves recognition inert.
+    vmess_clients = [{"id": u["vless_uuid"], "alterId": 0,
+                      "email": u["username"]} for u in users]
+    for i, p in enumerate(mpaths):
+        inbounds.append({
+            "tag": f"vmess-ws-{i}", "listen": "127.0.0.1",
+            "port": BE_VMESSWS_BASE + i,
+            "protocol": "vmess",
+            "settings": {"clients": vmess_clients},
+            "streamSettings": {"network": "ws", "wsSettings": {"path": p}},
+        })
+    if vmess_tcp_enabled(conn):
+        inbounds.append({
+            "tag": "vmess", "listen": "127.0.0.1", "port": BE_VMESS,
+            "protocol": "vmess",
+            "settings": {"clients": vmess_clients},
+            "streamSettings": {"network": "tcp", "security": "none"},
+        })
     cfg = {"log": {"loglevel": "warning"}, "inbounds": inbounds}
     outbounds, routing, n_up = build_egress(conn, users)
     cfg["outbounds"] = outbounds
@@ -2035,6 +2133,7 @@ def cmd_render(args):
         tunnels = ssh_tunnels(conn)
         vp, tp, strat = vless_paths(conn), trojan_paths(conn), upstream_strategy(conn)
         sp = ss_paths(conn)
+        mp = vmess_paths(conn)
     out = args.out or "./data/config.json"
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     tmp = out + ".tmp"
@@ -2062,11 +2161,13 @@ def cmd_render(args):
         print(json.dumps({"out": out, "users": n, "upstreams": n_up,
                           "strategy": strat, "vless_paths": vp,
                           "trojan_paths": tp, "ss_ws_paths": sp,
+                          "vmess_paths": mp,
                           "ssh_tunnels": len(tunnels)}, indent=2))
         return
     print(f"wrote {out}: dispatcher port {PUBLIC_PORT} -> mux {MUX_PORT}, "
           f"http-in {BE_HTTP}, socks-in {BE_SOCKS}, {n} enabled user(s), "
           f"vless paths {vp}, trojan paths {tp}, ss-ws paths {sp}, "
+          f"vmess paths {mp}, "
           f"default fallback -> shadowsocks, egress: {egress}"
           + (f", ssh tunnels: {len(tunnels)} (see ssh-tunnels.json)" if tunnels else ""))
 
@@ -2189,6 +2290,9 @@ PRIVATE_CIDRS = ("127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12",
                  "::1/128", "fc00::/7", "fe80::/10")
 DIRECT_ALLOW_PRIVATE = os.environ.get("DIRECT_ALLOW_PRIVATE", "")
 VLESS_ENABLED = os.environ.get("VLESS_ENABLED", "")
+VMESS_TCP_ENABLED = os.environ.get("VMESS_TCP_ENABLED", "")
+SS_TCP_ENABLED = os.environ.get("SS_TCP_ENABLED", "")
+HTTP_ENABLED = os.environ.get("HTTP_ENABLED", "")
 SSH_ENABLED = os.environ.get("XMAGIC_ENABLE_SSH", "")
 
 
@@ -2283,6 +2387,51 @@ def vless_enabled(conn=None):
     return VLESS_ENABLED.lower() in ("1", "true", "yes", "on")
 
 
+def vmess_tcp_enabled(conn=None):
+    """Whether the bare-VMess (plain TCP) inbound is rendered.
+
+    VMess is AEAD-encrypted itself, so its WebSocket carrier is on by
+    default like the rest of the self-encrypted families; the bare-TCP
+    form is a separate opt-in (bare-TCP forms are enable-able but off
+    unless the operator turns them on). A DB setting wins over the
+    VMESS_TCP_ENABLED env."""
+    if conn is not None:
+        raw = get_setting(conn, "vmess_tcp_enabled")
+        if raw is not None:
+            return raw == "1"
+    return VMESS_TCP_ENABLED.lower() in ("1", "true", "yes", "on")
+
+
+def ss_tcp_enabled(conn=None):
+    """Whether the bare-Shadowsocks (plain TCP) inbound is rendered.
+
+    Shadowsocks is AEAD-encrypted itself, so its WebSocket carrier is
+    on by default; the bare-TCP form is a separate opt-in like the
+    other bare-TCP forms (the mux default fallback keeps pointing at
+    the backend port and fails closed while it is off). A DB setting
+    wins over the SS_TCP_ENABLED env."""
+    if conn is not None:
+        raw = get_setting(conn, "ss_tcp_enabled")
+        if raw is not None:
+            return raw == "1"
+    return SS_TCP_ENABLED.lower() in ("1", "true", "yes", "on")
+
+
+def http_enabled(conn=None):
+    """Whether the HTTP-proxy (CONNECT) inbound is rendered.
+
+    Many environments cannot forward CONNECT at all, so the HTTP
+    proxy is opt-in like the bare-TCP forms (the default-on set is
+    the WebSocket carriers). The dispatcher honors the same switch
+    by the inbound's presence in the rendered config. A DB setting
+    wins over the HTTP_ENABLED env."""
+    if conn is not None:
+        raw = get_setting(conn, "http_enabled")
+        if raw is not None:
+            return raw == "1"
+    return HTTP_ENABLED.lower() in ("1", "true", "yes", "on")
+
+
 def ssh_enabled():
     """Whether SSH support is on: the inbound sshd (users' ssh keys,
     ssh -D/-L/-R, same-group interconnect over ssh -R) and the
@@ -2317,10 +2466,10 @@ def allow_private_direct(conn=None):
 
 
 # ------------------------------------------------------------ REALITY
-# VLESS+REALITY is on by default: unlike the bare VLESS inbounds,
-# REALITY brings its own encryption and camouflage (it borrows a real
-# site's TLS handshake), so it does not fall under the
-# plaintext-protocols-off policy. The node holds an X25519 keypair for
+# VLESS+REALITY is off by default: REALITY brings its own encryption
+# and camouflage (it borrows a real site's TLS handshake), but it
+# rides bare TCP, so it falls under the bare-TCP-forms-off policy
+# like bare SS / bare VMess. The node holds an X25519 keypair for
 # it; the private key is node-internal (stored in admin_settings,
 # never printed), the public key is a client configuration parameter
 # and is shown in the settings output like the other client-facing
@@ -2393,14 +2542,17 @@ def generate_reality_keypair():
 
 
 def reality_enabled(conn=None):
-    """Whether the REALITY inbound is rendered (on by default)."""
+    """Whether the REALITY inbound is rendered (off by default).
+
+    REALITY rides bare TCP like the other bare forms, and direct TCP
+    ingress is exactly what most fronted deployments cannot take -
+    so it is an opt-in like them: a DB setting wins over the
+    REALITY_ENABLED env, and with neither set it stays off."""
     if conn is not None:
         raw = get_setting(conn, "reality_enabled")
         if raw is not None:
             return raw == "1"
-    if REALITY_ENABLED:
-        return REALITY_ENABLED.lower() in ("1", "true", "yes", "on")
-    return True
+    return REALITY_ENABLED.lower() in ("1", "true", "yes", "on")
 
 
 def validate_reality_dest(raw):
@@ -2499,6 +2651,8 @@ def settings_info(conn):
         "trojan_ws_paths_from_db": get_setting(conn, "trojan_ws_paths") is not None,
         "ss_ws_paths": ss_paths(conn),
         "ss_ws_paths_from_db": get_setting(conn, "ss_ws_paths") is not None,
+        "vmess_ws_paths": vmess_paths(conn),
+        "vmess_ws_paths_from_db": get_setting(conn, "vmess_ws_paths") is not None,
         "upstream_strategy": upstream_strategy(conn),
         "upstream_strategy_from_db": get_setting(conn, "upstream_strategy") is not None,
         "ss_method": default_ss_method(conn),
@@ -2506,6 +2660,15 @@ def settings_info(conn):
         "vless_enabled": vless_enabled(conn),
         "vless_enabled_from_db":
             get_setting(conn, "vless_enabled") is not None,
+        "vmess_tcp_enabled": vmess_tcp_enabled(conn),
+        "vmess_tcp_enabled_from_db":
+            get_setting(conn, "vmess_tcp_enabled") is not None,
+        "ss_tcp_enabled": ss_tcp_enabled(conn),
+        "ss_tcp_enabled_from_db":
+            get_setting(conn, "ss_tcp_enabled") is not None,
+        "http_enabled": http_enabled(conn),
+        "http_enabled_from_db":
+            get_setting(conn, "http_enabled") is not None,
         "ssh_enabled": ssh_enabled(),
         "reality_enabled": reality_enabled(conn),
         "reality_enabled_from_db":
@@ -2552,6 +2715,7 @@ def cmd_settings(args):
         for key, value in (("vless_ws_paths", args.vless_ws_paths),
                            ("trojan_ws_paths", args.trojan_ws_paths),
                            ("ss_ws_paths", args.ss_ws_paths),
+                           ("vmess_ws_paths", args.vmess_ws_paths),
                            ("upstream_strategy", args.upstream_strategy),
                            ("ss_method", args.ss_method)):
             if value is None:
@@ -2582,6 +2746,24 @@ def cmd_settings(args):
             else:
                 set_setting(conn, "vless_enabled",
                             "1" if args.vless == "on" else "0")
+        if getattr(args, "vmess_tcp", None) is not None:
+            if args.vmess_tcp == "":
+                delete_setting(conn, "vmess_tcp_enabled")
+            else:
+                set_setting(conn, "vmess_tcp_enabled",
+                            "1" if args.vmess_tcp == "on" else "0")
+        if getattr(args, "ss_tcp", None) is not None:
+            if args.ss_tcp == "":
+                delete_setting(conn, "ss_tcp_enabled")
+            else:
+                set_setting(conn, "ss_tcp_enabled",
+                            "1" if args.ss_tcp == "on" else "0")
+        if getattr(args, "http", None) is not None:
+            if args.http == "":
+                delete_setting(conn, "http_enabled")
+            else:
+                set_setting(conn, "http_enabled",
+                            "1" if args.http == "on" else "0")
         if getattr(args, "reality", None) is not None:
             if args.reality == "":
                 delete_setting(conn, "reality_enabled")
@@ -2628,12 +2810,20 @@ def cmd_settings(args):
           f"({src[info['trojan_ws_paths_from_db']]})")
     print(f"ss_ws_paths: {','.join(info['ss_ws_paths'])} "
           f"({src[info['ss_ws_paths_from_db']]})")
+    print(f"vmess_ws_paths: {','.join(info['vmess_ws_paths'])} "
+          f"({src[info['vmess_ws_paths_from_db']]})")
     print(f"upstream_strategy: {info['upstream_strategy']} "
           f"({src[info['upstream_strategy_from_db']]})")
     print(f"ss_method (new users): {info['ss_method']} "
           f"({src[info['ss_method_from_db']]})")
     print(f"vless_enabled: {info['vless_enabled']} "
           f"({src[info['vless_enabled_from_db']]})")
+    print(f"vmess_tcp_enabled: {info['vmess_tcp_enabled']} "
+          f"({src[info['vmess_tcp_enabled_from_db']]})")
+    print(f"ss_tcp_enabled: {info['ss_tcp_enabled']} "
+          f"({src[info['ss_tcp_enabled_from_db']]})")
+    print(f"http_enabled: {info['http_enabled']} "
+          f"({src[info['http_enabled_from_db']]})")
     print(f"ssh_enabled: {info['ssh_enabled']} (environment)")
     print(f"reality_enabled: {info['reality_enabled']} "
           f"({src[info['reality_enabled_from_db']]})")
@@ -3190,6 +3380,7 @@ def main():
     a.add_argument("--vless-ws-paths", help="comma-separated; empty string = back to env")
     a.add_argument("--trojan-ws-paths", help="comma-separated; empty string = back to env")
     a.add_argument("--ss-ws-paths", help="comma-separated; empty string = back to env")
+    a.add_argument("--vmess-ws-paths", help="comma-separated; empty string = back to env")
     a.add_argument("--upstream-strategy")
     a.add_argument("--ss-method", help="default method for new users")
     a.add_argument("--interconnect-off-groups",
@@ -3200,9 +3391,22 @@ def main():
                    help="render the VLESS inbounds (off by default:"
                         " VLESS has no encryption of its own);"
                         " empty string = back to env")
+    a.add_argument("--vmess-tcp", choices=("on", "off", ""),
+                   help="render the bare-VMess (plain TCP) inbound"
+                        " (off by default; the VMess-WS inbound is"
+                        " always rendered); empty string = back to env")
+    a.add_argument("--ss-tcp", choices=("on", "off", ""),
+                   help="render the bare-Shadowsocks (plain TCP)"
+                        " inbound (off by default; the SS-WS inbounds"
+                        " are always rendered); empty string = back"
+                        " to env")
+    a.add_argument("--http", choices=("on", "off", ""),
+                   help="render the HTTP-proxy (CONNECT) inbound"
+                        " (off by default; many environments cannot"
+                        " forward CONNECT); empty string = back to env")
     a.add_argument("--reality", choices=("on", "off", ""),
-                   help="render the VLESS+REALITY inbound (on by default:"
-                        " REALITY carries its own encryption);"
+                   help="render the VLESS+REALITY inbound (off by"
+                        " default: it rides bare TCP);"
                         " empty string = back to env")
     a.add_argument("--reality-dest",
                    help="REALITY camouflage target host:port;"
@@ -3254,7 +3458,7 @@ def main():
     a = sub.add_parser("upstream-add"); a.add_argument("name")
     a.add_argument("--addr", required=True); a.add_argument("--port", type=int, required=True)
     a.add_argument("--proto", required=True,
-                   choices=("vless-ws", "vless", "trojan-ws", "ss", "http", "socks", "ssh"))
+                   choices=("vless-ws", "vless", "trojan-ws", "ss", "vmess-ws", "vmess", "http", "socks", "ssh"))
     a.add_argument("--group", default="default")
     a.add_argument("--path"); a.add_argument("--uuid")
     a.add_argument("--username"); a.add_argument("--password")
@@ -3274,7 +3478,7 @@ def main():
     a.set_defaults(fn=cmd_upstream_add)
     a = sub.add_parser("upstream-edit"); a.add_argument("name")
     a.add_argument("--addr"); a.add_argument("--port", type=int)
-    a.add_argument("--proto", choices=("vless-ws", "vless", "trojan-ws", "ss", "http", "socks", "ssh"))
+    a.add_argument("--proto", choices=("vless-ws", "vless", "trojan-ws", "ss", "vmess-ws", "vmess", "http", "socks", "ssh"))
     a.add_argument("--group"); a.add_argument("--path"); a.add_argument("--uuid")
     a.add_argument("--username"); a.add_argument("--password"); a.add_argument("--key-file")
     a.add_argument("--key-content-file",

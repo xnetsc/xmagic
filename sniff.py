@@ -11,14 +11,32 @@ bytes identify the protocol unambiguously:
   well-formed SOCKS5 greeting        -> SOCKS5 inbound  (BE_SOCKS_PORT;
                                         only with XMAGIC_ENABLE_SOCKS5=1,
                                         off by default: SOCKS5 is plaintext)
-  "CONNECT ..."                      -> HTTP inbound    (BE_HTTP_PORT)
+  "CONNECT ..."                      -> HTTP inbound    (BE_HTTP_PORT;
+                                        only while the node's HTTP
+                                        proxy is on - an "http" inbound
+                                        in the rendered config; else
+                                        the mux, failing closed there)
   other HTTP + "Upgrade: websocket"  -> Xray mux        (XRAY_MUX_PORT)
-  other HTTP, absolute-form target   -> HTTP inbound    (BE_HTTP_PORT)
+  other HTTP, absolute-form target   -> HTTP inbound    (BE_HTTP_PORT;
+                                        same HTTP-on condition)
   other HTTP, origin-form target     -> admin console   (ADMIN_BE_PORT)
+  VMess AEAD AuthID (validated)      -> VMess inbound   (VMESS_BE_PORT)
   anything else (VLESS-TCP, bare SS) -> Xray mux        (XRAY_MUX_PORT)
 
-The mux itself then dispatches WebSocket paths to the VLESS/Trojan
-backends and everything else to the bare-Shadowsocks backend.
+The mux itself then dispatches WebSocket paths to the VLESS/Trojan/
+Shadowsocks/VMess backends and everything else to the
+bare-Shadowsocks backend.
+
+A bare VMess stream is random-looking AEAD ciphertext, so no prefix
+identifies it - but its first 16 bytes are an AuthID the node can
+verify: an AES-128 block over (timestamp, random, CRC32) under a key
+derived from the user's id. The dispatcher validates that block
+against the user ids of the rendered config's bare "vmess" inbound
+(XMAGIC_XRAY_CONFIG, else $DATA_DIR/config.json). That inbound is
+rendered only while bare VMess is enabled, so with it off the id set
+is empty, recognition is inert, and a VMess stream falls through to
+the mux like any other unknown traffic. Recognition is routing only:
+the VMess backend still performs the full authentication.
 
 One header is rewritten on the way to the mux. v2ray-plugin clients
 (Shadowrocket's among them) may open a WebSocket with "early data":
@@ -50,19 +68,29 @@ Environment:
   BE_HTTP_PORT   Xray http inbound       (default 18081)
   BE_SOCKS_PORT  Xray socks inbound      (default 18082)
   XRAY_REALITY_PORT  Xray REALITY inbound (default 18083)
+  VMESS_BE_PORT  Xray bare-VMess inbound (default 18084)
   SSH_BE_PORT    sshd port               (default 12222)
   ADMIN_BE_PORT  admin console backend   (default 18090)
+  XMAGIC_XRAY_CONFIG  rendered Xray config the bare-VMess user ids
+                 and the HTTP-proxy on/off state (an "http" inbound's
+                 presence) are read from (default:
+                 $DATA_DIR/config.json, DATA_DIR defaulting to /data)
   SNIFF_PEEK_TIMEOUT  seconds to wait for the client's first bytes (5)
 
 Python 3 stdlib only. One thread pair per connection; logging to stdout.
 """
 import base64
+import hashlib
+import json
 import os
 import select
 import socket
+import struct
 import sys
 import threading
 import time
+import uuid
+import zlib
 
 LISTEN_PORT = int(os.environ.get("XRAY_PORT", "8080"))
 TARGETS = {
@@ -70,6 +98,7 @@ TARGETS = {
     "http": ("127.0.0.1", int(os.environ.get("BE_HTTP_PORT", "18081"))),
     "socks": ("127.0.0.1", int(os.environ.get("BE_SOCKS_PORT", "18082"))),
     "reality": ("127.0.0.1", int(os.environ.get("XRAY_REALITY_PORT", "18083"))),
+    "vmess": ("127.0.0.1", int(os.environ.get("VMESS_BE_PORT", "18084"))),
     "ssh": ("127.0.0.1", int(os.environ.get("SSH_BE_PORT", "12222"))),
     "admin": ("127.0.0.1", int(os.environ.get("ADMIN_BE_PORT", "18090"))),
 }
@@ -110,6 +139,291 @@ def _looks_socks(data: bytes) -> bool:
     return all(m in (0x00, 0x01, 0x02, 0xFF) for m in data[2:2 + n])
 
 
+# ------------------------------------------------------------ VMess AuthID
+# A bare VMess stream opens with a 16-byte AuthID: AES-128-ECB of
+# (timestamp int64 BE, 4 random bytes, CRC32 BE of the first 12) under
+# a per-user key, KDF16(cmd_key, "AES Auth ID Encryption") with
+# cmd_key = MD5(uuid bytes || "c48619fe-...") and KDF the recursive
+# HMAC-SHA256 construction of v2ray-core's proxy/vmess/aead. Only one
+# block per user is ever decrypted here, so a small pure-Python
+# AES-128 (both directions - encrypt exists for the tests) is plenty.
+
+
+def _gf_mul(a, b):
+    p = 0
+    for _ in range(8):
+        if b & 1:
+            p ^= a
+        a = ((a << 1) ^ 0x1B) & 0xFF if a & 0x80 else (a << 1) & 0xFF
+        b >>= 1
+    return p
+
+
+def _build_sboxes():
+    def rotl(x, n):
+        return ((x << n) | (x >> (8 - n))) & 0xFF
+
+    sbox = []
+    for x in range(256):
+        inv = 0
+        if x:
+            inv, base, e = 1, x, 254  # x**254 is the GF(2^8) inverse
+            while e:
+                if e & 1:
+                    inv = _gf_mul(inv, base)
+                base = _gf_mul(base, base)
+                e >>= 1
+        sbox.append(inv ^ rotl(inv, 1) ^ rotl(inv, 2) ^ rotl(inv, 3)
+                    ^ rotl(inv, 4) ^ 0x63)
+    inv_sbox = [0] * 256
+    for i, s in enumerate(sbox):
+        inv_sbox[s] = i
+    return sbox, inv_sbox
+
+
+_SBOX, _INV_SBOX = _build_sboxes()
+_RCON = (0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1B, 0x36)
+
+
+def _aes_expand_key(key):
+    """AES-128 key schedule: the 11 round keys, 16 bytes each."""
+    w = [list(key[4 * i:4 * i + 4]) for i in range(4)]
+    for i in range(4, 44):
+        t = list(w[i - 1])
+        if i % 4 == 0:
+            t = [_SBOX[t[1]] ^ _RCON[i // 4 - 1], _SBOX[t[2]],
+                 _SBOX[t[3]], _SBOX[t[0]]]
+        w.append([w[i - 4][j] ^ t[j] for j in range(4)])
+    return [bytes(b for word in w[4 * r:4 * r + 4] for b in word)
+            for r in range(11)]
+
+
+def _shift_rows(s):
+    return [s[0], s[5], s[10], s[15], s[4], s[9], s[14], s[3],
+            s[8], s[13], s[2], s[7], s[12], s[1], s[6], s[11]]
+
+
+def _inv_shift_rows(s):
+    return [s[0], s[13], s[10], s[7], s[4], s[1], s[14], s[11],
+            s[8], s[5], s[2], s[15], s[12], s[9], s[6], s[3]]
+
+
+def _mix_columns(s):
+    out = [0] * 16
+    for c in range(4):
+        a = s[4 * c:4 * c + 4]
+        out[4 * c:4 * c + 4] = [
+            _gf_mul(a[0], 2) ^ _gf_mul(a[1], 3) ^ a[2] ^ a[3],
+            a[0] ^ _gf_mul(a[1], 2) ^ _gf_mul(a[2], 3) ^ a[3],
+            a[0] ^ a[1] ^ _gf_mul(a[2], 2) ^ _gf_mul(a[3], 3),
+            _gf_mul(a[0], 3) ^ a[1] ^ a[2] ^ _gf_mul(a[3], 2)]
+    return out
+
+
+def _inv_mix_columns(s):
+    out = [0] * 16
+    for c in range(4):
+        a = s[4 * c:4 * c + 4]
+        out[4 * c:4 * c + 4] = [
+            _gf_mul(a[0], 14) ^ _gf_mul(a[1], 11)
+            ^ _gf_mul(a[2], 13) ^ _gf_mul(a[3], 9),
+            _gf_mul(a[0], 9) ^ _gf_mul(a[1], 14)
+            ^ _gf_mul(a[2], 11) ^ _gf_mul(a[3], 13),
+            _gf_mul(a[0], 13) ^ _gf_mul(a[1], 9)
+            ^ _gf_mul(a[2], 14) ^ _gf_mul(a[3], 11),
+            _gf_mul(a[0], 11) ^ _gf_mul(a[1], 13)
+            ^ _gf_mul(a[2], 9) ^ _gf_mul(a[3], 14)]
+    return out
+
+
+def _aes128_encrypt_block(key, block):
+    rk = _aes_expand_key(key)
+    s = [b ^ k for b, k in zip(block, rk[0])]
+    for rnd in range(1, 10):
+        s = _mix_columns(_shift_rows([_SBOX[b] for b in s]))
+        s = [b ^ k for b, k in zip(s, rk[rnd])]
+    s = _shift_rows([_SBOX[b] for b in s])
+    return bytes(b ^ k for b, k in zip(s, rk[10]))
+
+
+def _aes128_decrypt_block(key, block):
+    rk = _aes_expand_key(key)
+    s = [b ^ k for b, k in zip(block, rk[10])]
+    for rnd in range(9, 0, -1):
+        s = [_INV_SBOX[b] for b in _inv_shift_rows(s)]
+        s = [b ^ k for b, k in zip(s, rk[rnd])]
+        s = _inv_mix_columns(s)
+    s = [_INV_SBOX[b] for b in _inv_shift_rows(s)]
+    return bytes(b ^ k for b, k in zip(s, rk[0]))
+
+
+class _ChainHash:
+    """One link of the VMess KDF: an HMAC-SHA256 whose hash function
+    is the previous link (the Go original builds hmac.New over a
+    factory returning the chained hash; this mirrors its semantics:
+    the inner pad feeds a copy of the chain, the outer pad the chain
+    itself)."""
+
+    def __init__(self, key, inner):
+        self._in = bytes(b ^ 0x36 for b in key.ljust(64, b"\x00"))
+        self._out = bytes(b ^ 0x5C for b in key.ljust(64, b"\x00"))
+        self._inner = inner.copy()
+        self._outer = inner
+        self._inner.update(self._in)
+
+    def copy(self):
+        dup = object.__new__(type(self))
+        dup._in, dup._out = self._in, self._out
+        dup._inner, dup._outer = self._inner.copy(), self._outer.copy()
+        return dup
+
+    def update(self, data):
+        self._inner.update(data)
+
+    def digest(self):
+        inner_result = self._inner.digest()[:32]
+        self._outer.update(self._out)
+        self._outer.update(inner_result)
+        return self._outer.digest()
+
+
+def _kdf(key, path):
+    cur = _ChainHash(b"VMess AEAD KDF", hashlib.sha256())
+    for item in path:
+        cur = _ChainHash(item, cur)
+    cur.update(key)
+    return cur.digest()
+
+
+def _kdf16(key, path):
+    return _kdf(key, path)[:16]
+
+
+def _cmd_key(uuid_bytes):
+    return hashlib.md5(
+        uuid_bytes + b"c48619fe-8f02-49e0-b9e9-edf763e17e21").digest()
+
+
+_AUTH_KEYS = {}
+
+
+def _auth_key(uid_str):
+    key = _AUTH_KEYS.get(uid_str)
+    if key is None:
+        try:
+            raw = uuid.UUID(uid_str).bytes
+        except ValueError:
+            return None
+        key = _kdf16(_cmd_key(raw), [b"AES Auth ID Encryption"])
+        _AUTH_KEYS[uid_str] = key
+    return key
+
+
+_CONFIG_CACHE = {"key": None, "ids": frozenset(), "http": True}
+
+
+def _vmess_config_path():
+    path = os.environ.get("XMAGIC_XRAY_CONFIG")
+    if path:
+        return path
+    return os.path.join(os.environ.get("DATA_DIR", "/data"),
+                        "config.json")
+
+
+def _load_rendered_config():
+    """(bare-vmess ids, http inbound present) from the rendered
+    config, or None when the file cannot be read at all.
+
+    Cached on (path, mtime, size); callers pick their own fallback
+    for None (VMess: the last good id set; HTTP: enabled, the legacy
+    behavior in deployments without the config wiring). Only the
+    inbound tagged "vmess" contributes ids - the vmess-ws inbounds
+    carry the same ids but must not arm recognition on their own:
+    the bare inbound exists in the render only while bare VMess is
+    enabled, so a WS-only render leaves the set empty and AuthID
+    recognition inert."""
+    path = _vmess_config_path()
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = (path, st.st_mtime_ns, st.st_size)
+    if _CONFIG_CACHE["key"] == key:
+        return _CONFIG_CACHE["ids"], _CONFIG_CACHE["http"]
+    ids, http = set(), False
+    try:
+        with open(path) as f:
+            cfg = json.load(f)
+        for inbound in cfg.get("inbounds", []):
+            if inbound.get("protocol") == "http":
+                http = True
+            if (inbound.get("protocol") == "vmess"
+                    and inbound.get("tag") == "vmess"):
+                clients = (inbound.get("settings") or {}).get(
+                    "clients") or []
+                for client in clients:
+                    cid = str(client.get("id") or "").strip().lower()
+                    if cid:
+                        ids.add(cid)
+    except (OSError, ValueError, AttributeError):
+        return None
+    _CONFIG_CACHE["key"] = key
+    _CONFIG_CACHE["ids"] = frozenset(ids)
+    _CONFIG_CACHE["http"] = http
+    return _CONFIG_CACHE["ids"], http
+
+
+def _vmess_ids():
+    """User ids of the BARE vmess inbound in the rendered config
+    (empty while bare VMess is off or the config is unreadable -
+    the last good set survives a transient read error)."""
+    loaded = _load_rendered_config()
+    if loaded is None:
+        return _CONFIG_CACHE["ids"]
+    return loaded[0]
+
+
+def _http_enabled():
+    """The node's HTTP proxy is on iff the rendered config holds an
+    "http" inbound. An unreadable config means a deployment without
+    the config wiring - keep the legacy behavior and route HTTP."""
+    loaded = _load_rendered_config()
+    if loaded is None:
+        return True
+    return loaded[1]
+
+
+def _authid_match(data, ids, now):
+    """True when data opens with a valid VMess AuthID for one of ids.
+
+    The same two checks the VMess server itself applies first: the
+    CRC32 over the decrypted head must match, and the embedded
+    timestamp must sit within the +/-120s window."""
+    head = data[:16]
+    for uid in ids:
+        key = _auth_key(uid)
+        if key is None:
+            continue
+        plain = _aes128_decrypt_block(key, head)
+        ts = struct.unpack(">q", plain[:8])[0]
+        crc = struct.unpack(">I", plain[12:16])[0]
+        if ts < 0 or abs(ts - now) > 120:
+            continue
+        if zlib.crc32(plain[:12]) & 0xFFFFFFFF == crc:
+            return True
+    return False
+
+
+def _looks_vmess(data, now=None):
+    if len(data) < 16:
+        return False
+    ids = _vmess_ids()
+    if not ids:
+        return False
+    return _authid_match(data, ids,
+                         time.time() if now is None else now)
+
+
 def classify(data: bytes) -> str:
     if SSH_ENABLED and data.startswith(b"SSH-"):
         return "ssh"
@@ -121,7 +435,9 @@ def classify(data: bytes) -> str:
     if SOCKS_PUBLIC and _looks_socks(data):
         return "socks"
     if data.startswith(b"CONNECT "):
-        return "http"
+        # The HTTP proxy is opt-in on the node; while its inbound is
+        # absent from the render, CONNECT fails closed at the mux.
+        return "http" if _http_enabled() else "mux"
     if data.startswith(HTTP_METHODS):
         head = data.split(b"\r\n\r\n", 1)[0].lower()
         if b"upgrade: websocket" in head or b"upgrade:websocket" in head:
@@ -131,7 +447,13 @@ def classify(data: bytes) -> str:
         target = parts[1] if len(parts) > 1 else b""
         if target.startswith(b"/"):
             return "admin"
-        return "http"
+        return "http" if _http_enabled() else "mux"
+    if _looks_vmess(data):
+        # A bare-VMess stream: random-looking, but its AuthID
+        # validates against a user id, which no other protocol's
+        # opening bytes do (CRC32 + a live timestamp inside an
+        # AES block keyed per user).
+        return "vmess"
     return "mux"
 
 
@@ -308,6 +630,11 @@ def _decidable(data: bytes) -> bool:
             return b"\r\n\r\n" in data or len(data) >= 4096
         if tok.startswith(data):
             return False
+    if len(data) < 16 and _vmess_ids():
+        # A random-looking stream may be a VMess head split across
+        # segments: wait for the full 16-byte AuthID before letting
+        # it fall through to the mux.
+        return False
     return True
 
 
