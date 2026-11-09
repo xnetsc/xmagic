@@ -521,28 +521,52 @@ def _ws_client_frame(payload: bytes) -> bytes:
 def _ws_rewrite(client, data: bytes):
     """Plan the early-data normalization for a mux-bound connection.
 
-    Pure inspection of peeked bytes: returns (head_len, new_head,
-    early_data) when the connection's request head is complete in
-    the peek and carries the header, else None (raw splice). The
-    caller consumes exactly head_len bytes, forwards new_head, and
-    when early_data is not None reframes it via _forward_gated.
+    Pure inspection of peeked bytes: returns (plan, info). plan is
+    (head_len, new_head, early_data) when the connection's request
+    head is complete in the peek and carries the header, else None
+    (raw splice); the caller consumes exactly head_len bytes,
+    forwards new_head, and when early_data is not None reframes it
+    via _forward_gated. info is a one-line summary of the upgrade
+    request for the log (request line, the header's disposition,
+    User-Agent) - what a client actually sent is otherwise invisible
+    from the node's side when a dialect mismatch is suspected.
     """
     if not data.startswith(HTTP_METHODS):
-        return None
+        return None, None
     big = client.recv(65536, socket.MSG_PEEK)
     if len(big) < len(data):
         big = data
     end = big.find(b"\r\n\r\n")
     if end < 0:
-        return None
+        return None, None
     head = big[:end + 4]
-    if b"sec-websocket-protocol" not in head.lower():
-        return None
+    lines = head[:-4].split(b"\r\n")
+    request = lines[0].decode("latin-1", "replace")
+    sp, ua = None, ""
+    for line in lines[1:]:
+        name, sep, val = line.partition(b":")
+        if not sep:
+            continue
+        lname = name.strip().lower()
+        if lname == b"sec-websocket-protocol" and sp is None:
+            sp = val.strip()
+        elif lname == b"user-agent":
+            ua = val.strip().decode("latin-1", "replace")[:60]
+    if sp is None:
+        disp = "absent"
+    else:
+        decoded = _b64_decode_loose(sp)
+        disp = (f"data:{len(decoded)}"
+                if decoded is not None and len(decoded) >= ED_MIN
+                else "token")
+    info = f"{request} sp={disp}" + (f" ua={ua}" if ua else "")
+    if sp is None:
+        return None, info
     plan = normalize_ws_head(head)
     if plan is None:
-        return None
+        return None, info
     new_head, early = plan
-    return end + 4, new_head, early
+    return (end + 4, new_head, early), info
 
 
 def _recv_exact(client, n: int) -> bytes:
@@ -667,7 +691,11 @@ def handle(client, addr):
             client.close()
             return
         kind = classify(data)
-        plan = _ws_rewrite(client, data) if kind == "mux" else None
+        plan = None
+        if kind == "mux":
+            plan, ws_info = _ws_rewrite(client, data)
+            if ws_info:
+                log(f"{addr}: ws {ws_info}")
         host, port = TARGETS[kind]
         try:
             backend = socket.create_connection((host, port), timeout=10)
