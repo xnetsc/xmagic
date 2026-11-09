@@ -141,6 +141,29 @@ def unit_checks():
           sniff.classify(connect) == "http")
     del os.environ["XMAGIC_XRAY_CONFIG"]
 
+    def ws_frame(op, payload, mask=b"\x01\x02\x03\x04"):
+        n = len(payload)
+        hdr = bytes([0x80 | op, 0x80 | n]) if n < 126 else \
+            bytes([0x80 | op, 0x80 | 126]) + n.to_bytes(2, "big")
+        body = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        return hdr + mask + body
+
+    ws_head = b"GET /xmagic HTTP/1.1\r\nHost: h\r\n\r\n"
+    payload = bytes(range(50))
+    check("frame parser: binary frame after the head",
+          sniff._first_data_frame(ws_head + ws_frame(2, payload))
+          == (2, 50, payload))
+    check("frame parser: control frame skipped",
+          sniff._first_data_frame(
+              ws_head + ws_frame(9, b"hi") + ws_frame(1, b"abc"))
+          == (1, 3, b"abc"))
+    check("frame parser: truncated frame undecidable",
+          sniff._first_data_frame(ws_head + ws_frame(2, payload)[:5])
+          is None)
+    check("frame parser: skip_head at a frame boundary",
+          sniff._first_data_frame(ws_frame(2, payload), skip_head=True)
+          == (2, 50, payload))
+
 
 def main():
     unit_checks()

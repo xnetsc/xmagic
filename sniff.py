@@ -569,6 +569,96 @@ def _ws_rewrite(client, data: bytes):
     return (end + 4, new_head, early), info
 
 
+def _first_data_frame(buf: bytes, skip_head: bool = False):
+    """First WebSocket data frame in a client stream, for the log.
+
+    The stream starts with the HTTP upgrade head (already consumed
+    by the caller when skip_head is set), then masked frames.
+    Returns (opcode, payload_length, payload_prefix) with the
+    prefix unmasked and capped at 64 bytes - enough to identify
+    what protocol a rejected stream actually carries - or None
+    while the bytes buffered so far cannot decide.
+    """
+    if skip_head:
+        i = 0
+    else:
+        end = buf.find(b"\r\n\r\n")
+        if end < 0:
+            return None
+        i = end + 4
+    for _ in range(8):  # skip at most a few control frames
+        if len(buf) < i + 2:
+            return None
+        b0, b1 = buf[i], buf[i + 1]
+        opcode = b0 & 0x0F
+        ln = b1 & 0x7F
+        j = i + 2
+        if ln == 126:
+            if len(buf) < j + 2:
+                return None
+            ln = int.from_bytes(buf[j:j + 2], "big")
+            j += 2
+        elif ln == 127:
+            if len(buf) < j + 8:
+                return None
+            ln = int.from_bytes(buf[j:j + 8], "big")
+            j += 8
+        mask = None
+        if b1 & 0x80:
+            if len(buf) < j + 4:
+                return None
+            mask = buf[j:j + 4]
+            j += 4
+        if opcode in (0x0, 0x1, 0x2):
+            take = min(ln, 64)
+            if len(buf) < j + take:
+                return None
+            payload = buf[j:j + take]
+            if mask:
+                payload = bytes(b ^ mask[k % 4]
+                                for k, b in enumerate(payload))
+            return opcode, ln, payload
+        if len(buf) < j + ln:
+            return None
+        i = j + ln
+    return None
+
+
+def _pipe_c2b_snoop(src, dst, tag, skip_head=False):
+    """pipe() client->backend, logging the first data frame's head.
+
+    Observation only: every chunk is forwarded the moment it
+    arrives; a copy is parsed on the side until the first data
+    frame is identified (or a sane cap is passed).
+    """
+    buf = b""
+    logged = False
+    try:
+        while True:
+            r, _, _ = select.select([src], [], [], 300)
+            if not r:
+                break
+            chunk = src.recv(65536)
+            if not chunk:
+                break
+            dst.sendall(chunk)
+            if not logged and len(buf) <= 1 << 20:
+                buf += chunk
+                got = _first_data_frame(buf, skip_head)
+                if got is not None:
+                    opcode, ln, payload = got
+                    log(f"{tag}: ws first frame op={opcode} len={ln} "
+                        f"head={payload.hex()}")
+                    logged = True
+    except (OSError, ValueError):
+        pass
+    finally:
+        try:
+            dst.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+
 def _recv_exact(client, n: int) -> bytes:
     out = b""
     while len(out) < n:
@@ -692,6 +782,7 @@ def handle(client, addr):
             return
         kind = classify(data)
         plan = None
+        ws_info = None
         if kind == "mux":
             plan, ws_info = _ws_rewrite(client, data)
             if ws_info:
@@ -754,7 +845,14 @@ def handle(client, addr):
                 backend.close()
                 return
         client.settimeout(None)
-        t = threading.Thread(target=pipe, args=(client, backend), daemon=True)
+        if ws_info is not None:
+            t = threading.Thread(target=_pipe_c2b_snoop,
+                                 args=(client, backend, addr,
+                                       plan is not None),
+                                 daemon=True)
+        else:
+            t = threading.Thread(target=pipe,
+                                 args=(client, backend), daemon=True)
         t.start()
         pipe(backend, client)
         backend.close()
