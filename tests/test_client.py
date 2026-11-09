@@ -528,6 +528,18 @@ def main():
             [sys.executable, "-m", "http.server", "18103",
              "--directory", upd_dir, "--bind", "127.0.0.1"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(100):
+            try:
+                probe = http.client.HTTPConnection("127.0.0.1", 18103,
+                                                   timeout=1)
+                probe.request("HEAD", "/xmagic.py")
+                probe.getresponse().read()
+                probe.close()
+                break
+            except OSError:
+                time.sleep(0.05)
+        else:
+            raise RuntimeError("local update server did not come up")
 
         def cli_copy(*args):
             proc = subprocess.run([sys.executable, copy_path, *args],
