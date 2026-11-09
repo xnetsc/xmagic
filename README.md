@@ -146,7 +146,7 @@ WS path lists,
 the upstream pool strategy, the default SS method for new users,
 the REALITY switch and camouflage parameters (next section),
 whether direct egress to private addresses is allowed, and the
-group opt-out list for same-group interconnect (on by default - see
+group state lists for same-group interconnect (on by default - see
 "Same-group interconnect" below). A value stored
 in the database wins; clearing it falls back to the `.env` deployment
 default; saving re-renders and applies at once. Port configuration is
@@ -512,8 +512,12 @@ python3 users.py route-add --kind full --pattern example.com --to intl --user ca
 ## Same-group interconnect
 
 Users in the same group can reach each other's services through the
-gateway, LAN-style. It is **on by default**; Settings (or
-`settings --interconnect-off-groups`) lists the groups that opt out.
+gateway, LAN-style. It is **on by default**, and every group is in
+one of three states: on, paused (the Settings paused list, or
+`settings --interconnect-paused-groups`) or closed (the Settings
+opt-out list, or `settings --interconnect-off-groups`). Pausing
+stops a group's interconnect without giving up its port slices;
+closing releases them. A group sits in at most one list.
 Interconnect depends on SSH support: the reverse forwards are SSH
 sessions, so it is available only while SSH is enabled
 (`XMAGIC_ENABLE_SSH=1`). While SSH is off, the console shows the
@@ -527,13 +531,18 @@ SSH is enabled and the node has restarted.
   (20000-21599) is allocated when a member needs one — enabled,
   with an SSH key registered, in a group with interconnect on —
   and released when the member is disabled, the key is removed, or
-  the group opts out; a member who needs a slice again gets their
-  previous block back when it is still free. At most 100 slices
+  the group is closed. While the group is paused the slice is
+  kept - still counted against the pool, not claimable by anyone
+  else - but unusable; a member who needs a slice again after a
+  release gets their previous block back when it is still free. At most 100 slices
   are held at once; an operation that would need one more is
   refused with the shortfall spelled out. sshd enforces the slice
   per key (`permitlisten` in authorized_keys, slices shown in the
   console's user list), so nobody can squat on another user's
-  ports.
+  ports. Every apply also reconciles the allocation table against
+  eligibility — rows whose holders no longer qualify are released
+  and missing ones claimed — so what is held always matches who
+  can actually interconnect.
 - Visit: any member of the group dials `127.0.0.1:<port>` through
   their proxy like any other destination. Routing sends a member's
   slice only to members of the group; every other loopback

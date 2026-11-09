@@ -1488,6 +1488,437 @@ JHde4tAsdlXZGG6MF7TiAAAAEHhtYWdpYyBmaXh0dXJlLWIBAgMEBQ==
               "total_blocks": 100, "claimed_blocks": 100,
               "free_blocks": 0}, out)
 
+    # ---- apply-time release reconcile: holders who stopped being
+    # eligible outside the write paths (direct edits: disabled, key
+    # removed, group pushed onto the opt-out list) keep their rows
+    # until an apply releases them - through the same path a write
+    # would use, so the block is remembered the same way. Release
+    # runs before the claim pass, so a block freed by this apply is
+    # claimable in it.
+    rec2_db = os.path.join(workdir, "rec2.db")
+    env_rec2 = dict(env, PROXY_DB=rec2_db)
+
+    def cli_rec2(*args):
+        proc = subprocess.run([sys.executable, users_py, *args],
+                              env=env_rec2, capture_output=True,
+                              text=True)
+        return proc.returncode, proc.stdout, proc.stderr
+
+    rc, _, err = cli_rec2("init")
+    check("release-reconcile fixture: fresh db", rc == 0, err)
+    for user, grp in (("keeper", "keep"), ("victimdis", "keep"),
+                      ("victimkey", "keep"), ("victimoff", "voff")):
+        rc, _, err = cli_rec2("add", user, "--group", grp,
+                              "--ssh-key-file", kg1pub)
+        assert rc == 0, err
+    raw = sqlite3.connect(rec2_db)
+    raw.execute(
+        "INSERT INTO users (username, enabled, vless_uuid,"
+        " trojan_password, ss_password, ss_method, ssh_pubkey,"
+        " upstream_group, created_at, last_interconnect_lo)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?)",
+        ("waiter", 1, "uuid-waiter", "pw", "pw", "aes-256-gcm",
+         "ssh-ed25519 AAAA waiter", "keep",
+         "2026-05-01T00:00:00.000000+00:00", 20048))
+    raw.commit()
+    raw.close()
+    rc, out, _ = cli_rec2("--json", "settings")
+    check("release-reconcile fixture: four holders claimed on the"
+          " write paths, the seeded waiter is rowless",
+          json.loads(out)["interconnect_slices"] == {
+              "keeper": [20000, 20015], "victimdis": [20016, 20031],
+              "victimkey": [20032, 20047],
+              "victimoff": [20048, 20063]}, out)
+    raw = sqlite3.connect(rec2_db)
+    raw.execute("UPDATE users SET enabled = 0"
+                " WHERE username = 'victimdis'")
+    raw.execute("UPDATE users SET ssh_pubkey = NULL"
+                " WHERE username = 'victimkey'")
+    raw.execute(
+        "INSERT INTO admin_settings (key, value) VALUES"
+        " ('interconnect_off_groups', 'voff')")
+    raw.commit()
+    raw.close()
+    rc, _, err = cli_rec2("apply")
+    check("apply runs clean over the dirtied table", rc == 0, err)
+    rc, out, _ = cli_rec2("--json", "settings")
+    check("apply release reconcile: the disabled, keyless and"
+          " opted-out holders lose their rows; the eligible holder"
+          " is unmoved; the waiter claims the block victimoff freed"
+          " in this same apply (his remembered block, not the"
+          " lowest free one)",
+          json.loads(out)["interconnect_slices"] == {
+              "keeper": [20000, 20015], "waiter": [20048, 20063]},
+          out)
+    raw = sqlite3.connect(rec2_db)
+    remembered = dict(raw.execute(
+        "SELECT username, last_interconnect_lo FROM users"
+        " WHERE username LIKE 'victim%'").fetchall())
+    n_alloc2 = raw.execute(
+        "SELECT COUNT(*) FROM interconnect_allocations"
+    ).fetchone()[0]
+    raw.close()
+    check("each released block is remembered on its user record,"
+          " exactly as a write-path release records it; only the"
+          " two eligible rows remain",
+          remembered == {"victimdis": 20016, "victimkey": 20032,
+                         "victimoff": 20048}
+          and n_alloc2 == 2, str(remembered))
+    rec2_keys = open(os.path.join(workdir, "authorized_keys")).read()
+    check("the release reaches the rendered keys: only the two"
+          " remaining holders carry permitlisten",
+          rec2_keys.count("permitlisten=") == 32
+          and 'permitlisten="127.0.0.1:20048"' in rec2_keys,
+          rec2_keys[:160])
+    rc, _, err = cli_rec2("apply")
+    rc, out, _ = cli_rec2("--json", "settings")
+    raw = sqlite3.connect(rec2_db)
+    remembered2 = dict(raw.execute(
+        "SELECT username, last_interconnect_lo FROM users"
+        " WHERE username LIKE 'victim%'").fetchall())
+    raw.close()
+    check("a second apply is a no-op (rows and memories unchanged)",
+          rc == 0
+          and json.loads(out)["interconnect_slices"] == {
+              "keeper": [20000, 20015], "waiter": [20048, 20063]}
+          and remembered2 == remembered, out)
+
+    # ---- three group states: on / paused / closed. Pausing keeps
+    # the slices (rows stay, blocks stay claimed) but renders
+    # nothing for the group; closing releases; resuming restores
+    # holders as they were and claims for members who joined while
+    # paused.
+    trz_db = os.path.join(workdir, "trz.db")
+    env_trz = dict(env, PROXY_DB=trz_db)
+
+    def cli_trz(*args):
+        proc = subprocess.run([sys.executable, users_py, *args],
+                              env=env_trz, capture_output=True,
+                              text=True)
+        return proc.returncode, proc.stdout, proc.stderr
+
+    rc, _, err = cli_trz("init")
+    check("three-state fixture: fresh db", rc == 0, err)
+    for user, grp in (("p1", "pz"), ("p2", "pz"), ("q1", "other")):
+        rc, _, err = cli_trz("add", user, "--group", grp,
+                             "--ssh-key-file", kg1pub)
+        assert rc == 0, err
+    rc, out, _ = cli_trz("--json", "settings")
+    trz_info = json.loads(out)
+    check("three-state baseline: claims in order, paused list"
+          " empty and not from db",
+          trz_info["interconnect_slices"] == {
+              "p1": [20000, 20015], "p2": [20016, 20031],
+              "q1": [20032, 20047]}
+          and trz_info["interconnect_paused_groups"] == []
+          and trz_info["interconnect_paused_groups_from_db"]
+          is False, out)
+    rc, out, err = cli_trz("settings",
+                           "--interconnect-paused-groups", "pz")
+    check("pause group pz via settings", rc == 0, err)
+    rc, out, _ = cli_trz("settings")
+    check("settings show lists the paused groups",
+          "interconnect_paused_groups: pz (db)" in out, out)
+    rc, out, _ = cli_trz("--json", "settings")
+    trz_info = json.loads(out)
+    check("paused: rows and capacity are untouched, the list is"
+          " stored",
+          trz_info["interconnect_slices"] == {
+              "p1": [20000, 20015], "p2": [20016, 20031],
+              "q1": [20032, 20047]}
+          and trz_info["interconnect_capacity"] == {
+              "total_blocks": 100, "claimed_blocks": 3,
+              "free_blocks": 97}
+          and trz_info["interconnect_paused_groups"] == ["pz"]
+          and trz_info["interconnect_paused_groups_from_db"]
+          is True, out)
+    rc, out, _ = cli_trz("list")
+    check("paused holders still show their slices in the user"
+          " list",
+          "p1" in out and "interconnect=20000-20015" in out, out)
+    rc, _, err = cli_trz("add", "p3", "--group", "pz",
+                         "--ssh-key-file", kg1pub)
+    check("keyed add into a paused group succeeds but claims"
+          " nothing", rc == 0, err)
+    rc, out, _ = cli_trz("--json", "settings")
+    check("the paused newcomer holds no slice",
+          "p3" not in json.loads(out)["interconnect_slices"], out)
+    rc, _, err = cli_trz("apply")
+    check("apply runs clean with a paused group", rc == 0, err)
+    rc, out, _ = cli_trz("--json", "settings")
+    check("apply reconcile spares paused rows (hold) and does not"
+          " claim for the paused newcomer (active)",
+          json.loads(out)["interconnect_slices"] == {
+              "p1": [20000, 20015], "p2": [20016, 20031],
+              "q1": [20032, 20047]}, out)
+    trz_cfg = json.load(open(os.path.join(workdir, "config.json")))
+    trz_band = {r.get("port"): r.get("user")
+                for r in trz_cfg["routing"]["rules"]
+                if r.get("outboundTag") == "direct"
+                and r.get("ip") == ["127.0.0.0/8"]}
+    check("paused group renders no band rules; the on group keeps"
+          " its",
+          "20000-20015" not in trz_band
+          and "20016-20031" not in trz_band
+          and trz_band.get("20032-20047") == ["q1"],
+          json.dumps(trz_band))
+    trz_keys = open(os.path.join(workdir, "authorized_keys")).read()
+    check("paused holders carry no permitlisten; the active"
+          " holder keeps his",
+          trz_keys.count("permitlisten=") == 16
+          and 'permitlisten="127.0.0.1:20032"' in trz_keys,
+          trz_keys[:160])
+    rc, _, err = cli_trz("settings", "--interconnect-paused-groups",
+                         "")
+    check("resume group pz", rc == 0, err)
+    rc, out, _ = cli_trz("--json", "settings")
+    check("resume: kept rows are back exactly as they were; the"
+          " member who joined while paused claims the lowest free"
+          " block",
+          json.loads(out)["interconnect_slices"] == {
+              "p1": [20000, 20015], "p2": [20016, 20031],
+              "q1": [20032, 20047], "p3": [20048, 20063]}, out)
+    rc, _, err = cli_trz("settings",
+                         "--interconnect-paused-groups", "pz")
+    assert rc == 0, err
+    rc, _, err = cli_trz("settings",
+                         "--interconnect-paused-groups", "",
+                         "--interconnect-off-groups", "pz")
+    check("paused -> closed in one write releases every member",
+          rc == 0, err)
+    rc, out, _ = cli_trz("--json", "settings")
+    trz_info = json.loads(out)
+    check("after closing, only the untouched group still holds",
+          trz_info["interconnect_slices"] == {"q1": [20032, 20047]}
+          and trz_info["interconnect_off_groups"] == ["pz"]
+          and trz_info["interconnect_paused_groups"] == [], out)
+    rc, _, err = cli_trz("settings", "--interconnect-off-groups",
+                         "")
+    check("reopen the closed group", rc == 0, err)
+    rc, out, _ = cli_trz("--json", "settings")
+    check("reopened members re-claim their remembered blocks",
+          json.loads(out)["interconnect_slices"] == {
+              "p1": [20000, 20015], "p2": [20016, 20031],
+              "q1": [20032, 20047], "p3": [20048, 20063]}, out)
+    rc, _, err = cli_trz("settings",
+                         "--interconnect-paused-groups", "pz")
+    assert rc == 0, err
+    rc, out, err = cli_trz("settings", "--interconnect-off-groups",
+                           "pz")
+    check("conflict: closing a stored-paused group is refused and"
+          " names the group",
+          rc != 0 and "'pz'" in err + out and "both" in err + out,
+          err + out)
+    rc, out, err = cli_trz("settings",
+                           "--interconnect-off-groups", "pz",
+                           "--interconnect-paused-groups", "pz")
+    check("conflict: naming one group in both lists in a single"
+          " write is refused too",
+          rc != 0 and "'pz'" in err + out, err + out)
+    rc, out, _ = cli_trz("--json", "settings")
+    trz_info = json.loads(out)
+    check("conflicts leave both stored lists untouched",
+          trz_info["interconnect_off_groups"] == []
+          and trz_info["interconnect_paused_groups"] == ["pz"],
+          out)
+    rc, _, err = cli_trz("settings",
+                         "--interconnect-paused-groups", "")
+    check("clear the paused list again (group back on, rows kept)",
+          rc == 0, err)
+    rc, out, _ = cli_trz("--json", "settings")
+    check("state is fully restored after the conflict detour",
+          json.loads(out)["interconnect_slices"] == {
+              "p1": [20000, 20015], "p2": [20016, 20031],
+              "q1": [20032, 20047], "p3": [20048, 20063]}, out)
+
+    # ---- paused blocks still count: 99 on-group holders plus one
+    # paused holder fill the band, so a new claim is refused even
+    # though the paused slice is unusable; and the apply reconcile
+    # (release = hold predicate) leaves the paused row in place.
+    trz2_db = os.path.join(workdir, "trz2.db")
+    env_trz2 = dict(env, PROXY_DB=trz2_db)
+
+    def cli_trz2(*args):
+        proc = subprocess.run([sys.executable, users_py, *args],
+                              env=env_trz2, capture_output=True,
+                              text=True)
+        return proc.returncode, proc.stdout, proc.stderr
+
+    rc, _, err = cli_trz2("init")
+    raw = sqlite3.connect(trz2_db)
+    for i in range(1, 100):
+        name = f"ph{i:03d}"
+        raw.execute(
+            "INSERT INTO users (username, vless_uuid,"
+            " trojan_password, ss_password, ss_method, ssh_pubkey,"
+            " upstream_group, created_at) VALUES (?,?,?,?,?,?,?,?)",
+            (name, f"uuid-p{i}", "pw", "pw", "aes-256-gcm",
+             f"ssh-ed25519 AAAA {name}", "pool",
+             f"2026-01-01T00:{i // 60:02d}:{i % 60:02d}.000000+00:00"))
+        lo = 20000 + (i - 1) * 16
+        raw.execute(
+            "INSERT INTO interconnect_allocations (username, port_lo,"
+            " port_hi) VALUES (?,?,?)", (name, lo, lo + 15))
+    raw.execute(
+        "INSERT INTO users (username, vless_uuid, trojan_password,"
+        " ss_password, ss_method, ssh_pubkey, upstream_group,"
+        " created_at) VALUES (?,?,?,?,?,?,?,?)",
+        ("pzhold", "uuid-pz", "pw", "pw", "aes-256-gcm",
+         "ssh-ed25519 AAAA pzhold", "pz",
+         "2026-01-02T00:00:00.000000+00:00"))
+    raw.execute(
+        "INSERT INTO interconnect_allocations (username, port_lo,"
+        " port_hi) VALUES (?,?,?)", ("pzhold", 21584, 21599))
+    raw.execute(
+        "INSERT INTO users (username, vless_uuid, trojan_password,"
+        " ss_password, ss_method, ssh_pubkey, upstream_group,"
+        " created_at) VALUES (?,?,?,?,?,?,?,?)",
+        ("waiter", "uuid-w", "pw", "pw", "aes-256-gcm",
+         "ssh-ed25519 AAAA waiter", "pool",
+         "2026-01-03T00:00:00.000000+00:00"))
+    raw.execute(
+        "INSERT INTO admin_settings (key, value) VALUES"
+        " ('interconnect_paused_groups', 'pz')")
+    raw.commit()
+    raw.close()
+    check("paused-pool fixture: fresh db, 100 rows seeded (one"
+          " paused)", rc == 0, err)
+    rc, out, _ = cli_trz2("--json", "settings")
+    trz2_info = json.loads(out)
+    check("the paused block counts as claimed: band exactly full",
+          trz2_info["interconnect_capacity"] == {
+              "total_blocks": 100, "claimed_blocks": 100,
+              "free_blocks": 0}
+          and trz2_info["interconnect_slices"].get("pzhold")
+          == [21584, 21599]
+          and trz2_info["interconnect_paused_groups"] == ["pz"],
+          out)
+    rc, out, err = cli_trz2("add", "newbie", "--group", "pool",
+                            "--ssh-key-file", kg1pub)
+    check("a new keyed add is refused: the paused block is not"
+          " up for grabs",
+          rc != 0 and "20000-21599" in err + out, err + out)
+    rc, _, err = cli_trz2("apply")
+    check("apply succeeds over the full, partly paused band",
+          rc == 0, err)
+    rc, out, _ = cli_trz2("--json", "settings")
+    trz2_info = json.loads(out)
+    check("reconcile leaves the paused row in place and the"
+          " waiter rowless (band still full)",
+          trz2_info["interconnect_slices"].get("pzhold")
+          == [21584, 21599]
+          and "waiter" not in trz2_info["interconnect_slices"]
+          and trz2_info["interconnect_capacity"][
+              "claimed_blocks"] == 100, out)
+
+    # ---- resuming a paused group is a quantified gate over only
+    # the members who still need a slice: holders kept theirs
+    # across the pause and are not counted.
+    trz3_db = os.path.join(workdir, "trz3.db")
+    env_trz3 = dict(env, PROXY_DB=trz3_db)
+
+    def cli_trz3(*args):
+        proc = subprocess.run([sys.executable, users_py, *args],
+                              env=env_trz3, capture_output=True,
+                              text=True)
+        return proc.returncode, proc.stdout, proc.stderr
+
+    rc, _, err = cli_trz3("init")
+    raw = sqlite3.connect(trz3_db)
+    for i in range(1, 99):
+        name = f"ph{i:03d}"
+        raw.execute(
+            "INSERT INTO users (username, vless_uuid,"
+            " trojan_password, ss_password, ss_method, ssh_pubkey,"
+            " upstream_group, created_at) VALUES (?,?,?,?,?,?,?,?)",
+            (name, f"uuid-p{i}", "pw", "pw", "aes-256-gcm",
+             f"ssh-ed25519 AAAA {name}", "pool",
+             f"2026-01-01T00:{i // 60:02d}:{i % 60:02d}.000000+00:00"))
+        lo = 20000 + (i - 1) * 16
+        raw.execute(
+            "INSERT INTO interconnect_allocations (username, port_lo,"
+            " port_hi) VALUES (?,?,?)", (name, lo, lo + 15))
+    for j, name in enumerate(("r1", "r2", "r3", "r4"), start=1):
+        raw.execute(
+            "INSERT INTO users (username, vless_uuid,"
+            " trojan_password, ss_password, ss_method, ssh_pubkey,"
+            " upstream_group, created_at) VALUES (?,?,?,?,?,?,?,?)",
+            (name, f"uuid-{name}", "pw", "pw", "aes-256-gcm",
+             f"ssh-ed25519 AAAA {name}", "rz",
+             f"2026-02-01T00:00:0{j}.000000+00:00"))
+    for name, lo in (("r1", 21568), ("r2", 21584)):
+        raw.execute(
+            "INSERT INTO interconnect_allocations (username, port_lo,"
+            " port_hi) VALUES (?,?,?)", (name, lo, lo + 15))
+    raw.execute(
+        "INSERT INTO admin_settings (key, value) VALUES"
+        " ('interconnect_paused_groups', 'rz')")
+    raw.commit()
+    raw.close()
+    check("resume fixture: fresh db, paused group with 2 holders"
+          " and 2 waiting, band full", rc == 0, err)
+    rc, out, err = cli_trz3("settings",
+                            "--interconnect-paused-groups", "")
+    check("resume refused, quantified over the waiting members"
+          " only (holders across the pause are not counted)",
+          rc != 0
+          and "cannot enable interconnect for group 'rz'"
+          in err + out
+          and "2 member(s) need a port slice (16 ports each,"
+              " 32 ports in total)" in err + out
+          and "only 0 free block(s) (0 ports)" in err + out
+          and "short 2 block(s) (32 ports)" in err + out
+          and "cannot be served: r3, r4" in err + out, err + out)
+    rc, out, err = cli_trz3("--json", "settings",
+                            "--interconnect-paused-groups", "")
+    try:
+        eobj = json.loads(err)
+    except ValueError:
+        eobj = {}
+    check("resume refusal is the structured error object with the"
+          " same figures",
+          rc != 0 and eobj.get("code")
+          == "interconnect_insufficient_ports"
+          and eobj.get("group") == "rz"
+          and eobj.get("needed_users") == ["r3", "r4"]
+          and eobj.get("needed_count") == 2
+          and eobj.get("free_blocks") == 0
+          and eobj.get("shortfall_blocks") == 2
+          and eobj.get("shortfall_ports") == 32
+          and eobj.get("users_without_ports") == ["r3", "r4"],
+          err + out)
+    rc, out, _ = cli_trz3("--json", "settings")
+    trz3_info = json.loads(out)
+    check("refused resume is atomic: group stays paused, nobody"
+          " claimed",
+          trz3_info["interconnect_paused_groups"] == ["rz"]
+          and "r3" not in trz3_info["interconnect_slices"]
+          and "r4" not in trz3_info["interconnect_slices"]
+          and trz3_info["interconnect_slices"].get("r1")
+          == [21568, 21583], out)
+    rc, _, err = cli_trz3("disable", "ph001")
+    assert rc == 0, err
+    rc, _, err = cli_trz3("disable", "ph002")
+    check("disable two pool holders to free two blocks",
+          rc == 0, err)
+    rc, _, err = cli_trz3("settings",
+                          "--interconnect-paused-groups", "")
+    check("resume succeeds once the waiting members fit", rc == 0,
+          err)
+    rc, out, _ = cli_trz3("--json", "settings")
+    trz3_info = json.loads(out)
+    check("the waiting members claim the freed blocks in order;"
+          " the holders across the pause never moved",
+          trz3_info["interconnect_slices"].get("r3")
+          == [20000, 20015]
+          and trz3_info["interconnect_slices"].get("r4")
+          == [20016, 20031]
+          and trz3_info["interconnect_slices"].get("r1")
+          == [21568, 21583]
+          and trz3_info["interconnect_slices"].get("r2")
+          == [21584, 21599]
+          and trz3_info["interconnect_paused_groups"] == [], out)
+
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     return 1 if FAIL else 0
 

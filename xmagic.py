@@ -629,6 +629,9 @@ def cmd_settings_show(args):
         f"interconnect_off_groups: "
         f"{','.join(payload['interconnect_off_groups']) or '(none)'} "
         f"({src[payload['interconnect_off_groups_from_db']]})",
+        f"interconnect_paused_groups: "
+        f"{','.join(payload['interconnect_paused_groups']) or '(none)'} "
+        f"({src[payload['interconnect_paused_groups_from_db']]})",
         f"interconnect: "
         f"{'available' if payload.get('ssh_enabled', True) else 'unavailable (SSH not enabled)'}",
         f"interconnect_capacity: "
@@ -671,7 +674,7 @@ def cmd_settings_set(args):
     for key in ("session_ttl_hours", "vless_ws_paths", "trojan_ws_paths",
                 "ss_ws_paths", "vmess_ws_paths", "upstream_strategy",
                 "ss_method",
-                "interconnect_off_groups",
+                "interconnect_off_groups", "interconnect_paused_groups",
                 "reality_dest", "reality_server_names", "reality_short_ids"):
         if getattr(args, key, None) is not None:
             body[key] = getattr(args, key)
@@ -701,6 +704,8 @@ def cmd_settings_set(args):
          f"ss_method={payload['ss_method']}, "
          f"interconnect_off_groups="
          f"{','.join(payload['interconnect_off_groups']) or '(none)'}{ic_note}, "
+         f"interconnect_paused_groups="
+         f"{','.join(payload['interconnect_paused_groups']) or '(none)'}, "
          f"reality_enabled={payload['reality_enabled']}, "
          f"reality_dest={payload['reality_dest']}, "
          f"reality_public_key={payload['reality_public_key']}\n"
@@ -1378,6 +1383,11 @@ def main():
                    help="comma-separated user groups whose members may NOT"
                         " interconnect (on by default); empty string ="
                         " nobody opted out")
+    a.add_argument("--interconnect-paused-groups",
+                   help="comma-separated user groups whose interconnect"
+                        " is paused: members keep their port slices but"
+                        " cannot use them until the group is back on;"
+                        " empty string = nobody paused")
     a.add_argument("--no-direct-allow-private", dest="direct_allow_private",
                    action="store_false",
                    help="disallow direct egress to private/LAN addresses")

@@ -855,6 +855,42 @@ def main():
             check("ssh off: clearing the opt-out via remote CLI",
                   rc == 0 and "interconnect_off_groups=(none)" in out,
                   err + out)
+            rc, out, err = cli("--node", "c", "settings", "set",
+                               "--interconnect-paused-groups", "team")
+            check("ssh off: paused list stored via remote CLI, with"
+                  " the unavailable mark",
+                  rc == 0
+                  and "interconnect_paused_groups=team" in out
+                  and "interconnect unavailable: SSH not enabled"
+                  in out, err + out)
+            rc, out, err = cli("--node", "c", "settings", "show")
+            check("ssh off: settings show lists the paused groups"
+                  " via remote CLI",
+                  rc == 0
+                  and "interconnect_paused_groups: team" in out,
+                  err + out)
+            rc, out, err = cli("--node", "c", "--json", "settings",
+                               "show")
+            check("ssh off: --json settings show carries the paused"
+                  " list and its source flag",
+                  rc == 0
+                  and json.loads(out)["interconnect_paused_groups"]
+                  == ["team"]
+                  and json.loads(out)[
+                      "interconnect_paused_groups_from_db"] is True,
+                  err + out)
+            rc, out, err = cli("--node", "c", "settings", "set",
+                               "--interconnect-off-groups", "team")
+            check("conflict: closing a paused group via remote CLI"
+                  " is refused and names the group",
+                  rc != 0 and "team" in err + out
+                  and "both" in err + out, err + out)
+            rc, out, err = cli("--node", "c", "settings", "set",
+                               "--interconnect-paused-groups", "")
+            check("ssh off: clearing the paused list via remote CLI",
+                  rc == 0
+                  and "interconnect_paused_groups=(none)" in out,
+                  err + out)
 
             # Capacity: seed 100 keyed holders of group "capped"
             # directly (user rows + allocation rows), then exercise

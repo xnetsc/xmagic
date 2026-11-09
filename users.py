@@ -1170,7 +1170,9 @@ def cmd_remove(args):
 def cmd_list(_):
     with db() as conn:
         rows = conn.execute("SELECT * FROM users ORDER BY username").fetchall()
-        members = interconnect_members(conn)
+        # display shows the table itself: a paused holder still
+        # holds his slice and stays visible as holding it
+        members = interconnect_slices(conn)
     if JSON_OUT:
         print(json.dumps([_user_record(r, members) for r in rows], indent=2))
         return
@@ -2236,8 +2238,10 @@ def cmd_render_keys(args):
         rows = conn.execute(
             "SELECT username, ssh_pubkey FROM users WHERE enabled = 1 AND ssh_pubkey IS NOT NULL"
             " ORDER BY username").fetchall()
-        slices = (interconnect_slices(conn)
-                  if interconnect_members(conn) else {})
+        # permitlisten only for ACTIVE holders: a paused holder's
+        # row stays in the table but must not be bindable until his
+        # group is switched back on
+        slices = interconnect_members(conn)
     out = args.out or "./data/authorized_keys"
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     tmp = out + ".tmp"
@@ -2367,10 +2371,31 @@ def normalize_group_list(raw):
     return ",".join(names)
 
 
+def parse_group_list_arg(raw):
+    """One interconnect list value -> (canonical, group set): the
+    empty string clears back to the default (canonical None, empty
+    set); anything else is normalized (ValueError on bad input)."""
+    if raw == "":
+        return None, set()
+    canonical = normalize_group_list(raw)
+    return canonical, (set(canonical.split(",")) if canonical
+                       else set())
+
+
 def interconnect_off_groups(conn):
-    """Groups whose members may NOT interconnect. Interconnect is on
-    by default for every group; this list is the opt-out."""
+    """Groups whose members may NOT interconnect (state: closed).
+    Interconnect is on by default for every group; this list is the
+    opt-out - members' slices are released back to the pool."""
     raw = get_setting(conn, "interconnect_off_groups") or ""
+    return {g.strip() for g in raw.split(",") if g.strip()}
+
+
+def interconnect_paused_groups(conn):
+    """Groups whose interconnect is paused: members keep their
+    slices (the blocks stay theirs and count against the pool) but
+    cannot use them - no routing rules, no permitlisten - until
+    the group is switched back on."""
+    raw = get_setting(conn, "interconnect_paused_groups") or ""
     return {g.strip() for g in raw.split(",") if g.strip()}
 
 
@@ -2384,8 +2409,8 @@ def interconnect_slices(conn):
     """{username: (first_port, last_port)} - read from the allocation
     table, the only source of truth for who holds which slice. Rows
     are claimed and released on the write paths (add / enable /
-    setkey / setgroup / opt-out changes); rendering and display
-    only ever read."""
+    setkey / setgroup / opt-out changes) and reconciled against
+    eligibility at apply; rendering and display only ever read."""
     rows = conn.execute(
         "SELECT username, port_lo, port_hi"
         " FROM interconnect_allocations").fetchall()
@@ -2419,11 +2444,11 @@ def _backfill_interconnect_allocations(conn):
         return
     off = interconnect_off_groups(conn)
     rows = conn.execute(
-        "SELECT username, ssh_pubkey, upstream_group FROM users"
-        " WHERE enabled = 1").fetchall()
+        "SELECT username, enabled, ssh_pubkey, upstream_group"
+        " FROM users WHERE enabled = 1").fetchall()
     for r in rows:
-        if (r["username"] in legacy and (r["ssh_pubkey"] or "").strip()
-                and r["upstream_group"] not in off):
+        if (r["username"] in legacy
+                and _slice_hold_eligible(r, off)):
             lo, hi = legacy[r["username"]]
             conn.execute(
                 "INSERT INTO interconnect_allocations"
@@ -2431,13 +2456,27 @@ def _backfill_interconnect_allocations(conn):
                 (r["username"], lo, hi))
 
 
-def _slice_eligible(row, off):
-    """A user needs a slice when they can actually expose services:
-    enabled, holding an ssh key (no key, no ssh -R), and in a group
-    whose interconnect is on. Pure dialers need no slice."""
+def _slice_hold_eligible(row, off):
+    """Whether the user's allocation row may exist at all: enabled,
+    holding an ssh key (no key, no ssh -R), and in a group that is
+    not closed for interconnect (on or paused). Paused keeps the
+    row - the block stays the member's, counts against the pool,
+    and nobody else can claim it; it just cannot be used while
+    paused. This is the predicate for row existence (the reconcile
+    release pass, the migration backfill)."""
     return (bool(row["enabled"])
             and bool((row["ssh_pubkey"] or "").strip())
             and row["upstream_group"] not in off)
+
+
+def _slice_active_eligible(row, off, paused):
+    """Whether the user may claim and use a slice right now: hold
+    eligibility plus the group fully on (not paused). This is the
+    predicate for claiming (write paths, the reconcile claim pass)
+    and for rendering (routing rules, permitlisten). Pure dialers
+    need no slice."""
+    return (_slice_hold_eligible(row, off)
+            and row["upstream_group"] not in paused)
 
 
 def _claim_interconnect_slice(conn, username, last_lo=None):
@@ -2536,14 +2575,16 @@ def require_interconnect_slice(conn, username):
     """Called after a write that may have made username claim-eligible
     (add / enable / setkey / setgroup), inside the same transaction:
     claim their slice, or raise ValueError so the whole write is
-    refused. Users who need no slice (disabled, keyless, group
-    opted out) are untouched, and a held slice is never moved."""
+    refused. Users who cannot claim right now (disabled, keyless,
+    group closed or paused) are untouched, and a held slice is
+    never moved."""
     row = conn.execute(
         "SELECT enabled, ssh_pubkey, upstream_group, last_interconnect_lo"
         " FROM users WHERE username = ?", (username,)).fetchone()
     if row is None:
         return
-    if not _slice_eligible(row, interconnect_off_groups(conn)):
+    if not _slice_active_eligible(row, interconnect_off_groups(conn),
+                                  interconnect_paused_groups(conn)):
         return
     if _claim_interconnect_slice(conn, username,
                                  row["last_interconnect_lo"]) is None:
@@ -2552,25 +2593,48 @@ def require_interconnect_slice(conn, username):
 
 
 def _reconcile_interconnect_claims(conn):
-    """Top up the allocation table: every claim-eligible user who
-    holds no row claims a slice, in creation order. Runs only from
-    apply_changes - the write paths claim eagerly for the user they
-    touch, but a user seeded outside them (imported data, a legacy
-    slice the migration returned to the pool) can sit eligible and
-    rowless until some write happens to name him, and rendering
-    stays silent about it; apply is the one operation every surface
-    runs, so it closes the gap. Claim-only and never fatal: holders
-    are never moved, nothing is released, and a full band simply
-    leaves the rest rowless - the refusal gates live on the write
-    paths, and apply is not an interconnect operation."""
+    """Make the allocation table match eligibility exactly, in one
+    transaction ahead of the render in apply_changes. Rendering
+    stays read-only and the write paths claim/release eagerly for
+    the user they touch; this closes the two gaps data seeded
+    outside them can leave behind (imports, direct database edits,
+    a legacy slice the migration returned to the pool):
+
+    - release pass: a holder who no longer meets hold eligibility
+      (_slice_hold_eligible: disabled, key removed, group closed
+      since - or a row naming no user at all) is released through
+      the same helper the write paths use, so the block returns to
+      the pool and is remembered on the user record in exactly the
+      same way. A merely paused holder still holds, so his row is
+      never released here;
+    - claim pass: every actively eligible user who holds no row
+      claims a slice, in creation order.
+
+    Release runs first, so a block freed by this same apply can
+    serve a waiter in it. Never fatal: eligible holders are never
+    moved, and a full band simply leaves the rest rowless - the
+    refusal gates live on the write paths, and apply is not an
+    interconnect operation."""
     off = interconnect_off_groups(conn)
+    paused = interconnect_paused_groups(conn)
     held = interconnect_slices(conn)
+    if held:
+        users = conn.execute(
+            "SELECT username, enabled, ssh_pubkey, upstream_group"
+            " FROM users").fetchall()
+        by_name = {r["username"]: r for r in users}
+        for username in sorted(held):
+            row = by_name.get(username)
+            if row is None or not _slice_hold_eligible(row, off):
+                _release_interconnect_slice(conn, username)
+        held = interconnect_slices(conn)
     rows = conn.execute(
         "SELECT username, enabled, ssh_pubkey, upstream_group,"
         " last_interconnect_lo FROM users"
         " ORDER BY created_at, username").fetchall()
     for r in rows:
-        if r["username"] in held or not _slice_eligible(r, off):
+        if r["username"] in held or not _slice_active_eligible(
+                r, off, paused):
             continue
         got = _claim_interconnect_slice(conn, r["username"],
                                         r["last_interconnect_lo"])
@@ -2579,32 +2643,71 @@ def _reconcile_interconnect_claims(conn):
         held[r["username"]] = got
 
 
-def interconnect_off_transition(conn, old_off, new_off):
-    """Apply the allocation side of an interconnect_off_groups change,
-    inside the settings write's own transaction:
-    - groups entering the opt-out list release every member's slice
-      (ports return to the pool; the block is remembered per user);
-    - groups leaving it have every eligible member (enabled, keyed,
-      not yet holding) claim a slice, in creation order. If a group
-      cannot be fully served, ValueError refuses the whole settings
-      write with the shortfall spelled out, so no group ever ends
-      up half-claimed and the setting itself stays untouched."""
-    released = new_off - old_off
-    if released:
+def _interconnect_group_state(group, off, paused):
+    """A group's interconnect state: 'off' (closed), 'paused' or
+    'on' (the default - in neither list)."""
+    if group in off:
+        return "off"
+    if group in paused:
+        return "paused"
+    return "on"
+
+
+def interconnect_groups_transition(conn, old_off, new_off,
+                                   old_paused, new_paused):
+    """Apply the allocation side of an interconnect group-state
+    change (the off/paused lists), inside the settings write's own
+    transaction. A group named in both new lists refuses the whole
+    write. Otherwise, per group whose state changes:
+
+    - entering off (from on or paused): every member's slice is
+      released (ports return to the pool; the block is remembered
+      per user);
+    - entering on (from off or paused): every actively eligible
+      member (enabled, keyed) who holds no row claims one, in
+      creation order - members who kept a row across a pause are
+      not counted. If a group cannot be fully served, ValueError
+      refuses the whole settings write with the shortfall spelled
+      out, so no group ever ends up half-claimed and the stored
+      lists stay untouched;
+    - entering paused: rows are kept exactly as they are and
+      nothing is claimed - the change is render-only (the group
+      stops routing, its blocks stay held).
+
+    Releases run before claims, so a block freed by one group's
+    closing can serve another group's opening in the same write."""
+    both = sorted(set(new_off) & set(new_paused))
+    if both:
+        raise ValueError(
+            "interconnect group state conflict: group(s) "
+            + ", ".join(f"'{g}'" for g in both)
+            + " cannot be both closed (off) and paused")
+    groups = set(old_off) | set(new_off) | set(old_paused) \
+        | set(new_paused)
+    closing = [g for g in groups
+               if _interconnect_group_state(g, new_off, new_paused)
+               == "off"
+               and _interconnect_group_state(g, old_off, old_paused)
+               != "off"]
+    if closing:
         rows = conn.execute(
             "SELECT username, upstream_group FROM users").fetchall()
         for r in rows:
-            if r["upstream_group"] in released:
+            if r["upstream_group"] in closing:
                 _release_interconnect_slice(conn, r["username"])
-    turned_on = old_off - new_off
-    if not turned_on:
+    opening = [g for g in groups
+               if _interconnect_group_state(g, new_off, new_paused)
+               == "on"
+               and _interconnect_group_state(g, old_off, old_paused)
+               != "on"]
+    if not opening:
         return
     held = interconnect_slices(conn)
     rows = conn.execute(
         "SELECT username, upstream_group, ssh_pubkey, last_interconnect_lo"
         " FROM users WHERE enabled = 1 ORDER BY created_at, username"
     ).fetchall()
-    for group in sorted(turned_on):
+    for group in sorted(opening):
         needy = [r for r in rows
                  if r["upstream_group"] == group
                  and (r["ssh_pubkey"] or "").strip()
@@ -2622,15 +2725,21 @@ def interconnect_off_transition(conn, old_off, new_off):
 def interconnect_groups_members(conn):
     """{group: {username: (first_port, last_port)}} - interconnect is
     same-group only: a group's members may dial each other's slices,
-    never another group's."""
+    never another group's. Only ACTIVE members appear (group fully
+    on): a paused group's holders keep their rows in the table but
+    are not routed to and get no permitlisten until the group is
+    switched back on."""
     off = interconnect_off_groups(conn)
+    paused = interconnect_paused_groups(conn)
     slices = interconnect_slices(conn)
     rows = conn.execute(
         "SELECT username, upstream_group FROM users WHERE enabled = 1"
     ).fetchall()
     groups = {}
     for r in rows:
-        if r["upstream_group"] not in off and r["username"] in slices:
+        if (r["upstream_group"] not in off
+                and r["upstream_group"] not in paused
+                and r["username"] in slices):
             groups.setdefault(r["upstream_group"], {})[r["username"]] = \
                 slices[r["username"]]
     return groups
@@ -2638,7 +2747,10 @@ def interconnect_groups_members(conn):
 
 def interconnect_members(conn):
     """Flat {username: (first_port, last_port)} across all groups -
-    who holds a slice at all (console display, key rendering)."""
+    the ACTIVE holders: whose slices are routed and carry
+    permitlisten right now. (Who holds a row at all, paused
+    holders included, is interconnect_slices - the table itself,
+    which is what user lists and the settings payload show.)"""
     out = {}
     for members in interconnect_groups_members(conn).values():
         out.update(members)
@@ -2972,9 +3084,13 @@ def settings_info(conn):
         "interconnect_off_groups": sorted(interconnect_off_groups(conn)),
         "interconnect_off_groups_from_db":
             get_setting(conn, "interconnect_off_groups") is not None,
+        "interconnect_paused_groups":
+            sorted(interconnect_paused_groups(conn)),
+        "interconnect_paused_groups_from_db":
+            get_setting(conn, "interconnect_paused_groups") is not None,
         "interconnect_slices": {
             name: list(span) for name, span
-            in interconnect_members(conn).items()},
+            in interconnect_slices(conn).items()},
         "interconnect_capacity": interconnect_capacity(conn),
     }
 
@@ -3024,19 +3140,24 @@ def cmd_settings(args):
             if key.endswith("_paths"):
                 value = ",".join(_parse_paths(value, "/unused"))
             set_setting(conn, key, value)
-        if getattr(args, "interconnect_off_groups", None) is not None:
+        off_arg = getattr(args, "interconnect_off_groups", None)
+        paused_arg = getattr(args, "interconnect_paused_groups", None)
+        if off_arg is not None or paused_arg is not None:
             old_off = interconnect_off_groups(conn)
-            if args.interconnect_off_groups == "":
-                canonical, new_off = None, set()
-            else:
-                try:
-                    canonical = normalize_group_list(
-                        args.interconnect_off_groups)
-                except ValueError as exc:
-                    sys.exit(str(exc))
-                new_off = set(canonical.split(",")) if canonical else set()
+            old_paused = interconnect_paused_groups(conn)
+            off_canon = paused_canon = None
+            new_off, new_paused = old_off, old_paused
             try:
-                interconnect_off_transition(conn, old_off, new_off)
+                if off_arg is not None:
+                    off_canon, new_off = parse_group_list_arg(off_arg)
+                if paused_arg is not None:
+                    paused_canon, new_paused = \
+                        parse_group_list_arg(paused_arg)
+            except ValueError as exc:
+                sys.exit(str(exc))
+            try:
+                interconnect_groups_transition(conn, old_off, new_off,
+                                               old_paused, new_paused)
             except InterconnectShortfall as exc:
                 if JSON_OUT:
                     print(json.dumps({"error": str(exc), **exc.fields}),
@@ -3045,10 +3166,18 @@ def cmd_settings(args):
                 sys.exit(str(exc))
             except ValueError as exc:
                 sys.exit(str(exc))
-            if canonical is None:
-                delete_setting(conn, "interconnect_off_groups")
-            else:
-                set_setting(conn, "interconnect_off_groups", canonical)
+            if off_arg is not None:
+                if off_canon is None:
+                    delete_setting(conn, "interconnect_off_groups")
+                else:
+                    set_setting(conn, "interconnect_off_groups",
+                                off_canon)
+            if paused_arg is not None:
+                if paused_canon is None:
+                    delete_setting(conn, "interconnect_paused_groups")
+                else:
+                    set_setting(conn, "interconnect_paused_groups",
+                                paused_canon)
         if getattr(args, "vless", None) is not None:
             if args.vless == "":
                 delete_setting(conn, "vless_enabled")
@@ -3148,6 +3277,9 @@ def cmd_settings(args):
     print(f"interconnect_off_groups: "
           f"{','.join(info['interconnect_off_groups']) or '(none)'} "
           f"({src[info['interconnect_off_groups_from_db']]})")
+    print(f"interconnect_paused_groups: "
+          f"{','.join(info['interconnect_paused_groups']) or '(none)'} "
+          f"({src[info['interconnect_paused_groups_from_db']]})")
     print(f"interconnect: "
           f"{'available' if info['ssh_enabled'] else 'unavailable (SSH not enabled)'}")
     print(f"interconnect_capacity: "
@@ -3185,11 +3317,12 @@ def render_all(out_dir):
         rows = conn.execute(
             "SELECT username, ssh_pubkey FROM users WHERE enabled = 1"
             " AND ssh_pubkey IS NOT NULL ORDER BY username").fetchall()
-        # when interconnect is armed, EVERY user gets a permitlisten
-        # for their own slice: a non-member must not be able to squat
-        # on a member's ports and intercept the group's traffic
-        slices = (interconnect_slices(conn)
-                  if interconnect_members(conn) else {})
+        # when interconnect is armed, every ACTIVE holder gets a
+        # permitlisten for their own slice: a non-member must not be
+        # able to squat on a member's ports and intercept the group's
+        # traffic. Paused holders are excluded on purpose - their
+        # rows are kept, but the slices are not bindable while paused
+        slices = interconnect_members(conn)
     keys_path = os.path.join(out_dir, "authorized_keys")
     tmp = keys_path + ".tmp"
     with open(tmp, "w") as f:
@@ -3311,9 +3444,10 @@ def restart_channel():
 
 def apply_changes():
     out_dir = os.path.dirname(os.path.abspath(DB_PATH))
-    # Claim any slices seeded data left unclaimed, in one committed
-    # transaction ahead of the render, so the files rendered below
-    # already carry the topped-up table (rendering itself stays
+    # Reconcile the allocation table with eligibility (release
+    # stale rows, claim missing ones) in one committed transaction
+    # ahead of the render, so the files rendered below already
+    # carry the reconciled table (rendering itself stays
     # read-only). Both surfaces - the node CLI and the console -
     # funnel through here, so both get the reconcile.
     with db() as conn:
@@ -3709,6 +3843,11 @@ def main():
                    help="comma-separated user groups whose members may NOT"
                         " interconnect (interconnect is on by default);"
                         " empty string = nobody opted out")
+    a.add_argument("--interconnect-paused-groups",
+                   help="comma-separated user groups whose interconnect"
+                        " is paused: members keep their port slices but"
+                        " cannot use them until the group is back on;"
+                        " empty string = nobody paused")
     a.add_argument("--vless", choices=("on", "off", ""),
                    help="render the VLESS inbounds (off by default:"
                         " VLESS has no encryption of its own);"

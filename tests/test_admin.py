@@ -563,6 +563,43 @@ def main():
         gina = [u for u in body["users"] if u["username"] == "gina"][0]
         check("re-enabled member regains the remembered block",
               gina.get("interconnect") == [20000, 20015], f"{gina}")
+        status, body = client.call("POST", "/api/settings",
+                                   {"interconnect_paused_groups": "team"})
+        check("settings: interconnect paused list stored",
+              status == 200
+              and body["interconnect_paused_groups"] == ["team"]
+              and body["interconnect_paused_groups_from_db"] is True
+              and body["db_values"]["interconnect_paused_groups"]
+              == "team", f"{status} {body}")
+        status, body = client.call("GET", "/api/users")
+        gina = [u for u in body["users"] if u["username"] == "gina"][0]
+        check("paused member keeps her slice in the user list"
+              " (held, not usable)",
+              gina.get("interconnect") == [20000, 20015], f"{gina}")
+        status, body = client.call("POST", "/api/settings",
+                                   {"interconnect_off_groups": "team"})
+        check("conflict: closing a stored-paused group is refused"
+              " and names the group",
+              status == 400 and "team" in body.get("error", "")
+              and "both" in body.get("error", ""), f"{status} {body}")
+        status, body = client.call("POST", "/api/settings",
+                                   {"interconnect_off_groups": "team",
+                                    "interconnect_paused_groups": "team"})
+        check("conflict: naming one group in both lists in a"
+              " single write is refused too",
+              status == 400 and "team" in body.get("error", ""),
+              f"{status} {body}")
+        status, body = client.call("GET", "/api/settings")
+        check("conflicts leave both stored lists untouched",
+              body["interconnect_off_groups"] == []
+              and body["interconnect_paused_groups"] == ["team"],
+              f"{status} {body}")
+        status, body = client.call("POST", "/api/settings",
+                                   {"interconnect_paused_groups": ""})
+        check("settings: paused list cleared, group back on",
+              status == 200
+              and body["interconnect_paused_groups"] == [],
+              f"{status} {body}")
         status, body = client.call("POST", "/api/users/gina/remove", {})
         check("interconnect test user removed again", status == 200,
               f"{status} {body}")
