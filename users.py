@@ -987,6 +987,120 @@ def get_user(conn, username):
     return row
 
 
+SHARE_PROTOCOLS = ("ss-ws", "ss", "trojan-ws", "vmess-ws", "vmess",
+                   "vless-reality", "vless-ws")
+
+
+def share_urls(conn, user, server, port=443, tls=True, protocol=None):
+    """Share URLs (Shadowrocket-importable) for one user, one entry
+    per protocol the node currently serves.
+
+    Only currently enabled protocols are generated - asking for one
+    specific protocol that is off raises ValueError rather than
+    silently omitting it, and a disabled user gets none. The WS
+    carriers ride the outer TLS when tls is set (an HTTPS endpoint
+    in front of the node), plain otherwise.
+
+    Capabilities the client enables by default but the gateway
+    cannot carry are pinned off explicitly: Shadowsocks URLs carry
+    udp=0, because the node has no UDP ingress and the WebSocket
+    plugin carries no UDP, while the client turns UDP forwarding
+    on by default - left unset, the node's UDP dies in a black
+    hole. (Mux needs no pin: the dispatcher demultiplexes it.)"""
+    if not user["enabled"]:
+        raise ValueError(f"user {user['username']} is disabled")
+    if protocol is not None and protocol not in SHARE_PROTOCOLS:
+        raise ValueError(f"unknown protocol: {protocol} "
+                         f"(choose from {', '.join(SHARE_PROTOCOLS)})")
+    host = f"[{server}]" if ":" in server \
+        and not server.startswith("[") else server
+    endpoint = f"{host}:{port}"
+    name = user["username"]
+    uuid = user["vless_uuid"]
+    out = []
+
+    def add(proto, label, url):
+        if protocol is None or protocol == proto:
+            out.append({"protocol": proto, "label": label, "url": url})
+
+    def frag(label):
+        return urllib.parse.quote(f"{name} {label}", safe="")
+
+    # Shadowsocks over WebSocket (v2ray-plugin) - always on.
+    userinfo = base64.urlsafe_b64encode(
+        f"{user['ss_method']}:{user['ss_password']}".encode()
+    ).decode().rstrip("=")
+    for p in ss_paths(conn):
+        plugin = (f"v2ray-plugin;mode=websocket;host={server};path={p}"
+                  + (";tls" if tls else ""))
+        add("ss-ws", f"Shadowsocks (WebSocket) {p}",
+            f"ss://{userinfo}@{endpoint}?plugin="
+            + urllib.parse.quote(plugin, safe="")
+            + f"&udp=0#{frag('ss-ws ' + p)}")
+    # Bare Shadowsocks - only while bare SS is enabled.
+    if ss_tcp_enabled(conn):
+        add("ss", "Shadowsocks",
+            f"ss://{userinfo}@{endpoint}?udp=0#{frag('ss')}")
+    # Trojan over WebSocket - always on.
+    for p in trojan_paths(conn):
+        q = "type=ws&host=" + urllib.parse.quote(server, safe="") \
+            + "&path=" + urllib.parse.quote(p, safe="")
+        if tls:
+            q = "security=tls&sni=" \
+                + urllib.parse.quote(server, safe="") + "&" + q
+        add("trojan-ws", f"Trojan (WebSocket) {p}",
+            f"trojan://{urllib.parse.quote(user['trojan_password'], safe='')}"
+            f"@{endpoint}?{q}#{frag('trojan-ws ' + p)}")
+    # VMess over WebSocket - always on.
+    for p in vmess_paths(conn):
+        doc = {"v": "2", "ps": f"{name} vmess-ws {p}", "add": server,
+               "port": str(port), "id": uuid, "aid": "0", "scy": "auto",
+               "net": "ws", "type": "none", "host": server, "path": p,
+               "tls": "tls" if tls else "",
+               "sni": server if tls else ""}
+        add("vmess-ws", f"VMess (WebSocket) {p}",
+            "vmess://" + base64.b64encode(
+                json.dumps(doc, separators=(",", ":")).encode()).decode())
+    # Bare VMess - only while bare VMess is enabled.
+    if vmess_tcp_enabled(conn):
+        doc = {"v": "2", "ps": f"{name} vmess", "add": server,
+               "port": str(port), "id": uuid, "aid": "0", "scy": "auto",
+               "net": "tcp", "type": "none", "host": "", "path": "",
+               "tls": "", "sni": ""}
+        add("vmess", "VMess",
+            "vmess://" + base64.b64encode(
+                json.dumps(doc, separators=(",", ":")).encode()).decode())
+    # VLESS + REALITY - only while REALITY is enabled.
+    if reality_enabled(conn):
+        sni = reality_server_names(conn)[0]
+        sid = reality_short_ids(conn)[0] \
+            if reality_short_ids(conn) else ""
+        q = ("encryption=none&flow=xtls-rprx-vision&security=reality"
+             f"&sni={urllib.parse.quote(sni, safe='')}&fp=chrome"
+             f"&pbk={urllib.parse.quote(reality_keypair(conn)[1], safe='')}"
+             f"&sid={urllib.parse.quote(sid, safe='')}&type=tcp")
+        add("vless-reality", "VLESS (REALITY)",
+            f"vless://{uuid}@{endpoint}?{q}#{frag('vless-reality')}")
+    # VLESS over WebSocket - plaintext VLESS stays off unless the
+    # operator explicitly enabled it.
+    if vless_enabled(conn):
+        for p in vless_paths(conn):
+            q = "type=ws&host=" + urllib.parse.quote(server, safe="") \
+                + "&path=" + urllib.parse.quote(p, safe="")
+            if tls:
+                q = "security=tls&sni=" \
+                    + urllib.parse.quote(server, safe="") + "&" + q
+            else:
+                q = "security=none&" + q
+            add("vless-ws", f"VLESS (WebSocket) {p}",
+                f"vless://{uuid}@{endpoint}?encryption=none&{q}"
+                f"#{frag('vless-ws ' + p)}")
+    if protocol is not None and not out:
+        raise ValueError(
+            f"protocol {protocol} is not enabled on this node")
+    return out
+
+
 def cmd_init(_):
     cfg = active_db_config()
     with db() as conn:
@@ -1184,6 +1298,22 @@ def cmd_list(_):
         print(f"{r['username']:<20} enabled={bool(r['enabled'])!s:<5} group={r['upstream_group']:<10} "
               f"ssh_key={key} created={r['created_at']}"
               + (f" interconnect={ic[0]}-{ic[1]}" if ic else ""))
+
+
+def cmd_share(args):
+    with db() as conn:
+        user = get_user(conn, args.user)
+        try:
+            urls = share_urls(conn, user, args.server, args.port,
+                              tls=not args.no_tls,
+                              protocol=args.protocol)
+        except ValueError as exc:
+            sys.exit(str(exc))
+    if JSON_OUT:
+        print(json.dumps(urls, indent=2))
+        return
+    for e in urls:
+        print(f"{e['label']}: {e['url']}")
 
 
 def cmd_setgroup(args):
@@ -3916,6 +4046,15 @@ def main():
     a.set_defaults(fn=lambda args: cmd_flag(args, 0))
     a = sub.add_parser("remove"); a.add_argument("user"); a.set_defaults(fn=cmd_remove)
     sub.add_parser("list").set_defaults(fn=cmd_list)
+    a = sub.add_parser("share"); a.add_argument("user")
+    a.add_argument("--server", required=True,
+                   help="public host clients connect to")
+    a.add_argument("--port", type=int, default=443)
+    a.add_argument("--no-tls", action="store_true",
+                   help="the public endpoint is plain HTTP (no TLS "
+                        "in front), so WS carriers run unencrypted")
+    a.add_argument("--protocol", choices=SHARE_PROTOCOLS)
+    a.set_defaults(fn=cmd_share)
     a = sub.add_parser("upstream-add"); a.add_argument("name")
     a.add_argument("--addr", required=True); a.add_argument("--port", type=int, required=True)
     a.add_argument("--proto", required=True,

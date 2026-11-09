@@ -70,6 +70,328 @@ BIND = os.environ.get("XMAGIC_ADMIN_BIND", "127.0.0.1")
 PORT = int(os.environ.get("XMAGIC_ADMIN_PORT", "8090"))
 
 
+# --- QR codes for the share panel -------------------------------------
+# Minimal QR encoder (ISO/IEC 18004): byte mode, error-correction
+# level M, versions 1-15 - enough for every share URL this node
+# mints (<= 412 payload bytes). The mask is chosen by the standard
+# penalty rules. Renders to a single-path inline SVG so the console
+# stays one self-contained page with no image assets. Matrices were
+# verified module-for-module against an independent implementation.
+
+# version: (total codewords, ecc codewords per block,
+#           ((blocks, data codewords per block), ...)) - level M
+_QR_ECC_M = {
+    1: (26, 10, ((1, 16),)),
+    2: (44, 16, ((1, 28),)),
+    3: (70, 26, ((1, 44),)),
+    4: (100, 18, ((2, 32),)),
+    5: (134, 24, ((2, 43),)),
+    6: (172, 16, ((4, 27),)),
+    7: (196, 18, ((4, 31),)),
+    8: (242, 22, ((2, 38), (2, 39))),
+    9: (292, 22, ((3, 36), (2, 37))),
+    10: (346, 26, ((4, 43), (1, 44))),
+    11: (404, 30, ((1, 50), (4, 51))),
+    12: (466, 22, ((6, 36), (2, 37))),
+    13: (532, 22, ((8, 37), (1, 38))),
+    14: (581, 24, ((4, 40), (5, 41))),
+    15: (655, 24, ((5, 41), (5, 42))),
+}
+_QR_ALIGN = {2: (6, 18), 3: (6, 22), 4: (6, 26), 5: (6, 30),
+             6: (6, 34), 7: (6, 22, 38), 8: (6, 24, 42),
+             9: (6, 26, 46), 10: (6, 28, 50), 11: (6, 30, 54),
+             12: (6, 32, 58), 13: (6, 34, 62), 14: (6, 26, 46, 66),
+             15: (6, 26, 48, 70)}
+_QR_REMAINDER = (0, 7, 7, 7, 7, 7, 0, 0, 0, 0, 0, 0, 0, 3, 3)
+
+
+def _qr_gf_mul(x, y):
+    """Multiply in GF(256) modulo x^8+x^4+x^3+x^2+1."""
+    z = 0
+    for i in range(7, -1, -1):
+        z = (z << 1) ^ ((z >> 7) * 0x11D)
+        if (y >> i) & 1:
+            z ^= x
+    return z
+
+
+def _qr_rs_divisor(degree):
+    result = [0] * (degree - 1) + [1]
+    root = 1
+    for _ in range(degree):
+        for j in range(len(result)):
+            result[j] = _qr_gf_mul(result[j], root)
+            if j + 1 < len(result):
+                result[j] ^= result[j + 1]
+        root = _qr_gf_mul(root, 0x02)
+    return result
+
+
+def _qr_rs_remainder(data, divisor):
+    result = [0] * len(divisor)
+    for b in data:
+        factor = b ^ result.pop(0)
+        result.append(0)
+        for i, coef in enumerate(divisor):
+            result[i] ^= _qr_gf_mul(coef, factor)
+    return result
+
+
+def _qr_final_bits(data, version):
+    """The interleaved data+ecc bit stream for one payload."""
+    _, ecc_len, groups = _QR_ECC_M[version]
+    total_data = sum(n * d for n, d in groups)
+    capacity = total_data * 8
+    bits = []
+
+    def put(val, n):
+        for i in range(n - 1, -1, -1):
+            bits.append((val >> i) & 1)
+
+    put(0b0100, 4)                                # byte mode
+    put(len(data), 8 if version <= 9 else 16)
+    for b in data:
+        put(b, 8)
+    if len(bits) > capacity:
+        return None
+    bits += [0] * min(4, capacity - len(bits))    # terminator
+    bits += [0] * (-len(bits) % 8)                # byte alignment
+    i = 0
+    while len(bits) < capacity:                   # pad codewords
+        put((0xEC, 0x11)[i % 2], 8)
+        i += 1
+    codewords = bytearray()
+    for i in range(0, len(bits), 8):
+        v = 0
+        for bit in bits[i:i + 8]:
+            v = (v << 1) | bit
+        codewords.append(v)
+    divisor = _qr_rs_divisor(ecc_len)
+    blocks = []
+    pos = 0
+    for count, dlen in groups:
+        for _ in range(count):
+            chunk = bytes(codewords[pos:pos + dlen])
+            pos += dlen
+            blocks.append(
+                (chunk, _qr_rs_remainder(chunk, divisor)))
+    stream = bytearray()
+    for i in range(max(len(b[0]) for b in blocks)):
+        for chunk, _ in blocks:
+            if i < len(chunk):
+                stream.append(chunk[i])
+    for i in range(ecc_len):
+        for _, ecc in blocks:
+            stream.append(ecc[i])
+    out = []
+    for b in stream:
+        for i in range(7, -1, -1):
+            out.append((b >> i) & 1)
+    out += [0] * _QR_REMAINDER[version - 1]
+    return out
+
+
+def _qr_format_bits(mask):
+    data = mask                     # level M's indicator bits are 00
+    rem = data
+    for _ in range(10):
+        rem = (rem << 1) ^ ((rem >> 9) * 0x537)
+    return ((data << 10) | rem) ^ 0x5412
+
+
+def _qr_version_bits(version):
+    # (version << 12) reduced modulo the BCH generator
+    # x^12+x^11+x^10+x^9+x^8+x^5+x^2+1 (0x1F25).
+    x = version << 12
+    for bit in range(17, 11, -1):
+        if x & (1 << bit):
+            x ^= 0x1F25 << (bit - 12)
+    return (version << 12) | (x & 0xFFF)
+
+
+def _qr_render(version, bits, mask):
+    """The module matrix for one payload bit stream under one mask."""
+    size = version * 4 + 17
+    modules = [[False] * size for _ in range(size)]
+    function = [[False] * size for _ in range(size)]
+
+    def set_function(x, y, dark):
+        if 0 <= x < size and 0 <= y < size:
+            modules[y][x] = dark
+            function[y][x] = True
+
+    # Timing patterns (finder patterns overwrite the overlaps).
+    for i in range(size):
+        set_function(6, i, i % 2 == 0)
+        set_function(i, 6, i % 2 == 0)
+    # Finder patterns.
+    for cx, cy in ((3, 3), (size - 4, 3), (3, size - 4)):
+        for dy in range(-4, 5):
+            for dx in range(-4, 5):
+                dist = max(abs(dx), abs(dy))
+                set_function(cx + dx, cy + dy,
+                             dist != 2 and dist != 4)
+    # Alignment patterns.
+    if version > 1:
+        centers = _QR_ALIGN[version]
+        for cy in centers:
+            for cx in centers:
+                if (cx, cy) in ((centers[0], centers[0]),
+                                (centers[0], centers[-1]),
+                                (centers[-1], centers[0])):
+                    continue                # finder territory
+                for dy in range(-2, 3):
+                    for dx in range(-2, 3):
+                        set_function(cx + dx, cy + dy,
+                                     max(abs(dx), abs(dy)) != 1)
+    # Version information (versions >= 7).
+    if version >= 7:
+        vbits = _qr_version_bits(version)
+        for i in range(18):
+            bit = ((vbits >> i) & 1) != 0
+            set_function(size - 11 + i % 3, i // 3, bit)
+            set_function(i // 3, size - 11 + i % 3, bit)
+
+    def draw_format(m):
+        fbits = _qr_format_bits(m)
+
+        def bit(i):
+            return ((fbits >> i) & 1) != 0
+
+        for i in range(6):
+            set_function(8, i, bit(i))
+        set_function(8, 7, bit(6))
+        set_function(8, 8, bit(7))
+        set_function(7, 8, bit(8))
+        for i in range(9, 15):
+            set_function(14 - i, 8, bit(i))
+        for i in range(8):
+            set_function(size - 1 - i, 8, bit(i))
+        for i in range(8, 15):
+            set_function(8, size - 15 + i, bit(i))
+        set_function(8, size - 8, True)     # dark module
+
+    draw_format(0)          # reserve the format cells as function
+    # Data placement, zigzag from the bottom right.
+    i = 0
+    right = size - 1
+    while right >= 1:
+        if right == 6:
+            right = 5
+        upward = ((right + 1) & 2) == 0
+        for vert in range(size):
+            y = size - 1 - vert if upward else vert
+            for dx in range(2):
+                x = right - dx
+                if not function[y][x] and i < len(bits):
+                    dark = bits[i] == 1
+                    i += 1
+                    if mask == 0:
+                        flip = (y + x) % 2 == 0
+                    elif mask == 1:
+                        flip = y % 2 == 0
+                    elif mask == 2:
+                        flip = x % 3 == 0
+                    elif mask == 3:
+                        flip = (y + x) % 3 == 0
+                    elif mask == 4:
+                        flip = (y // 2 + x // 3) % 2 == 0
+                    elif mask == 5:
+                        flip = (y * x) % 2 + (y * x) % 3 == 0
+                    elif mask == 6:
+                        flip = ((y * x) % 2 + (y * x) % 3) % 2 == 0
+                    else:
+                        flip = ((y + x) % 2 + (y * x) % 3) % 2 == 0
+                    modules[y][x] = dark != flip
+        right -= 2
+    draw_format(mask)       # the real format bits for this mask
+    return modules
+
+
+def _qr_penalty(m):
+    size = len(m)
+    penalty = 0
+    lines = list(m) + [[m[y][x] for y in range(size)]
+                       for x in range(size)]
+    for line in lines:
+        run_color = line[0]
+        run = 1
+        for cell in line[1:]:
+            if cell == run_color:
+                run += 1
+            else:
+                if run >= 5:
+                    penalty += run - 2        # 3 + (run - 5)
+                run_color = cell
+                run = 1
+        if run >= 5:
+            penalty += run - 2
+        for i in range(size - 6):
+            if line[i:i + 7] == [True, False, True, True, True,
+                                 False, True]:
+                before = i >= 4 and not any(line[i - 4:i])
+                after = i + 11 <= size \
+                    and not any(line[i + 7:i + 11])
+                edge = i < 4 or i + 11 > size
+                if before or after or edge:
+                    penalty += 40
+    for y in range(size - 1):
+        for x in range(size - 1):
+            c = m[y][x]
+            if m[y][x + 1] == c and m[y + 1][x] == c \
+                    and m[y + 1][x + 1] == c:
+                penalty += 3
+    dark = sum(row.count(True) for row in m)
+    total = size * size
+    k = (abs(dark * 20 - total * 10) + total - 1) // total - 1
+    if k > 0:
+        penalty += k * 10
+    return penalty
+
+
+def qr_matrix(data, mask=None):
+    """Module matrix (True = dark) for data (bytes), or None when
+    it exceeds a version-15 symbol. mask forces one mask pattern;
+    the default evaluates all eight by the penalty rules."""
+    version = None
+    for v in range(1, 16):
+        total_data = sum(n * d for n, d in _QR_ECC_M[v][2])
+        if 4 + (8 if v <= 9 else 16) + 8 * len(data) \
+                <= total_data * 8:
+            version = v
+            break
+    if version is None:
+        return None
+    bits = _qr_final_bits(data, version)
+    if mask is not None:
+        return _qr_render(version, bits, mask)
+    best, best_score = None, None
+    for m in range(8):
+        candidate = _qr_render(version, bits, m)
+        score = _qr_penalty(candidate)
+        if best_score is None or score < best_score:
+            best, best_score = candidate, score
+    return best
+
+
+def qr_svg(text):
+    """An inline SVG QR code for text, or None when too long."""
+    matrix = qr_matrix(text.encode("utf-8"))
+    if matrix is None:
+        return None
+    size = len(matrix)
+    border = 4
+    dim = size + border * 2
+    path = "".join(
+        f"M{x + border} {y + border}h1v1h-1z"
+        for y, row in enumerate(matrix)
+        for x, dark in enumerate(row) if dark)
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" '
+            f'viewBox="0 0 {dim} {dim}">'
+            f'<rect width="{dim}" height="{dim}" fill="#ffffff"/>'
+            f'<path d="{path}" fill="#000000"/></svg>')
+
+
 def _blog(msg):
     """Boot diagnostics, flushed immediately: a startup that hangs
     or dies must leave its last completed step in the log, which a
@@ -837,6 +1159,48 @@ def api_add_user(body):
     applied = apply_changes()
     return {"user": _user_dict(row, with_secrets=True), "applied": applied,
             "vless_enabled": v_on, "ssh_enabled": users_mod.ssh_enabled()}
+
+
+def api_user_share(username, body, headers):
+    """Client share URLs for one user, each with a QR code (the
+    remote CLI prints the same URLs without codes). The public
+    endpoint is the one this very request arrived on - server from
+    Origin/Host like the Passkey RP id, port from the Host header,
+    TLS unless the origin is plain http - because the console is
+    always reached through the node's public face. Body fields
+    server/port/tls override (the remote CLI passes its registered
+    node URL through). Only protocols the node currently enables
+    are generated; asking for a disabled one is an error."""
+    server = (body.get("server") or "").strip() or rp_id_for(headers)
+    if not server:
+        raise ApiError(400, "cannot tell the node's public address"
+                            " from the request; pass server")
+    origin = headers.get("Origin") or ""
+    tls = not origin.startswith("http://")
+    hostport = (headers.get("Host") or "").rsplit("]", 1)[-1]
+    port = 443 if tls else 80
+    if ":" in hostport:
+        try:
+            port = int(hostport.rsplit(":", 1)[1])
+        except ValueError:
+            pass
+    if body.get("port"):
+        port = int(body["port"])
+    if body.get("tls") is not None:
+        tls = bool(body["tls"])
+    with users_mod.db() as conn:
+        row = conn.execute("SELECT * FROM users WHERE username = ?",
+                           (username,)).fetchone()
+        if row is None:
+            raise ApiError(404, f"no such user: {username}")
+        try:
+            urls = users_mod.share_urls(
+                conn, row, server, port, tls=tls,
+                protocol=body.get("protocol") or None)
+        except ValueError as exc:
+            raise ApiError(400, str(exc))
+    return {"urls": [dict(e, qr=qr_svg(e["url"])) for e in urls]}
+
 
 
 def api_user_action(username, action, body):
@@ -1631,7 +1995,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send_json(201, api_add_user(body))
         elif path.startswith("/api/users/"):
             username, _, action = path[len("/api/users/"):].partition("/")
-            self._send_json(200, api_user_action(username, action, body))
+            if action == "share":
+                self._send_json(200, api_user_share(username, body,
+                                                    self.headers))
+            else:
+                self._send_json(200, api_user_action(username, action,
+                                                     body))
         elif path == "/api/upstreams":
             self._send_json(201, api_add_upstream(body))
         elif path.startswith("/api/upstreams/"):
@@ -1677,6 +2046,10 @@ html,body{margin:0;padding:0}
 body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;
   background:var(--bg);color:var(--text);font-size:14px;line-height:1.55}
 .hidden{display:none!important}
+.share-item{display:flex;gap:14px;padding:10px 0;border-top:1px solid var(--border)}
+.share-qr{width:128px;flex:none}
+.share-qr svg{width:100%;height:auto;display:block}
+.share-body{min-width:0}
 button{font:inherit;cursor:pointer;border:1px solid var(--border-strong);background:#fff;color:var(--text);
   border-radius:8px;padding:.42rem .85rem;font-size:.85rem;transition:background .12s,border-color .12s}
 button:hover{background:#f2f5fa}
@@ -1870,6 +2243,14 @@ td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
           </div>
           <div id="user-panel-list">
             <div class="tbl-wrap"><table id="users-table"></table></div>
+            <div id="share-panel" class="hidden">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-top:14px">
+                <h3 id="share-title" style="margin:0">分享链接</h3>
+                <button type="button" class="sm ghost" id="share-close">关闭</button>
+              </div>
+              <p class="sub">导入 Shadowrocket、v2rayN 等客户端，只包含当前已启用的协议。</p>
+              <div id="share-list"></div>
+            </div>
           </div>
           <div id="user-panel-form" class="hidden">
           <form id="form-user">
@@ -2242,7 +2623,8 @@ async function refresh() {
       <td><span class="badge ${u.enabled ? "on" : "off"}">${u.enabled ? "启用" : "停用"}</span></td>
       <td><code>vless uuid ${u.vless_uuid}${window.__vlessOn ? "" : "（未启用）"}<br>密码 ${u.password}<br>ss ${u.ss_method} / ${u.ss_password}` +
       `${u.ssh_key ? "<br>SSH 公钥已登记" + (u.ssh_fingerprint ? " " + u.ssh_fingerprint : "") + (window.__sshOn ? "<br>ssh -D 1080 -N -i xmagic-" + u.username + ".key -p " + s.public_port + " proxy@" + location.hostname : "（未启用）") : ""}${u.interconnect && window.__sshOn ? "<br>组内互访端口 " + u.interconnect[0] + "-" + u.interconnect[1] : ""}</code></td>
-      <td><div class="row-actions"><button class="sm" data-act="passwd" data-u="${u.username}">换密码</button>
+      <td><div class="row-actions"><button class="sm" data-act="share" data-u="${u.username}">分享</button>
+      <button class="sm" data-act="passwd" data-u="${u.username}">换密码</button>
       <button class="sm" data-act="rotate-uuid" data-u="${u.username}">换UUID</button>
       <button class="sm" data-act="setkey" data-u="${u.username}"${window.__sshOn ? "" : " disabled"}>公钥</button>
       <button class="sm" data-act="setgroup" data-u="${u.username}" data-g="${u.group}">分组</button>
@@ -2561,11 +2943,27 @@ document.addEventListener("click", async e => {
       await api(`/api/databases/${t.dataset.dbremove}/remove`, {});
       msg("配置已删除", true); refresh(); }
   } catch (err) { msg(String(err)); } });
+function showShare(username, r) {
+  $("share-title").textContent = "分享链接：" + username;
+  $("share-list").innerHTML = r.urls.map(e =>
+    `<div class="share-item"><div class="share-qr">${e.qr || ""}</div>` +
+    `<div class="share-body"><strong>${e.label}</strong><br><code>${e.url}</code><br>` +
+    `<button type="button" class="sm" data-copy="${encodeURIComponent(e.url)}">复制链接</button></div></div>`).join("");
+  $("share-panel").classList.remove("hidden");
+  $("share-panel").scrollIntoView({block: "nearest"});
+}
+document.addEventListener("click", async e => {
+  const c = e.target.closest("button[data-copy]");
+  if (c) { try { await navigator.clipboard.writeText(decodeURIComponent(c.dataset.copy));
+      msg("链接已复制", true); } catch (err) { msg(String(err)); } return; }
+  if (e.target.closest("#share-close")) $("share-panel").classList.add("hidden");
+});
 document.addEventListener("click", async e => {
   const b = e.target.closest("button[data-act]"); if (!b) return;
   const act = b.dataset.act;
   try {
     let r, body = {};
+    if (act === "share") { showShare(b.dataset.u, await api(`/api/users/${b.dataset.u}/share`, {})); return; }
     if (act === "setkey") { const v = prompt("SSH 公钥（留空 = 清除）"); if (v === null) return; body = {ssh_pubkey: v}; }
     if (act === "setgroup") { const v = prompt("上级分组", b.dataset.g || "default"); if (v === null) return; body = {group: v}; }
     if (act === "setmethod") { const v = prompt("SS 方法", b.dataset.m || ""); if (v === null) return; body = {method: v}; }

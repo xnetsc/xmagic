@@ -9,6 +9,7 @@ wrong key rejected -> gateway-user management -> admin-reset.
 
 Run: python3 tests/test_admin.py
 """
+import base64
 import hashlib
 import http.client
 import json
@@ -362,6 +363,50 @@ def main():
                                    {"note": "primary"})
         check("setnote applies", status == 200
               and body.get("user", {}).get("note") == "primary", f"{status} {body}")
+
+        # --- share URLs + QR: only enabled protocols, explicit
+        # endpoint override wins over the request-derived one
+        status, body = client.call("GET", "/api/users")
+        alice = next(u for u in body["users"]
+                     if u["username"] == "alice")
+        status, body = client.call("POST", "/api/users/alice/share",
+                                   {"server": "node.example.com",
+                                    "port": 443, "tls": True})
+        protos = sorted(e["protocol"] for e in body.get("urls", []))
+        check("share: only enabled protocols are generated",
+              status == 200 and protos == ["ss-ws", "trojan-ws",
+                                           "vless-ws", "vmess-ws"],
+              f"{status} {protos}")
+        by_proto = {e["protocol"]: e for e in body.get("urls", [])}
+        ss_url = by_proto.get("ss-ws", {}).get("url", "")
+        ui = ss_url.split("ss://", 1)[1].split("@", 1)[0]
+        cred = base64.urlsafe_b64decode(
+            ui + "=" * (-len(ui) % 4)).decode()
+        check("share: ss userinfo carries alice's method + password",
+              cred == f"{alice['ss_method']}:{alice['ss_password']}",
+              cred)
+        check("share: ss pins udp off; trojan aims at the node host",
+              "&udp=0" in ss_url.split("#", 1)[0] and all(
+                  e["url"].startswith("trojan://")
+                  and "@node.example.com:443" in e["url"]
+                  for e in body["urls"]
+                  if e["protocol"] == "trojan-ws"))
+        check("share: every entry carries an svg qr code",
+              all((e.get("qr") or "").startswith("<svg")
+                  and "viewBox=" in e["qr"] for e in body["urls"]))
+        status, body = client.call("POST", "/api/users/alice/share",
+                                   {"protocol": "ss"})
+        check("share: a disabled protocol is refused",
+              status == 400 and "not enabled" in body.get("error", ""),
+              f"{status} {body}")
+        status, body = client.call("POST", "/api/users/alice/share",
+                                   {"protocol": "trojan-ws"})
+        check("share: a single-protocol request narrows the list",
+              status == 200
+              and [e["protocol"] for e in body["urls"]] == ["trojan-ws"],
+              f"{status} {body}")
+        status, _ = client.call("POST", "/api/users/nobody/share", {})
+        check("share: unknown user is a 404", status == 404, f"{status}")
 
         status, body = client.call("POST", "/api/upstreams",
                                    {"name": "up-a", "protocol": "ss",

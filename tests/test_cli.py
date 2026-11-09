@@ -1919,6 +1919,116 @@ JHde4tAsdlXZGG6MF7TiAAAAEHhtYWdpYyBmaXh0dXJlLWIBAgMEBQ==
           == [21584, 21599]
           and trz3_info["interconnect_paused_groups"] == [], out)
 
+    # ---- share URLs: only currently enabled protocols, exact shapes
+    rc, out, _ = cli("--json", "list")
+    alice = {u["username"]: u for u in json.loads(out)}["alice"]
+    rc, out, _ = cli("--json", "settings")
+    info = json.loads(out)
+    rc, out, err = cli("--json", "share", "alice",
+                       "--server", "node.example.com")
+    urls = json.loads(out) if rc == 0 else []
+    by_proto = {e["protocol"]: e["url"] for e in urls}
+    want_protos = (["ss-ws"] * len(info["ss_ws_paths"])
+                   + ["trojan-ws"] * len(info["trojan_ws_paths"])
+                   + ["vmess-ws"] * len(info["vmess_ws_paths"])
+                   + (["ss"] if info["ss_tcp_enabled"] else [])
+                   + (["vmess"] if info["vmess_tcp_enabled"] else [])
+                   + (["vless-reality"] if info["reality_enabled"]
+                      else [])
+                   + (["vless-ws"] * len(info["vless_ws_paths"])
+                      if info["vless_enabled"] else []))
+    check("share: exactly the currently enabled protocols, "
+          "one entry per WS path",
+          rc == 0 and sorted(e["protocol"] for e in urls)
+          == sorted(want_protos), err + out)
+    import base64 as _b64
+    import urllib.parse as _up
+    def entries(proto):
+        return [e["url"] for e in urls if e["protocol"] == proto]
+
+    ss_url = entries("ss-ws")[0] if entries("ss-ws") else ""
+    userinfo = ss_url.split("@")[0][len("ss://"):]
+    decoded = _b64.urlsafe_b64decode(
+        userinfo + "=" * (-len(userinfo) % 4)).decode()
+    check("share: ss-ws userinfo carries the user's method+password",
+          decoded == f"{alice['ss_method']}:{alice['ss_password']}",
+          ss_url)
+    plugins = [_up.parse_qs(_up.urlsplit(u).query).get("plugin",
+                                                       [""])[0]
+               for u in entries("ss-ws")]
+    plugin_paths = sorted(p.split(";path=", 1)[1].split(";")[0]
+                          for p in plugins)
+    check("share: ss-ws plugin is v2ray-plugin websocket + tls, "
+          "one per configured path",
+          all(p.startswith("v2ray-plugin;mode=websocket;"
+                           "host=node.example.com;")
+              and p.endswith(";tls") for p in plugins)
+          and plugin_paths == sorted(info["ss_ws_paths"]),
+          str(plugins))
+    check("share: ss-ws pins udp off (client default is on, the "
+          "gateway cannot carry it)",
+          all(_up.parse_qs(_up.urlsplit(u).query).get("udp") == ["0"]
+              for u in entries("ss-ws")), ss_url)
+    trojan_path = info["trojan_ws_paths"][0]
+    trojan_url = next(
+        (u for u in entries("trojan-ws")
+         if ("path=" + _up.quote(trojan_path, safe="")) in u), "")
+    check("share: trojan-ws carries password, tls, sni, host, path",
+          trojan_url.startswith(
+              f"trojan://{alice['password']}@node.example.com:443?")
+          and "security=tls" in trojan_url
+          and "sni=node.example.com" in trojan_url,
+          trojan_url)
+    vdocs = [json.loads(_b64.b64decode(u.split("://", 1)[1]))
+             for u in entries("vmess-ws")]
+    check("share: vmess-ws json carries uuid, ws, path, tls",
+          bool(vdocs)
+          and all(d.get("id") == alice["vless_uuid"]
+                  and d.get("net") == "ws"
+                  and d.get("tls") == "tls"
+                  and d.get("add") == "node.example.com"
+                  and d.get("port") == "443" for d in vdocs)
+          and sorted(d["path"] for d in vdocs)
+          == sorted(info["vmess_ws_paths"]), str(vdocs))
+    rc, out, err = cli("share", "alice", "--server", "node.example.com",
+                       "--protocol", "vless-reality")
+    check("share: a disabled protocol is refused, not omitted",
+          rc != 0 and "not enabled" in err, err + out)
+    rc, out, err = cli("share", "alice", "--server", "node.example.com",
+                       "--protocol", "ss")
+    check("share: bare ss refused while ss_tcp is off",
+          rc != 0 and "not enabled" in err, err + out)
+    rc, _, err = cli("settings", "--ss-tcp", "on")
+    assert rc == 0, err
+    rc, out, err = cli("--json", "share", "alice",
+                       "--server", "node.example.com",
+                       "--protocol", "ss")
+    one = json.loads(out) if rc == 0 else []
+    check("share: bare ss appears once enabled, udp pinned off",
+          rc == 0 and len(one) == 1
+          and one[0]["url"].startswith("ss://")
+          and "udp=0" in one[0]["url"], err + out)
+    rc, _, err = cli("settings", "--reality", "on")
+    assert rc == 0, err
+    rc, out, err = cli("--json", "share", "alice",
+                       "--server", "node.example.com",
+                       "--protocol", "vless-reality")
+    one = json.loads(out) if rc == 0 else []
+    check("share: reality url carries pbk/sid/sni/flow once enabled",
+          rc == 0 and len(one) == 1
+          and one[0]["url"].startswith(
+              f"vless://{alice['vless_uuid']}@node.example.com:443?")
+          and "security=reality" in one[0]["url"]
+          and "flow=xtls-rprx-vision" in one[0]["url"]
+          and "pbk=" in one[0]["url"], err + out)
+    rc, _, err = cli("disable", "alice")
+    assert rc == 0, err
+    rc, out, err = cli("share", "alice", "--server", "node.example.com")
+    check("share: a disabled user gets no urls",
+          rc != 0 and "disabled" in err, err + out)
+    rc, _, err = cli("enable", "alice")
+    assert rc == 0, err
+
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     return 1 if FAIL else 0
 

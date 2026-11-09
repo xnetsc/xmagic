@@ -164,6 +164,40 @@ def unit_checks():
           sniff._first_data_frame(ws_frame(2, payload), skip_head=True)
           == (2, 50, payload))
 
+    # Mux.Cool recognition for SS-WS demultiplexing. The frame head
+    # below is a real muxed client's first flight, captured live:
+    # meta length 12, session 0x29, New + target, TCP, port 0,
+    # 127.0.0.1, then the data length.
+    mux_head = bytes.fromhex("000c00290101010000017f0000010059")
+    check("mux recognizer accepts the captured session frame",
+          sniff._mux_open_state(mux_head) is True)
+    check("mux recognizer waits for the full meta + length",
+          sniff._mux_open_state(mux_head[:10]) is None)
+    check("mux recognizer rejects a raw stream head",
+          sniff._mux_open_state(bytes(range(64))) is False)
+    bad = bytearray(mux_head)
+    bad[4] = 0x02
+    check("mux recognizer rejects a non-New status",
+          sniff._mux_open_state(bytes(bad)) is False)
+    payload2, consumed = sniff._frames_payload(
+        ws_frame(2, b"abc") + ws_frame(9, b"zz") + ws_frame(2, b"de"))
+    check("frame payload walk concatenates data, skips control",
+          payload2 == b"abcde" and consumed > 0)
+
+    use_config({"inbounds": [
+        {"tag": "ss-ws-0", "protocol": "shadowsocks", "port": 12300,
+         "streamSettings": {"wsSettings": {"path": "/xmagic"}}},
+        {"tag": "ss-ws-1", "protocol": "shadowsocks", "port": 12301,
+         "streamSettings": {"wsSettings": {"path": "/other"}}},
+        {"tag": "trojan-ws-0", "protocol": "trojan", "port": 12000,
+         "streamSettings": {"wsSettings": {"path": "/trojan-ws"}}},
+    ]})
+    sniff._SS_WS_CACHE["key"] = None
+    check("ss-ws routes come from the rendered config",
+          sniff._ss_ws_routes() == {"/xmagic": 12300, "/other": 12301})
+    del os.environ["XMAGIC_XRAY_CONFIG"]
+    sniff._SS_WS_CACHE["key"] = None
+
 
 def main():
     unit_checks()
@@ -407,6 +441,268 @@ def main():
         got = ws_probe(head, marker)
         check("WS without the header: forwarded byte-identical",
               got == head + marker, f"got {got!r}")
+
+        # phase 5: SS-WS Mux.Cool demultiplexing. A second config
+        # maps /ss-ws to a stub WS backend; the mux port gets a WS
+        # echo stub. A raw client must stay on the mux splice; a
+        # muxed client must be fanned out to per-session backend
+        # connections with its stream bytes intact.
+        proc.terminate()
+        proc.wait(timeout=5)
+        for _ in range(50):
+            try:
+                socket.create_connection(("127.0.0.1", PUBLIC),
+                                         timeout=0.3).close()
+                time.sleep(0.1)
+            except OSError:
+                break
+
+        def ws_server(port, reply, records):
+            import hashlib as _hl
+            srv = socket.socket()
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind(("127.0.0.1", port))
+            srv.listen(8)
+            srv.settimeout(0.3)
+            cid = [0]
+
+            def serve_conn(conn):
+                cid[0] += 1
+                me = cid[0]
+                records.append(("open", me, b""))
+                try:
+                    conn.settimeout(4)
+                    buf = b""
+                    while b"\r\n\r\n" not in buf:
+                        chunk = conn.recv(4096)
+                        if not chunk:
+                            return
+                        buf += chunk
+                    head, _, buf = buf.partition(b"\r\n\r\n")
+                    key = b""
+                    for line in head.split(b"\r\n"):
+                        if line.lower().startswith(
+                                b"sec-websocket-key:"):
+                            key = line.split(b":", 1)[1].strip()
+                    accept = base64.b64encode(_hl.sha1(
+                        key + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+                    ).digest())
+                    conn.sendall(b"HTTP/1.1 101 Switching Protocols\r\n"
+                                 b"Upgrade: websocket\r\n"
+                                 b"Connection: Upgrade\r\n"
+                                 b"Sec-WebSocket-Accept: " + accept
+                                 + b"\r\n\r\n")
+                    while True:
+                        while len(buf) < 2:
+                            chunk = conn.recv(65536)
+                            if not chunk:
+                                return
+                            buf += chunk
+                        b1 = buf[1]
+                        ln = b1 & 0x7F
+                        p = 2
+                        if ln == 126:
+                            while len(buf) < 4:
+                                buf += conn.recv(65536)
+                            ln = int.from_bytes(buf[2:4], "big")
+                            p = 4
+                        mask = None
+                        if b1 & 0x80:
+                            while len(buf) < p + 4:
+                                chunk = conn.recv(65536)
+                                if not chunk:
+                                    return
+                                buf += chunk
+                            mask = buf[p:p + 4]
+                            p += 4
+                        while len(buf) < p + ln:
+                            chunk = conn.recv(65536)
+                            if not chunk:
+                                return
+                            buf += chunk
+                        payload = bytes(buf[p:p + ln])
+                        buf = buf[p + ln:]
+                        if mask:
+                            payload = bytes(
+                                b ^ mask[i % 4]
+                                for i, b in enumerate(payload))
+                        records.append(("data", me, payload))
+                        out = reply(payload)
+                        if out is not None:
+                            conn.sendall(bytes([0x82, len(out)]) + out)
+                except OSError:
+                    pass
+                finally:
+                    records.append(("close", me, b""))
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
+
+            while not stop.is_set():
+                try:
+                    conn, _ = srv.accept()
+                except socket.timeout:
+                    continue
+                threading.Thread(target=serve_conn, args=(conn,),
+                                 daemon=True).start()
+            srv.close()
+
+        echo_records, be_records = [], []
+        mux_echo_port = BASE + 72
+        ssbe_port = BASE + 71
+        threading.Thread(target=ws_server,
+                         args=(mux_echo_port, lambda p: p, echo_records),
+                         daemon=True).start()
+        threading.Thread(target=ws_server,
+                         args=(ssbe_port, lambda p: p.upper(), be_records),
+                         daemon=True).start()
+        cfg_dir = tempfile.mkdtemp(prefix="xmagic-sniff-p5-")
+        cfg_path = os.path.join(cfg_dir, "config.json")
+        with open(cfg_path, "w") as f:
+            json.dump({"inbounds": [{
+                "tag": "ss-ws-0", "protocol": "shadowsocks",
+                "port": ssbe_port,
+                "streamSettings": {"network": "ws",
+                                   "wsSettings": {"path": "/ss-ws"}}}]},
+                f)
+        proc = subprocess.Popen(
+            [sys.executable, os.path.join(ROOT, "sniff.py")],
+            env=dict(env, XRAY_MUX_PORT=str(mux_echo_port),
+                     XMAGIC_XRAY_CONFIG=cfg_path),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        for _ in range(50):
+            try:
+                socket.create_connection(("127.0.0.1", PUBLIC),
+                                         timeout=0.3).close()
+                break
+            except OSError:
+                time.sleep(0.1)
+
+        def ws_open(path):
+            c = socket.create_connection(("127.0.0.1", PUBLIC),
+                                         timeout=5)
+            key = base64.b64encode(b"0123456789abcdef").decode()
+            c.sendall((f"GET {path} HTTP/1.1\r\nHost: h\r\n"
+                       "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                       f"Sec-WebSocket-Key: {key}\r\n"
+                       "Sec-WebSocket-Version: 13\r\n\r\n").encode())
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                chunk = c.recv(4096)
+                if not chunk:
+                    raise ConnectionError("no handshake response")
+                buf += chunk
+            head, _, rest = buf.partition(b"\r\n\r\n")
+            if not head.startswith(b"HTTP/1.1 101"):
+                raise ConnectionError(f"bad handshake: {head!r}")
+            return c, bytearray(rest)
+
+        def ws_send(c, payload):
+            mask = b"\x0a\x0b\x0c\x0d"
+            n = len(payload)
+            hdr = bytes([0x82, 0x80 | n]) if n < 126 else \
+                bytes([0x82, 0x80 | 126]) + n.to_bytes(2, "big")
+            body = bytes(b ^ mask[i % 4]
+                         for i, b in enumerate(payload))
+            c.sendall(hdr + mask + body)
+
+        def ws_recv(c, buf):
+            while True:
+                if len(buf) >= 2:
+                    ln = buf[1] & 0x7F
+                    p = 2
+                    if ln == 126:
+                        if len(buf) < 4:
+                            ln = -1
+                        else:
+                            ln = int.from_bytes(buf[2:4], "big")
+                            p = 4
+                    if ln >= 0 and len(buf) >= p + ln:
+                        payload = bytes(buf[p:p + ln])
+                        del buf[:p + ln]
+                        return payload
+                chunk = c.recv(65536)
+                if not chunk:
+                    raise ConnectionError("closed while receiving")
+                buf += chunk
+
+        def mux_new(sid, data):
+            meta = sid.to_bytes(2, "big") + bytes([1, 1, 1]) \
+                + (0).to_bytes(2, "big") + bytes([1]) \
+                + socket.inet_aton("127.0.0.1")
+            return len(meta).to_bytes(2, "big") + meta \
+                + len(data).to_bytes(2, "big") + data
+
+        def mux_frame(sid, status, data=b""):
+            meta = sid.to_bytes(2, "big") + bytes([status, 2 if data else 0])
+            return len(meta).to_bytes(2, "big") + meta \
+                + len(data).to_bytes(2, "big") + data
+
+        def parse_mux(msg):
+            ml = int.from_bytes(msg[0:2], "big")
+            meta = msg[2:2 + ml]
+            dl = int.from_bytes(msg[2 + ml:4 + ml], "big")
+            return (int.from_bytes(meta[0:2], "big"), meta[2],
+                    msg[4 + ml:4 + ml + dl])
+
+        # (a) a raw stream stays on the mux splice, byte-identical,
+        # and never touches the SS backend.
+        c, buf = ws_open("/ss-ws")
+        raw = bytes(range(64, 128))
+        ws_send(c, raw)
+        got = ws_recv(c, buf)
+        check("demux: raw SS stream spliced through the mux as-is",
+              got == raw, f"got {got!r}")
+        time.sleep(0.4)
+        check("demux: raw stream never opened a backend session",
+              not [r for r in be_records if r[0] == "open"],
+              f"records {be_records!r}")
+        c.close()
+
+        # (b) one muxed session: New carries the stream head, Keep
+        # continues it, the backend's replies come back framed for
+        # the same session, End closes the backend connection.
+        be_records.clear()
+        c, buf = ws_open("/ss-ws")
+        ws_send(c, mux_new(7, b"hello-ss"))
+        sid, status, data = parse_mux(ws_recv(c, buf))
+        check("demux: session reply framed for its session",
+              (sid, status, data) == (7, 2, b"HELLO-SS"),
+              f"got {(sid, status, data)!r}")
+        ws_send(c, mux_frame(7, 2, b"again"))
+        sid, status, data = parse_mux(ws_recv(c, buf))
+        check("demux: keep frame continues the same backend stream",
+              (sid, status, data) == (7, 2, b"AGAIN"),
+              f"got {(sid, status, data)!r}")
+        seen = [r[2] for r in be_records if r[0] == "data"]
+        check("demux: backend received the bare stream bytes",
+              seen == [b"hello-ss", b"again"], f"got {seen!r}")
+        ws_send(c, mux_frame(7, 3))
+        for _ in range(30):
+            if any(r[0] == "close" for r in be_records):
+                break
+            time.sleep(0.1)
+        check("demux: End closed the backend connection",
+              any(r[0] == "close" for r in be_records),
+              f"records {be_records!r}")
+        c.close()
+
+        # (c) two sessions interleaved stay separate.
+        be_records.clear()
+        c, buf = ws_open("/ss-ws")
+        ws_send(c, mux_new(9, b"one"))
+        ws_send(c, mux_new(10, b"two"))
+        got = {}
+        for _ in range(2):
+            sid, status, data = parse_mux(ws_recv(c, buf))
+            got[sid] = data
+        check("demux: interleaved sessions do not cross",
+              got == {9: b"ONE", 10: b"TWO"}, f"got {got!r}")
+        opens = [r for r in be_records if r[0] == "open"]
+        check("demux: one backend connection per session",
+              len(opens) == 2, f"records {be_records!r}")
+        c.close()
     finally:
         proc.terminate()
         stop.set()

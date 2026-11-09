@@ -238,6 +238,10 @@ proxies:
     plugin-opts: {mode: websocket, host: <节点>, path: /ss-ws, mux: false}
 ```
 
+开启多路复用的插件客户端（Shadowrocket 默认开启）可直接使用：
+分发器在 SS-WS 路径上识别 Mux.Cool 分帧，解复用为逐会话的后端
+连接；未复用的流原样直通，两种情况都不需要改客户端配置。
+
 **套 CDN** 是这条入站在公网上的标准形态：把自有域名接入 CDN
 （在 CDN 侧放行 WebSocket），回源指向节点公网口，客户端以
 `wss://<你的域名>`＋SS 路径连入——CDN 终结客户端的 TLS 后，把
@@ -249,6 +253,22 @@ WebSocket 以明文 HTTP 转发回节点。由于 Shadowsocks 协议自身加密
 路径与 TLS 后拨号就是 SS over WSS，本节点也能经 CDN 去连上级。）
 
 ## 管理界面二：命令行（与 Web 功能完全一致）
+
+### 客户端分享链接
+
+每个用户的客户端配置都可以在三个界面生成标准分享 URL：
+
+- **控制台**：用户行上的「分享」按钮，逐条显示 URL 并附二维码
+  （扫码直接导入）。
+- **本地 CLI**：`users.py share <用户> --server <节点>`（可按需
+  加 `--port`、`--no-tls`、`--protocol`）。
+- **远程 CLI**：`xmagic.py users share <用户>`——端点默认取节点
+  URL，可用 `--server`、`--port`、`--tls` / `--no-tls` 覆盖。
+
+只生成当前已启用的协议；按名索要未启用的协议直接报错，不静默
+省略。SS 链接显式带 `udp=0`：SS 的载体传不了 UDP，而客户端默认
+开启 UDP 转发，这条显式关闭让导入的节点配置与实际能力一致。
+（Trojan、VMess、VLESS 的 UDP 是协议内承载，链接无需此项。）
 
 ### 节点上：users.py（引擎自带 CLI）
 
@@ -266,6 +286,7 @@ docker compose run --rm admin python3 users.py apply      # 渲染 + 重启（�
 docker compose run --rm admin python3 users.py status
 docker compose run --rm admin python3 users.py sessions   # 会话列表，可 sessions-revoke <id> 撤销
 docker compose run --rm admin python3 users.py settings --session-ttl-hours 48
+docker compose run --rm admin python3 users.py share alice --server <节点>   # 客户端分享 URL（仅已启用协议）
 docker compose run --rm admin python3 users.py --json list   # 机器可读输出，方便自动化
 ```
 
@@ -283,6 +304,7 @@ mkdir -p ~/.local/bin && curl -fsSL https://<节点地址>/cli/xmagic.py -o ~/.l
 python3 xmagic.py node add tokyo --url http://<节点地址>:8080   # 后台与代理共用公网端口，直连即可
 python3 xmagic.py login            # 自动拉起浏览器走 Passkey，登录态存回本地
 python3 xmagic.py users add alice
+python3 xmagic.py users share alice   # 该用户的客户端分享 URL（端点默认取节点 URL）
 python3 xmagic.py --node tokyo routes add --kind ip --pattern 1.1.1.1 --to intl
 python3 xmagic.py passkey replace  # 拉起浏览器：先用当前 Passkey 验证，再注册新 Passkey；保留本 CLI 会话，其余会话全部撤销
 python3 xmagic.py sessions list    # 看这个节点上的全部管理员会话

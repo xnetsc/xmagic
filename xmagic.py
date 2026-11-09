@@ -788,6 +788,30 @@ def cmd_users_action(args):
     emit(args, payload, human)
 
 
+def cmd_users_share(args):
+    """Share URLs for one user (URLs only - QR codes are the
+    console's). The endpoint defaults to the node URL this CLI
+    talks to; --server/--port/--tls/--no-tls override it for when
+    clients reach the node under a different public face."""
+    api, _, url = authed_api(args)
+    parts = urllib.parse.urlsplit(url)
+    body = {"server": args.server or parts.hostname,
+            "port": args.port or parts.port
+                    or (443 if parts.scheme == "https" else 80),
+            "tls": parts.scheme == "https" if args.tls is None
+                   else args.tls}
+    if args.protocol:
+        body["protocol"] = args.protocol
+    payload = api.call("POST", f"/api/users/{args.user}/share", body)
+    for e in payload["urls"]:
+        e.pop("qr", None)
+    human = "\n".join(f"{e['label']}\n  {e['url']}"
+                       for e in payload["urls"]) \
+        or "(no protocols enabled)"
+    emit(args, payload, human)
+
+
+
 def cmd_upstreams_list(args):
     api, _, _ = authed_api(args)
     payload = api.call("GET", "/api/upstreams")
@@ -1493,6 +1517,19 @@ def main():
     a = usub.add_parser("setnote", parents=C); a.add_argument("user")
     a.add_argument("note", nargs="?")
     a.set_defaults(fn=cmd_users_action, action="setnote")
+    a = usub.add_parser("share", parents=C); a.add_argument("user")
+    a.add_argument("--server", help="public host clients connect to"
+                                    " (default: the node URL's host)")
+    a.add_argument("--port", type=int)
+    a.add_argument("--protocol",
+                   choices=("ss-ws", "ss", "trojan-ws", "vmess-ws",
+                            "vmess", "vless-reality", "vless-ws"),
+                   help="only this protocol (must be enabled)")
+    tg = a.add_mutually_exclusive_group()
+    tg.add_argument("--tls", dest="tls", action="store_true",
+                    default=None)
+    tg.add_argument("--no-tls", dest="tls", action="store_false")
+    a.set_defaults(fn=cmd_users_share)
 
     up = sub.add_parser("upstreams", parents=C, help="upstream nodes")
     upsub = up.add_subparsers(dest="upstreams_cmd", required=True)

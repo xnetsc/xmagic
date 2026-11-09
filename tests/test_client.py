@@ -268,6 +268,26 @@ def main():
         check("users rotate-uuid via remote CLI",
               bool(rotated)
               and json.loads(out)["users"][0]["vless_uuid"] == rotated, out)
+
+        rc, out, err = cli("users", "share", "alice")
+        check("users share via remote CLI",
+              rc == 0 and "ss://" in out and "trojan://" in out
+              and "&udp=0" in out and f"@127.0.0.1:{PORT_A}" in out,
+              err + out)
+        rc, out, err = cli("--json", "users", "share", "alice")
+        entries = json.loads(out)["urls"] if rc == 0 else []
+        check("users share --json carries urls without qr codes",
+              sorted(e["protocol"] for e in entries)
+              == ["ss-ws", "trojan-ws", "vmess-ws"]
+              and all("qr" not in e for e in entries), out)
+        rc, out, err = cli("users", "share", "alice",
+                           "--server", "pub.example.com",
+                           "--port", "8443", "--tls")
+        check("users share endpoint overrides",
+              rc == 0 and "@pub.example.com:8443" in out, err + out)
+        rc, out, err = cli("users", "share", "alice", "--protocol", "ss")
+        check("users share refuses a disabled protocol",
+              rc != 0 and "not enabled" in err, err + out)
         rc, out, err = cli("upstreams", "add", "up1", "--proto", "ss",
                            "--addr", "10.9.9.9", "--port", "8388",
                            "--password", "pw")

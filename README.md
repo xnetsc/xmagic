@@ -297,6 +297,12 @@ proxies:
     plugin-opts: {mode: websocket, host: <node>, path: /ss-ws, mux: false}
 ```
 
+Plugin clients that enable mux (Shadowrocket turns it on by
+default) are accepted as-is: the dispatcher recognizes Mux.Cool
+framing on the SS-WS paths and demultiplexes it into per-session
+backend connections. Unmuxed streams pass through untouched - no
+client reconfiguration is needed either way.
+
 **Behind a CDN** is the standard public-internet shape for this
 inbound: put your own domain on a CDN (WebSocket must be enabled
 there), set the CDN's origin to the node's public port, and have
@@ -315,6 +321,26 @@ through a CDN.)
 
 ## Management interface 2: command line (identical to web)
 
+### Client share links
+
+Each user's client configuration can be minted as standard share
+URLs on all three surfaces:
+
+- **Console**: the Share button on a user row shows every URL
+  with a QR code next to it (scan to import).
+- **Node CLI**: `users.py share <user> --server <node>` (with
+  `--port`, `--no-tls`, `--protocol` as needed).
+- **Remote CLI**: `xmagic.py users share <user>` - the endpoint
+  defaults to the node URL; `--server`, `--port`, `--tls` /
+  `--no-tls` override it.
+
+Only protocols the node currently enables are generated; asking
+for a disabled one by name is an error, never a silent omission.
+SS links pin `udp=0`: the SS carriers cannot transport UDP, while
+clients enable UDP forwarding by default, so the pin keeps the
+imported node honest about what it can carry. (Trojan, VMess and
+VLESS carry UDP in-band; their links need no pin.)
+
 ### On the node: users.py (the engine's own CLI)
 
 Runs through the admin container; the host needs no Python:
@@ -331,6 +357,7 @@ docker compose run --rm admin python3 users.py apply      # render + restart (sa
 docker compose run --rm admin python3 users.py status
 docker compose run --rm admin python3 users.py sessions   # list sessions; sessions-revoke <id> to revoke
 docker compose run --rm admin python3 users.py settings --session-ttl-hours 48
+docker compose run --rm admin python3 users.py share alice --server <node>   # client share URLs (enabled protocols only)
 docker compose run --rm admin python3 users.py --json list   # machine-readable output for automation
 ```
 
@@ -358,6 +385,7 @@ python3 xmagic.py sessions list    # all sign-in sessions on this node
 python3 xmagic.py sessions revoke <id>
 python3 xmagic.py upstreams edit b1 --port 8443      # same API as the web editor
 python3 xmagic.py users rotate-uuid alice
+python3 xmagic.py users share alice   # client share URLs for one user (endpoint defaults to the node URL)
 python3 xmagic.py settings set --session-ttl-hours 24
 python3 xmagic.py settings set --upstream-strategy random --ss-method chacha20-ietf-poly1305
 python3 xmagic.py keys list        # SSH keys usable here: ~/.ssh, ~/.xmagic/keys, ssh-agent

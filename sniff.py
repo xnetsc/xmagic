@@ -56,6 +56,19 @@ stream head (>= 32 bytes) as the first WebSocket frame, ahead of the
 client's own frames: exactly the stream the client would have sent
 without early data. Everything else stays a raw splice.
 
+v2ray-plugin's other default is multiplexing: many SS connections
+share one WebSocket connection, each framed Mux.Cool-style as
+[2B meta length][meta][2B data length][data]. The SS inbound cannot
+demultiplex that - a muxed stream dies there as an unmatched user.
+So on upgrade paths the rendered config maps to an SS-WS inbound,
+the dispatcher watches the first frame: when it opens with an exact
+Mux.Cool session frame (the meta length must equal the serialized
+target length - not a pattern a random SS salt can pass), the
+dispatcher takes the connection over from the mux, terminates the
+mux itself and gives every session its own WebSocket connection to
+the SS backend. Any other stream on those paths keeps the raw
+splice through the mux, byte for byte.
+
 Origin-form vs absolute-form is what separates the console from proxy
 traffic on this one port: a browser talking to the console asks for
 "/..." on this host, while a client using the HTTP proxy asks for
@@ -393,6 +406,45 @@ def _http_enabled():
     return loaded[1]
 
 
+_SS_WS_CACHE = {"key": None, "routes": {}}
+
+
+def _ss_ws_routes():
+    """{ws path: backend port} of the rendered config's SS-WS
+    inbounds, for Mux.Cool demultiplexing. Empty when the config
+    cannot be read - demultiplexing then stays off and SS-WS
+    traffic takes the plain mux path, the behavior of deployments
+    without the config wiring."""
+    path = _vmess_config_path()
+    try:
+        st = os.stat(path)
+    except OSError:
+        return {}
+    key = (path, st.st_mtime_ns, st.st_size)
+    if _SS_WS_CACHE["key"] == key:
+        return _SS_WS_CACHE["routes"]
+    routes = {}
+    try:
+        with open(path) as f:
+            cfg = json.load(f)
+        for inbound in cfg.get("inbounds", []):
+            tag = str(inbound.get("tag") or "")
+            if inbound.get("protocol") != "shadowsocks" \
+                    or not tag.startswith("ss-ws"):
+                continue
+            ws = ((inbound.get("streamSettings") or {})
+                  .get("wsSettings") or {})
+            p = str(ws.get("path") or "").split("?", 1)[0]
+            port = inbound.get("port")
+            if p and isinstance(port, int):
+                routes[p] = port
+    except (OSError, ValueError, AttributeError):
+        return _SS_WS_CACHE["routes"]
+    _SS_WS_CACHE["key"] = key
+    _SS_WS_CACHE["routes"] = routes
+    return routes
+
+
 def _authid_match(data, ids, now):
     """True when data opens with a valid VMess AuthID for one of ids.
 
@@ -718,6 +770,512 @@ def _forward_gated(client, backend, frame, bell) -> bool:
     return True
 
 
+# --- Mux.Cool demultiplexing on SS-WS paths ---------------------------
+# Frame layout (v2ray-plugin mux mode): [2B meta length][meta]
+# [2B data length][data]; meta = session id(2B) + status(1B) +
+# option(1B) + target on a New session, serialized as network(1B) +
+# port(2B) + address type(1B) + address. Statuses: 1 New, 2 Keep,
+# 3 End, 4 KeepAlive.
+
+_MUX_NEW, _MUX_KEEP, _MUX_END = 1, 2, 3
+
+
+def _mux_open_state(buf):
+    """True/False/None: does buf open with a Mux.Cool session frame?
+
+    None while more bytes could still decide. False is final: the
+    meta length must be plausible, the status must be New with a
+    target option, and the target must serialize to exactly the
+    announced meta length."""
+    if len(buf) < 2:
+        return None
+    meta_len = int.from_bytes(buf[0:2], "big")
+    if meta_len < 8 or meta_len > 32:
+        return False
+    if len(buf) < 2 + meta_len + 2:
+        return None
+    meta = buf[2:2 + meta_len]
+    if meta[2] != _MUX_NEW or meta[3] not in (0x01, 0x03):
+        return False
+    if meta[4] not in (0x01, 0x02):       # network: TCP / UDP
+        return False
+    atyp = meta[7]
+    if atyp == 0x01:
+        addr = 4
+    elif atyp == 0x03:
+        addr = 16
+    elif atyp == 0x02:
+        if meta_len < 9:
+            return False
+        addr = 1 + meta[8]
+    else:
+        return False
+    return 8 + addr == meta_len
+
+
+def _frames_payload(buf):
+    """(payload, consumed) of the complete WebSocket frames in buf.
+
+    Data-frame payloads are concatenated - the mux layer sees only
+    the byte stream; control frames are skipped. A trailing partial
+    frame stays unconsumed."""
+    out = bytearray()
+    pos = 0
+    while True:
+        if len(buf) - pos < 2:
+            break
+        b0, b1 = buf[pos], buf[pos + 1]
+        opcode = b0 & 0x0F
+        length = b1 & 0x7F
+        p = pos + 2
+        if length == 126:
+            if len(buf) - p < 2:
+                break
+            length = int.from_bytes(buf[p:p + 2], "big")
+            p += 2
+        elif length == 127:
+            if len(buf) - p < 8:
+                break
+            length = int.from_bytes(buf[p:p + 8], "big")
+            p += 8
+        mask = None
+        if b1 & 0x80:
+            if len(buf) - p < 4:
+                break
+            mask = buf[p:p + 4]
+            p += 4
+        if len(buf) - p < length:
+            break
+        payload = bytes(buf[p:p + length])
+        if mask is not None:
+            payload = bytes(b ^ mask[i % 4]
+                            for i, b in enumerate(payload))
+        if opcode in (0x0, 0x1, 0x2):
+            out += payload
+        pos = p + length
+    return bytes(out), pos
+
+
+def _ws_server_frame(opcode, payload):
+    """One unmasked frame, as a WS server would send it."""
+    head = bytes([0x80 | opcode])
+    n = len(payload)
+    if n < 126:
+        head += bytes([n])
+    elif n <= 0xFFFF:
+        head += bytes([126]) + n.to_bytes(2, "big")
+    else:
+        head += bytes([127]) + n.to_bytes(8, "big")
+    return head + payload
+
+
+class _WSReader:
+    """Streaming WebSocket message reader over a socket.
+
+    read_message() returns one complete data message (fragmentation
+    reassembled); control frames are handled inline - a ping is
+    answered through the on_ping callback, a close raises EOFError.
+    """
+
+    def __init__(self, sock, buf=b"", on_ping=None):
+        self.sock = sock
+        self.buf = bytearray(buf)
+        self.on_ping = on_ping
+        self.frag = None
+
+    def _fill(self, n):
+        while len(self.buf) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise EOFError("socket closed")
+            self.buf += chunk
+
+    def read_head(self):
+        """Consume an HTTP head (through CRLFCRLF) and return it."""
+        while True:
+            idx = self.buf.find(b"\r\n\r\n")
+            if idx >= 0:
+                head = bytes(self.buf[:idx + 4])
+                del self.buf[:idx + 4]
+                return head
+            if len(self.buf) > 65536:
+                raise ConnectionError("http head too large")
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise EOFError("socket closed during head")
+            self.buf += chunk
+
+    def read_message(self):
+        while True:
+            self._fill(2)
+            b0, b1 = self.buf[0], self.buf[1]
+            fin = b0 & 0x80
+            opcode = b0 & 0x0F
+            masked = b1 & 0x80
+            length = b1 & 0x7F
+            pos = 2
+            if length == 126:
+                self._fill(4)
+                length = int.from_bytes(self.buf[2:4], "big")
+                pos = 4
+            elif length == 127:
+                self._fill(10)
+                length = int.from_bytes(self.buf[2:10], "big")
+                pos = 10
+            if length > 1 << 24:
+                raise ConnectionError("websocket message too large")
+            mask = None
+            if masked:
+                self._fill(pos + 4)
+                mask = bytes(self.buf[pos:pos + 4])
+                pos += 4
+            self._fill(pos + length)
+            payload = bytes(self.buf[pos:pos + length])
+            del self.buf[:pos + length]
+            if mask is not None:
+                payload = bytes(b ^ mask[i % 4]
+                                for i, b in enumerate(payload))
+            if opcode == 0x9:                       # ping
+                if self.on_ping is not None:
+                    self.on_ping(payload)
+                continue
+            if opcode == 0xA:                       # pong
+                continue
+            if opcode == 0x8:                       # close
+                raise EOFError("websocket close frame")
+            if opcode in (0x1, 0x2):
+                if self.frag is not None:
+                    raise ConnectionError("new message mid-fragment")
+                self.frag = bytearray(payload)
+            elif opcode == 0x0:
+                if self.frag is None:
+                    raise ConnectionError(
+                        "continuation without a start")
+                self.frag += payload
+            else:
+                raise ConnectionError("bad websocket opcode")
+            if fin:
+                out = bytes(self.frag)
+                self.frag = None
+                return out
+
+
+class _MuxSession:
+    """One mux session: a dedicated WebSocket connection to the
+    SS-WS backend, its byte stream wrapped in mux frames."""
+
+    def __init__(self, demux, sid, be_sock, reader):
+        self.demux = demux
+        self.sid = sid
+        self.be = be_sock
+        self.reader = reader
+        self.dead = False
+
+    def run(self):
+        try:
+            while not self.dead:
+                payload = self.reader.read_message()
+                self.demux.send_frame(self.sid, _MUX_KEEP, payload)
+        except (EOFError, ConnectionError, OSError):
+            pass
+        finally:
+            self.dead = True
+            try:
+                self.demux.send_frame(self.sid, _MUX_END, b"")
+            except (ConnectionError, OSError):
+                pass
+            self.demux.drop(self.sid, self)
+            try:
+                self.be.close()
+            except OSError:
+                pass
+
+    def write(self, data):
+        self.be.sendall(_ws_client_frame(data))
+
+    def close(self):
+        self.dead = True
+        try:
+            self.be.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self.be.close()
+        except OSError:
+            pass
+
+
+class _SSDemux:
+    """Terminates one muxed client WebSocket and fans its sessions
+    out to per-session WebSocket connections on the SS-WS backend."""
+
+    def __init__(self, client, be_port, path):
+        self.client = client
+        self.be_port = be_port
+        self.path = path
+        self.lock = threading.Lock()
+        self.sessions = {}
+
+    # -- client side ------------------------------------------------
+    def _send_ws(self, opcode, payload):
+        with self.lock:
+            self.client.sendall(_ws_server_frame(opcode, payload))
+
+    def send_frame(self, sid, status, data):
+        option = 0x02 if data else 0x00
+        meta = sid.to_bytes(2, "big") + bytes([status, option])
+        chunks = [data[i:i + 60000]
+                  for i in range(0, len(data), 60000)] or [b""]
+        for chunk in chunks:
+            frame = (len(meta).to_bytes(2, "big") + meta
+                     + len(chunk).to_bytes(2, "big") + chunk)
+            try:
+                self._send_ws(0x2, frame)
+            except OSError:
+                raise ConnectionError("client write failed")
+
+    def drop(self, sid, session):
+        with self.lock:
+            if self.sessions.get(sid) is session:
+                del self.sessions[sid]
+
+    # -- backend side ------------------------------------------------
+    def _open_session(self, sid):
+        be = socket.create_connection(("127.0.0.1", self.be_port),
+                                      timeout=10)
+        try:
+            key = base64.b64encode(os.urandom(16)).decode()
+            be.sendall(
+                (f"GET {self.path} HTTP/1.1\r\n"
+                 f"Host: 127.0.0.1:{self.be_port}\r\n"
+                 "Upgrade: websocket\r\n"
+                 "Connection: Upgrade\r\n"
+                 f"Sec-WebSocket-Key: {key}\r\n"
+                 "Sec-WebSocket-Version: 13\r\n\r\n").encode())
+            reader = _WSReader(be)
+            head = reader.read_head()
+            if b" 101 " not in head.split(b"\r\n", 1)[0]:
+                raise ConnectionError("backend refused the upgrade")
+            be.settimeout(None)
+            return _MuxSession(self, sid, be, reader)
+        except (OSError, EOFError, ConnectionError):
+            try:
+                be.close()
+            except OSError:
+                pass
+            raise
+
+    # -- the mux stream ----------------------------------------------
+    def serve(self, mux_prefix, raw_rest):
+        def on_ping(payload):
+            try:
+                self._send_ws(0xA, payload)
+            except OSError:
+                pass
+
+        reader = _WSReader(self.client, raw_rest, on_ping=on_ping)
+        buf = bytearray(mux_prefix)
+        try:
+            while True:
+                self._drain(buf)
+                buf += reader.read_message()
+        except (EOFError, ConnectionError, OSError):
+            pass
+        finally:
+            with self.lock:
+                sessions = list(self.sessions.values())
+                self.sessions.clear()
+            for s in sessions:
+                s.close()
+
+    def _drain(self, buf):
+        while True:
+            if len(buf) < 2:
+                return
+            meta_len = int.from_bytes(buf[0:2], "big")
+            if meta_len < 4 or meta_len > 4096:
+                raise ConnectionError("mux meta length implausible")
+            if len(buf) < 2 + meta_len + 2:
+                return
+            data_len = int.from_bytes(
+                buf[2 + meta_len:4 + meta_len], "big")
+            total = 2 + meta_len + 2 + data_len
+            if len(buf) < total:
+                return
+            meta = bytes(buf[2:2 + meta_len])
+            data = bytes(buf[2 + meta_len + 2:total])
+            del buf[:total]
+            self._frame(meta, data)
+
+    def _frame(self, meta, data):
+        sid = int.from_bytes(meta[0:2], "big")
+        status = meta[2]
+        if status == _MUX_NEW:
+            with self.lock:
+                old = self.sessions.pop(sid, None)
+            if old is not None:
+                old.close()
+            try:
+                session = self._open_session(sid)
+            except (OSError, EOFError, ConnectionError):
+                self.send_frame(sid, _MUX_END, b"")
+                return
+            with self.lock:
+                self.sessions[sid] = session
+            threading.Thread(target=session.run, daemon=True).start()
+            if data:
+                self._deliver(session, data)
+        elif status == _MUX_KEEP:
+            with self.lock:
+                session = self.sessions.get(sid)
+            if session is not None and data:
+                self._deliver(session, data)
+        elif status == _MUX_END:
+            with self.lock:
+                session = self.sessions.pop(sid, None)
+            if session is not None:
+                session.close()
+        # KeepAlive and unknown statuses carry nothing to do.
+
+    def _deliver(self, session, data):
+        try:
+            session.write(data)
+        except OSError:
+            session.close()
+            self.drop(session.sid, session)
+            try:
+                self.send_frame(session.sid, _MUX_END, b"")
+            except (ConnectionError, OSError):
+                pass
+
+
+def _serve_ss_ws(client, mux, addr, be_port, path, head_done):
+    """One SS-WS connection: a raw splice through the mux, unless
+    the client speaks v2ray-plugin mux - then demultiplex.
+
+    The mux backend answers the upgrade as usual. When the
+    demultiplexer takes over it closes that connection and speaks
+    WebSocket to the client itself, so the backend-to-client pump
+    must leave the client socket alone once takeover is signalled.
+    At takeover the backend has sent nothing but the handshake head,
+    and the pump is joined before the demultiplexer writes."""
+    takeover = threading.Event()
+
+    def pump_b2c():
+        try:
+            while not takeover.is_set():
+                r, _, _ = select.select([mux], [], [], 0.5)
+                if not r:
+                    continue
+                chunk = mux.recv(65536)
+                if not chunk:
+                    break
+                client.sendall(chunk)
+        except (OSError, ValueError):
+            # ValueError: the demultiplexer closed the mux socket
+            # under our select.
+            pass
+        finally:
+            if not takeover.is_set():
+                try:
+                    client.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+
+    t = threading.Thread(target=pump_b2c, daemon=True)
+    t.start()
+
+    rawbuf = bytearray()
+    if not head_done:
+        # Forward the request head to the mux byte for byte;
+        # anything already read past it stays buffered for the
+        # classification below.
+        try:
+            pending = bytearray()
+            while b"\r\n\r\n" not in pending:
+                chunk = client.recv(65536)
+                if not chunk:
+                    mux.close()
+                    return
+                pending += chunk
+                if len(pending) > 65536:
+                    break
+            head, _, rest = bytes(pending).partition(b"\r\n\r\n")
+            mux.sendall(head + b"\r\n\r\n")
+            rawbuf = bytearray(rest)
+        except OSError:
+            try:
+                mux.close()
+            except OSError:
+                pass
+            return
+
+    # Classify the first data message's payload: an exact Mux.Cool
+    # session-open frame, or not mux at all.
+    verdict = None
+    deadline = time.monotonic() + 3.0
+    while verdict is None:
+        payload, _ = _frames_payload(bytes(rawbuf))
+        verdict = _mux_open_state(payload)
+        if verdict is not None:
+            break
+        if len(rawbuf) > 1 << 16 or time.monotonic() > deadline:
+            verdict = False
+            break
+        r, _, _ = select.select(
+            [client], [], [],
+            max(0.0, deadline - time.monotonic()))
+        if not r:
+            verdict = False
+            break
+        try:
+            chunk = client.recv(65536)
+        except OSError:
+            chunk = b""
+        if not chunk:
+            try:
+                mux.close()
+            except OSError:
+                pass
+            return
+        rawbuf += chunk
+
+    if not verdict:
+        # A raw SS stream: flush what classification buffered, then
+        # splice exactly like the generic path.
+        try:
+            if rawbuf:
+                mux.sendall(bytes(rawbuf))
+        except OSError:
+            pass
+        pipe(client, mux)
+        try:
+            mux.close()
+        except OSError:
+            pass
+        t.join(timeout=2)
+        return
+
+    payload, consumed = _frames_payload(bytes(rawbuf))
+    takeover.set()
+    try:
+        mux.close()
+    except OSError:
+        pass
+    t.join(timeout=5)
+    log(f"{addr}: v2ray-plugin mux on {path} - demultiplexing")
+    _SSDemux(client, be_port, path).serve(payload,
+                                          bytes(rawbuf[consumed:]))
+
+
+def _ws_path(data):
+    """The request path (query stripped) of a peeked WS upgrade."""
+    parts = data.split(b"\r\n", 1)[0].split(b" ")
+    if len(parts) < 2:
+        return None
+    return parts[1].decode("latin-1").split("?", 1)[0]
+
+
 SPECIALS = (b"SSH-", b"CONNECT ") + HTTP_METHODS
 
 
@@ -783,10 +1341,15 @@ def handle(client, addr):
         kind = classify(data)
         plan = None
         ws_info = None
+        ss_path = None
+        ss_be = None
         if kind == "mux":
             plan, ws_info = _ws_rewrite(client, data)
             if ws_info:
                 log(f"{addr}: ws {ws_info}")
+                ss_path = _ws_path(data)
+                if ss_path is not None:
+                    ss_be = _ss_ws_routes().get(ss_path)
         host, port = TARGETS[kind]
         try:
             backend = socket.create_connection((host, port), timeout=10)
@@ -845,6 +1408,11 @@ def handle(client, addr):
                 backend.close()
                 return
         client.settimeout(None)
+        if ss_be is not None:
+            _serve_ss_ws(client, backend, addr, ss_be, ss_path,
+                         head_done=plan is not None)
+            backend.close()
+            return
         if ws_info is not None:
             t = threading.Thread(target=_pipe_c2b_snoop,
                                  args=(client, backend, addr,
