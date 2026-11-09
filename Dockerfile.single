@@ -50,6 +50,10 @@ RUN apk add --no-cache openssh-server openssh-client \
 RUN pip install --no-cache-dir "psycopg[binary]" "pymysql"
 COPY --from=xray-core /usr/local/bin/xray /usr/local/bin/xray
 COPY users.py admin.py sniff.py xmagic.py /app/
+# Precompile bytecode: on a cold start with a heavily throttled
+# CPU (serverless containers), compiling ~250KB of Python at
+# import time takes seconds the gateway may not have.
+RUN python3 -m compileall -q /app
 COPY sshd_config /etc/ssh/sshd_config
 COPY single-entrypoint.sh single-tunnels.sh /app/
 RUN chmod +x /app/single-entrypoint.sh /app/single-tunnels.sh

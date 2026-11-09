@@ -60,8 +60,11 @@ import time
 import urllib.parse
 import uuid as uuidlib
 
+print(f"admin[boot] {time.strftime('%H:%M:%S')} interpreter up; "
+      "importing engine ...", flush=True)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import users as users_mod  # the CLI engine: db(), render_config(), ...
+print(f"admin[boot] {time.strftime('%H:%M:%S')} engine imported", flush=True)
 
 BIND = os.environ.get("XMAGIC_ADMIN_BIND", "127.0.0.1")
 PORT = int(os.environ.get("XMAGIC_ADMIN_PORT", "8090"))
