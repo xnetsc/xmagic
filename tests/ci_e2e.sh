@@ -261,14 +261,21 @@ ssh-keygen -t ed25519 -f "$WORK/alice_key" -N '' -q
 # Client Xray (pinned, same version as the server images).
 # shellcheck disable=SC1091
 . "$ROOT/versions.env"
-curl -fsSL -o "$WORK/xray.zip" \
+# Release downloads flake often enough (a bare 504 aborted this
+# step once and failed the two client-xray checks downstream for
+# no code reason), so every fetch retries on any error.
+fetch() {
+  curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 \
+    -o "$1" "$2"
+}
+fetch "$WORK/xray.zip" \
   "https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/Xray-linux-64.zip"
 (cd "$WORK" && unzip -o -q xray.zip xray && chmod +x xray)
 
 # Mihomo client (pinned), for the SIP003 v2ray-plugin dialect check
 # against the SS-WS inbound.
 MIHOMO_VERSION=1.19.33
-curl -fsSL -o "$WORK/mihomo.gz" \
+fetch "$WORK/mihomo.gz" \
   "https://github.com/MetaCubeX/mihomo/releases/download/v${MIHOMO_VERSION}/mihomo-linux-amd64-v${MIHOMO_VERSION}.gz"
 gunzip -f "$WORK/mihomo.gz" && chmod +x "$WORK/mihomo"
 
