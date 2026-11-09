@@ -20,6 +20,24 @@ bytes identify the protocol unambiguously:
 The mux itself then dispatches WebSocket paths to the VLESS/Trojan
 backends and everything else to the bare-Shadowsocks backend.
 
+One header is rewritten on the way to the mux. v2ray-plugin clients
+(Shadowrocket's among them) may open a WebSocket with "early data":
+the first chunk of the tunneled stream rides base64-encoded in the
+Sec-WebSocket-Protocol handshake header and only the remainder
+follows in frames. Xray's WS server mishandles that split - unless
+the header carries the client's whole first flight, the stream head
+arrives corrupted and the backend rejects it (a Shadowsocks inbound
+reports "failed to match an user" for a stream whose password is in
+fact right). A value that is not early data at all (a subprotocol
+token) is worse: Xray still decodes and prepends it. So for mux-bound
+upgrades the dispatcher strips the header, holds the client's stream
+until the backend's handshake response has gone by (the frame must
+not coalesce with the request head - the mux's path sniffing would
+trip over it), and re-injects content that decodes to a plausible
+stream head (>= 32 bytes) as the first WebSocket frame, ahead of the
+client's own frames: exactly the stream the client would have sent
+without early data. Everything else stays a raw splice.
+
 Origin-form vs absolute-form is what separates the console from proxy
 traffic on this one port: a browser talking to the console asks for
 "/..." on this host, while a client using the HTTP proxy asks for
@@ -38,6 +56,7 @@ Environment:
 
 Python 3 stdlib only. One thread pair per connection; logging to stdout.
 """
+import base64
 import os
 import select
 import socket
@@ -116,7 +135,106 @@ def classify(data: bytes) -> str:
     return "mux"
 
 
-def pipe(src, dst):
+# Shortest Sec-WebSocket-Protocol payload still treated as early
+# data. A stream head shorter than this cannot carry even a salt and
+# one sealed record of any protocol the mux serves; a value that
+# decodes shorter is a subprotocol token, not data, and is dropped.
+ED_MIN = 32
+
+
+def _b64_decode_loose(value: bytes):
+    """Decode base64 in either alphabet, padded or not; None if not."""
+    v = value.strip().rstrip(b"=")
+    if not v:
+        return None
+    v += b"=" * (-len(v) % 4)
+    for alt in (b"-_", None):
+        try:
+            return base64.b64decode(v, altchars=alt, validate=True)
+        except ValueError:
+            continue
+    return None
+
+
+def normalize_ws_head(head: bytes):
+    """Split a WS upgrade head into (head to forward, early data).
+
+    Returns None when the head carries no Sec-WebSocket-Protocol
+    header (the common case - forward it untouched). Otherwise the
+    returned head has every such header removed, and the second
+    element is the decoded early data to re-inject as the first
+    frame, or None when the value was a token / undecodable and is
+    simply dropped.
+    """
+    lines = head[:-4].split(b"\r\n")  # caller guarantees the \r\n\r\n
+    kept, values = [], []
+    for line in lines:
+        name, sep, val = line.partition(b":")
+        if sep and name.strip().lower() == b"sec-websocket-protocol":
+            values.append(val)
+            continue
+        kept.append(line)
+    if not values:
+        return None
+    data = _b64_decode_loose(values[0])
+    if data is not None and len(data) < ED_MIN:
+        data = None
+    return b"\r\n".join(kept) + b"\r\n\r\n", data
+
+
+def _ws_client_frame(payload: bytes) -> bytes:
+    """One masked binary frame, as a WS client would send it."""
+    mask = os.urandom(4)
+    n = len(payload)
+    if n < 126:
+        hdr = bytes([0x82, 0x80 | n])
+    elif n < 65536:
+        hdr = bytes([0x82, 0x80 | 126]) + n.to_bytes(2, "big")
+    else:
+        hdr = bytes([0x82, 0x80 | 127]) + n.to_bytes(8, "big")
+    body = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    return hdr + mask + body
+
+
+def _ws_rewrite(client, data: bytes):
+    """Plan the early-data normalization for a mux-bound connection.
+
+    Pure inspection of peeked bytes: returns (head_len, new_head,
+    early_data) when the connection's request head is complete in
+    the peek and carries the header, else None (raw splice). The
+    caller consumes exactly head_len bytes, forwards new_head, and
+    when early_data is not None reframes it via _forward_gated.
+    """
+    if not data.startswith(HTTP_METHODS):
+        return None
+    big = client.recv(65536, socket.MSG_PEEK)
+    if len(big) < len(data):
+        big = data
+    end = big.find(b"\r\n\r\n")
+    if end < 0:
+        return None
+    head = big[:end + 4]
+    if b"sec-websocket-protocol" not in head.lower():
+        return None
+    plan = normalize_ws_head(head)
+    if plan is None:
+        return None
+    new_head, early = plan
+    return end + 4, new_head, early
+
+
+def _recv_exact(client, n: int) -> bytes:
+    out = b""
+    while len(out) < n:
+        chunk = client.recv(n - len(out))
+        if not chunk:
+            raise ConnectionError("client closed mid-head")
+        out += chunk
+    return out
+
+
+def pipe(src, dst, bell=None):
+    tail = b""
     try:
         while True:
             r, _, _ = select.select([src], [], [], 300)
@@ -126,14 +244,42 @@ def pipe(src, dst):
             if not chunk:
                 break
             dst.sendall(chunk)
+            if bell is not None and not bell.is_set():
+                window = tail + chunk
+                if b"\r\n\r\n" in window:
+                    bell.set()
+                tail = window[-3:]
     except (OSError, ValueError):
         # ValueError: the sibling thread closed the socket under our select.
         pass
     finally:
+        if bell is not None:
+            bell.set()
         try:
             dst.shutdown(socket.SHUT_WR)
         except OSError:
             pass
+
+
+def _forward_gated(client, backend, frame, bell) -> bool:
+    """Hold the client's stream until the handshake response passes.
+
+    The reframed early data must reach the backend as a WebSocket
+    frame in its own right: sent together with the request head it
+    lands in the mux's path-sniffing read and corrupts the routing,
+    so the client's own bytes wait in the kernel buffer (a real WS
+    client sends nothing before the 101 anyway). The grace period
+    bounds the wait when the backend never answers with an HTTP head;
+    the frame then goes out regardless, which is no worse than the
+    unnormalized connection would have been.
+    """
+    bell.wait(10)
+    try:
+        backend.sendall(frame)
+    except OSError:
+        return False
+    pipe(client, backend)
+    return True
 
 
 SPECIALS = (b"SSH-", b"CONNECT ") + HTTP_METHODS
@@ -194,6 +340,7 @@ def handle(client, addr):
             client.close()
             return
         kind = classify(data)
+        plan = _ws_rewrite(client, data) if kind == "mux" else None
         host, port = TARGETS[kind]
         try:
             backend = socket.create_connection((host, port), timeout=10)
@@ -227,8 +374,31 @@ def handle(client, addr):
                     pass
             client.close()
             return
-        client.settimeout(None)
         log(f"{addr}: -> {kind} ({host}:{port})")
+        if plan is not None:
+            head_len, new_head, early = plan
+            try:
+                _recv_exact(client, head_len)
+                backend.sendall(new_head)
+            except OSError:
+                backend.close()
+                return
+            client.settimeout(None)
+            if early is None:
+                log(f"{addr}: ws subprotocol header stripped")
+            else:
+                bell = threading.Event()
+                t = threading.Thread(target=pipe,
+                                     args=(backend, client, bell),
+                                     daemon=True)
+                t.start()
+                if _forward_gated(client, backend,
+                                  _ws_client_frame(early), bell):
+                    log(f"{addr}: ws early data reframed "
+                        f"({len(early)} bytes)")
+                backend.close()
+                return
+        client.settimeout(None)
         t = threading.Thread(target=pipe, args=(client, backend), daemon=True)
         t.start()
         pipe(backend, client)

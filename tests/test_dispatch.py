@@ -11,6 +11,7 @@ CONNECT / absolute-form HTTP -> HTTP proxy inbound, WebSocket upgrade
 anything else -> mux. Each stub backend answers with its own name, so
 the client's received bytes prove the routing.
 """
+import base64
 import os
 import socket
 import subprocess
@@ -196,6 +197,118 @@ def main():
         got = probe(b"CONNECT example.com:443 HTTP/1.1\r\n\r\n")
         check("CONNECT with http backend down -> dropped, no 503",
               got == b"", f"got {got!r}")
+
+        # phase 4: WS early-data normalization. The mux stub records
+        # exactly what the dispatcher forwards, so the rewritten head
+        # and the reframed early data are asserted byte for byte.
+        proc.terminate()
+        proc.wait(timeout=5)
+        for _ in range(50):
+            try:
+                socket.create_connection(("127.0.0.1", PUBLIC),
+                                         timeout=0.3).close()
+                time.sleep(0.1)
+            except OSError:
+                break
+        captured = []
+
+        def recorder(port):
+            srv = socket.socket()
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind(("127.0.0.1", port))
+            srv.listen(8)
+            srv.settimeout(0.3)
+            while not stop.is_set():
+                try:
+                    conn, _ = srv.accept()
+                except socket.timeout:
+                    continue
+                with conn:
+                    conn.settimeout(1.5)
+                    buf = b""
+                    replied = False
+                    try:
+                        while True:
+                            chunk = conn.recv(65536)
+                            if not chunk:
+                                break
+                            buf += chunk
+                            if not replied and b"\r\n\r\n" in buf:
+                                # a fake 101 so the dispatcher's
+                                # gated early-data injection fires
+                                conn.sendall(b"HTTP/1.1 101 Switching "
+                                             b"Protocols\r\n\r\n")
+                                replied = True
+                    except OSError:
+                        pass
+                    captured.append(buf)
+            srv.close()
+
+        rec_port = BASE + 70
+        threading.Thread(target=recorder, args=(rec_port,),
+                         daemon=True).start()
+        proc = subprocess.Popen(
+            [sys.executable, os.path.join(ROOT, "sniff.py")],
+            env=dict(env, XRAY_MUX_PORT=str(rec_port)),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        for _ in range(50):
+            try:
+                socket.create_connection(("127.0.0.1", PUBLIC),
+                                         timeout=0.3).close()
+                break
+            except OSError:
+                time.sleep(0.1)
+
+        def ws_probe(head, tail=b""):
+            n0 = len(captured)
+            with socket.create_connection(("127.0.0.1", PUBLIC),
+                                          timeout=5) as c:
+                c.sendall(head)
+                if tail:
+                    time.sleep(0.3)
+                    c.sendall(tail)
+                for _ in range(30):
+                    if len(captured) > n0:
+                        break
+                    time.sleep(0.1)
+            return captured[-1] if len(captured) > n0 else b""
+
+        marker = b"\x82\x84\x01\x02\x03\x04mark"
+        payload = bytes(range(64))
+        ed = base64.urlsafe_b64encode(payload).rstrip(b"=").decode()
+        head = (f"GET /ss-ws HTTP/1.1\r\nHost: h\r\n"
+                f"Upgrade: websocket\r\n"
+                f"Sec-WebSocket-Protocol: {ed}\r\n\r\n").encode()
+        got = ws_probe(head, marker)
+        stripped, _, rest = got.partition(b"\r\n\r\n")
+        ok = (b"sec-websocket-protocol" not in got.lower()
+              and stripped.startswith(b"GET /ss-ws HTTP/1.1"))
+        if ok and len(rest) >= 6 and rest[0] == 0x82 and rest[1] & 0x80:
+            ln = rest[1] & 0x7F
+            mask = rest[2:6]
+            frame = bytes(b ^ mask[i % 4]
+                          for i, b in enumerate(rest[6:6 + ln]))
+            ok = (ln == len(payload) and frame == payload
+                  and rest[6 + ln:] == marker)
+        else:
+            ok = False
+        check("WS early data: header stripped, payload reframed first",
+              ok, f"got {got!r}")
+
+        head = (b"GET /ss-ws HTTP/1.1\r\nHost: h\r\n"
+                b"Upgrade: websocket\r\n"
+                b"Sec-WebSocket-Protocol: shadowsocks\r\n\r\n")
+        got = ws_probe(head, marker)
+        want = (b"GET /ss-ws HTTP/1.1\r\nHost: h\r\n"
+                b"Upgrade: websocket\r\n\r\n" + marker)
+        check("WS subprotocol token: stripped, stream untouched",
+              got == want, f"got {got!r} want {want!r}")
+
+        head = (b"GET /ss-ws HTTP/1.1\r\nHost: h\r\n"
+                b"Upgrade: websocket\r\n\r\n")
+        got = ws_probe(head, marker)
+        check("WS without the header: forwarded byte-identical",
+              got == head + marker, f"got {got!r}")
     finally:
         proc.terminate()
         stop.set()
