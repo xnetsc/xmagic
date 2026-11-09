@@ -280,7 +280,7 @@ if [ "$FORM" = compose ]; then
   mkdir -p "$WORK/compose/data"
   cp "$ROOT/docker-compose.yml" "$ROOT/sshd_config" "$WORK/compose/"
   cp "$WORK/alice_key.pub" "$WORK/compose/data/alice.pub"
-  (cd "$WORK/compose" && docker compose up -d xray dispatcher sshd admin) \
+  (cd "$WORK/compose" && docker compose --profile ssh up -d xray dispatcher sshd admin) \
     > "$WORK/up.log" 2>&1
   check "compose stack starts" "$?"
 else
@@ -333,17 +333,20 @@ kill "$SSH_PID" 2>/dev/null; SSH_PID=""
 
 # The proxy account is forwarding-only: a key must never yield a shell
 # or a remote command (ForceCommand + /bin/false shell in the images).
+# Empty output alone does not prove refusal - a dead sshd also yields
+# no output - so the exit code must be exactly 1 (authenticated, then
+# refused by the forced command), never 255 (connection/auth error).
 out=$(ssh -i "$WORK/alice_key" -p "$PUB" \
   -o BatchMode=yes -o StrictHostKeyChecking=no \
   -o UserKnownHostsFile=/dev/null proxy@127.0.0.1 \
-  "echo SHOULD_NOT_PRINT" 2>/dev/null)
-[ -z "$out" ]
+  "echo SHOULD_NOT_PRINT" 2>/dev/null); rc=$?
+[ -z "$out" ] && [ "$rc" -eq 1 ]
 check "ssh exec is refused (forwarding-only account)" "$?"
 out=$(ssh -i "$WORK/alice_key" -p "$PUB" \
   -o BatchMode=yes -o StrictHostKeyChecking=no \
   -o UserKnownHostsFile=/dev/null proxy@127.0.0.1 \
-  </dev/null 2>/dev/null)
-[ -z "$out" ]
+  </dev/null 2>/dev/null); rc=$?
+[ -z "$out" ] && [ "$rc" -eq 1 ]
 check "ssh interactive shell is refused" "$?"
 
 add_user bob
