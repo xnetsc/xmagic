@@ -4,7 +4,9 @@
 Every protocol this node serves is client-speaks-first, so the opening
 bytes identify the protocol unambiguously:
 
-  "SSH-" banner                      -> sshd            (SSH_BE_PORT)
+  "SSH-" banner                      -> sshd            (SSH_BE_PORT;
+                                        only with XMAGIC_ENABLE_SSH=1,
+                                        off by default)
   TLS ClientHello (0x16 0x03 ...)    -> REALITY inbound (XRAY_REALITY_PORT)
   well-formed SOCKS5 greeting        -> SOCKS5 inbound  (BE_SOCKS_PORT;
                                         only with XMAGIC_ENABLE_SOCKS5=1,
@@ -58,6 +60,12 @@ PEEK_TIMEOUT = float(os.environ.get("SNIFF_PEEK_TIMEOUT", "5"))
 # unless the operator explicitly enables it.
 SOCKS_PUBLIC = os.environ.get(
     "XMAGIC_ENABLE_SOCKS5", "").lower() in ("1", "true", "yes", "on")
+# SSH support is off by default, opt-in with XMAGIC_ENABLE_SSH=1 (the
+# same environment decides whether the entrypoint starts sshd at
+# all). While off, an "SSH-" banner is not routed anywhere: it falls
+# through to the mux like any other stream and fails there.
+SSH_ENABLED = os.environ.get(
+    "XMAGIC_ENABLE_SSH", "").lower() in ("1", "true", "yes", "on")
 HTTP_METHODS = (b"GET ", b"POST ", b"PUT ", b"DELETE ", b"HEAD ",
                 b"OPTIONS ", b"PATCH ", b"TRACE ")
 
@@ -84,7 +92,7 @@ def _looks_socks(data: bytes) -> bool:
 
 
 def classify(data: bytes) -> str:
-    if data.startswith(b"SSH-"):
+    if SSH_ENABLED and data.startswith(b"SSH-"):
         return "ssh"
     if len(data) >= 2 and data[0] == 0x16 and data[1] == 0x03:
         # A TLS record opening a handshake: the REALITY inbound (a

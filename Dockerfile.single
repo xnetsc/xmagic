@@ -7,7 +7,7 @@
 # takes the whole container down with it, and the runtime's restart
 # policy brings it back as one unit. Config changes apply the same
 # way: apply renders, then signals the gateway processes (pidfiles in
-# /run/xmagic), whose exit restarts the container whole on the new
+# /tmp/xmagic-run), whose exit restarts the container whole on the new
 # config - so run it with a restart policy:
 #
 #   docker build -f Dockerfile.single -t xmagic-single .
@@ -28,6 +28,14 @@
 # port, and when DATABASE_URL is set the entrypoint registers it as
 # the business database (see single-entrypoint.sh) - that is what the
 # Heroku one-click deploy (app.json + heroku.yml) relies on.
+# Serverless runtimes (e.g. function-compute custom containers) may
+# not let the image write to system directories at all, so all runtime
+# scratch - pidfiles, restart markers, staged sshd host keys and
+# staged ssh client keys - lives under /tmp; only /data is persistent.
+# (authorized_keys is the exception: sshd fetches it through a
+# root-owned cat of the /data file - see single-entrypoint.sh -
+# because sshd's StrictModes parent-directory walk rejects both a
+# mode-less data mount and world-writable /tmp.)
 ARG XRAY_VERSION=26.10.31
 FROM ghcr.io/xtls/xray-core:${XRAY_VERSION} AS xray-core
 
@@ -35,7 +43,7 @@ FROM python:3.12-alpine
 RUN apk add --no-cache openssh-server openssh-client \
  && adduser -D -s /bin/false proxy \
  && passwd -u proxy \
- && mkdir -p /home/proxy/.ssh /etc/ssh/keys \
+ && mkdir -p /home/proxy/.ssh \
  && chown proxy:proxy /home/proxy/.ssh && chmod 700 /home/proxy/.ssh
 # psycopg / pymysql are the optional PostgreSQL / MySQL business-
 # database drivers (SQLite is in the standard library).
@@ -66,9 +74,7 @@ ENV XRAY_PORT=8080 \
     PROXY_DB=/data/users.db \
     XMAGIC_ADMIN_BIND=127.0.0.1 \
     XMAGIC_ADMIN_PORT=18090 \
-    XMAGIC_ADMIN_RPID=localhost \
-    XMAGIC_ADMIN_ORIGINS=http://localhost:8080,http://127.0.0.1:8080 \
-    XMAGIC_PID_DIR=/run/xmagic
+    XMAGIC_PID_DIR=/tmp/xmagic-run
 VOLUME /data
 EXPOSE 8080
 ENTRYPOINT ["/app/single-entrypoint.sh"]

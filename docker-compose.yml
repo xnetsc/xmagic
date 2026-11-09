@@ -57,6 +57,7 @@ x-gateway-env: &gateway-env
   REALITY_SERVER_NAMES: "${REALITY_SERVER_NAMES:-}"
   REALITY_SHORT_IDS: "${REALITY_SHORT_IDS:-}"
   XMAGIC_ENABLE_SOCKS5: "${XMAGIC_ENABLE_SOCKS5:-}"
+  XMAGIC_ENABLE_SSH: "${XMAGIC_ENABLE_SSH:-}"
 
 services:
   xray:
@@ -93,6 +94,11 @@ services:
     depends_on:
       - xray
 
+  # SSH support is off by default (XMAGIC_ENABLE_SSH, see .env.example):
+  # this service sits behind the "ssh" profile, so a plain compose up
+  # does not start it. Enable with COMPOSE_PROFILES=ssh (plus
+  # XMAGIC_ENABLE_SSH=1 so the dispatcher routes SSH and the console
+  # accepts SSH configuration) or `docker compose --profile ssh up`.
   sshd:
     image: ghcr.io/xnetsc/xmagic-sshd:latest
     build:
@@ -101,13 +107,16 @@ services:
     container_name: proxy-sshd
     restart: unless-stopped
     network_mode: host
+    profiles: ["ssh"]
     environment:
       SSH_BE_PORT: "${SSH_BE_PORT:-12222}"
     volumes:
-      # Directory mount for the same reason as the xray service; the
-      # image entrypoint copies the rendered authorized_keys from /data
-      # into the proxy home at every start (apply restarts this
-      # container after each render, so key changes propagate).
+      # Directory mount for the same reason as the xray service. At
+      # every start the image entrypoint stages the host keys from
+      # the volume as 0600 copies under /tmp and passes them with
+      # -h; authorized_keys is fetched by sshd through a root-owned
+      # cat of /data/authorized_keys (AuthorizedKeysCommand), so
+      # rendered key changes take effect with no restart at all.
       - ./data:/data:ro
       - ./data/ssh_host_keys:/etc/ssh/keys
     depends_on:
@@ -126,8 +135,6 @@ services:
       - "127.0.0.1:${ADMIN_BE_PORT:-18090}:8090"
     environment:
       <<: *gateway-env
-      XMAGIC_ADMIN_RPID: "${XMAGIC_ADMIN_RPID:-localhost}"
-      XMAGIC_ADMIN_ORIGINS: "${XMAGIC_ADMIN_ORIGINS:-http://localhost:${XRAY_PORT:-8080},http://127.0.0.1:${XRAY_PORT:-8080}}"
     volumes:
       - ./data:/data
       # Lets the console restart xray/sshd after a render. Remove this

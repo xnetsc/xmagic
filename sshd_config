@@ -3,9 +3,12 @@
 # makes every session channel run /bin/false, so neither an interactive
 # shell nor a remote command can ever execute; only port forwarding
 # (-D/-L/-R) is available to key holders.
-HostKey /etc/ssh/keys/ssh_host_rsa_key
-HostKey /etc/ssh/keys/ssh_host_ecdsa_key
-HostKey /etc/ssh/keys/ssh_host_ed25519_key
+# No HostKey lines here on purpose: the persistent host keys live in
+# the data volume, whose filesystem may not preserve Unix permissions
+# (an object-storage mount presents every file as 0777, and sshd
+# refuses a private host key that others can access). Every launcher
+# stages root-owned 0600 copies under /tmp and passes them explicitly
+# with sshd -h, so sshd is never left to a default host-key location.
 PermitRootLogin no
 PasswordAuthentication no
 KbdInteractiveAuthentication no

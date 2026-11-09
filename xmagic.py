@@ -597,6 +597,7 @@ def cmd_settings_show(args):
         f"({src[payload['ss_method_from_db']]})",
         f"vless_enabled: {payload['vless_enabled']} "
         f"({src[payload['vless_enabled_from_db']]})",
+        f"ssh_enabled: {payload.get('ssh_enabled', True)} (environment)",
         f"reality_enabled: {payload['reality_enabled']} "
         f"({src[payload['reality_enabled_from_db']]})",
         f"reality_dest: {payload['reality_dest']} "
@@ -698,13 +699,14 @@ def cmd_users_list(args):
     api, _, _ = authed_api(args)
     payload = api.call("GET", "/api/users")
     off = "" if payload.get("vless_enabled") else " (off)"
+    ssh_off = "" if payload.get("ssh_enabled", True) else " (off)"
     lines = []
     for u in payload["users"]:
         lines.append(
             f"{u['username']:<16} group={u['group']:<10} "
             f"enabled={u['enabled']!s:<5} vless uuid={u['vless_uuid']}{off}\n"
             f"{'':<16} password={u['password']}  ss={u['ss_method']}/{u['ss_password']}"
-            + (f"  ssh-key={u.get('ssh_fingerprint') or 'yes'}"
+            + (f"  ssh-key={u.get('ssh_fingerprint') or 'yes'}{ssh_off}"
                if u["ssh_key"] else ""))
     emit(args, payload, "\n".join(lines) if lines else "(no users)")
 

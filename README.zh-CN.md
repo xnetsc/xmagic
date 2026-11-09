@@ -7,6 +7,8 @@ HTTP 代理（CONNECT）、Trojan-WS、Shadowsocks-WS、VLESS+REALITY、裸 Shad
 自身不带加密的协议默认不开：VLESS-WS、VLESS（裸 TCP）（在设置里
 开启）与公网 SOCKS5（`XMAGIC_ENABLE_SOCKS5=1`）；HTTP 留着是因为
 它借道外层 HTTPS，Trojan 设计上强制 TLS，Shadowsocks 自带加密。
+SSH 也默认不开——它自带加密，关的是这个可选入口：`XMAGIC_ENABLE_SSH=1`
+才启动 sshd 与 SSH 上级，关闭期间 SSH 相关配置一律拒绝。
 节点自身还能作为下级节点去连多个上级（级联），入站会什么协议、出站就支持
 什么协议；选哪个上级既可按用户分组，也可按目标域名/IP 用路由规则指定。
 
@@ -45,7 +47,7 @@ HTTP 代理（CONNECT）、Trojan-WS、Shadowsocks-WS、VLESS+REALITY、裸 Shad
 
 | 协议 | 客户端连入（入站） | 本节点连上级（出站） | 认证 |
 | --- | --- | --- | --- |
-| SSH | sshd，`ssh -D` 得 SOCKS5 | `ssh -N -D` 隧道映射为本地 SOCKS 出站 | 公钥（双向都是） |
+| SSH | sshd（**默认关闭**：`XMAGIC_ENABLE_SSH=1` 开启），`ssh -D` 得 SOCKS5 | `ssh -N -D` 隧道映射为本地 SOCKS 出站 | 公钥（双向都是） |
 | SOCKS5 | Xray socks 入站（公网分支**默认关闭**：明文协议，`XMAGIC_ENABLE_SOCKS5=1` 开启） | Xray socks 出站 | 用户名+密码（可空） |
 | HTTP 代理 | Xray http 入站（CONNECT） | Xray http 出站 | Basic（可空） |
 | VLESS-WS | WS 路径分发 → 后端（**默认关闭**：VLESS 自身不加密，在设置里开启） | 同左 | uuid |
@@ -71,9 +73,9 @@ HTTP 代理（CONNECT）、Trojan-WS、Shadowsocks-WS、VLESS+REALITY、裸 Shad
 - **只支持一个管理员账号，且只能用 Passkey**：第一个注册的 Passkey 即管理员，
   注册随即永久关闭；不支持密码或其它登录方式。用户验证（UV）强制开启。
 - 后台没有自己的公网端口：浏览器打开 `http://<节点>:<XRAY_PORT>/` 就是
-  它（分发器按源形式/绝对形式分流，见架构节）。若前面挂了域名 + HTTPS，
-  把 `XMAGIC_ADMIN_RPID` / `XMAGIC_ADMIN_ORIGINS` 改成该域名，Passkey 按
-  该域名签发。
+  它（分发器按源形式/绝对形式分流，见架构节）。若前面挂了域名 + HTTPS
+  也无需任何配置：Passkey 的 RP ID 直接取自每个请求自己的请求头，
+  控制台在哪个域名下打开，Passkey 就按哪个域名签发。
 - Passkey 丢了没有网页找回通道：在节点上跑 `users.py admin-reset` 清掉凭证
   重新注册——能碰宿主机的人本来就拥有这台机器，这是刻意的破窗设计。
   还在登录状态时也可以在后台直接**更换 Passkey**（设置区）：更换完成的那一刻，
@@ -111,6 +113,13 @@ VLESS / Trojan / Shadowsocks 的 WS 路径列表、上级池策略、新用户�
 加密交给 TLS 层，而本网关不终结 TLS）与 dispatcher 的公网 SOCKS5
 分支（环境变量 `XMAGIC_ENABLE_SOCKS5=1`；SOCKS5 是明文，且不是
 HTTP、借不了外层 HTTPS 的道）。
+
+SSH 支持同样默认关（环境变量 `XMAGIC_ENABLE_SSH=1`，节点启动时
+读取、只认环境变量，控制台与 CLI 里没有开关）。关闭时 sshd 与
+隧道进程不启动（compose 形态下 sshd 服务在 `ssh` profile 后面），
+dispatcher 不分流 SSH 横幅，用户的 SSH 公钥、SSH 上级与节点密钥
+生成在控制台与两个 CLI 里都被拒绝；已存的公钥与上级留在数据库
+里，开启并重启节点后生效。
 
 「允许直连内网地址」默认关：经 VLESS / Trojan / Shadowsocks 进来的流量，
 直连时不能访问节点本机与内网地址（Xray freedom 出站的默认拦截规则，
@@ -463,9 +472,8 @@ dyno 重启不丢用户。
 [![Deploy to Heroku](https://www.herokucdn.com/deploy/button.svg)](https://heroku.com/deploy?template=https://github.com/xnetsc/xmagic)
 
 按钮用仓库里的 `app.json` + `heroku.yml` 拉起单容器镜像，并自动配一个
-Heroku Postgres（业务库，见上文的平台适配）。部署完成后，把两个环境
-变量设成你的应用域名并重启 dyno，后台的 Passkey 才能按该域名工作：
-`XMAGIC_ADMIN_RPID=<应用域名>`、`XMAGIC_ADMIN_ORIGINS=https://<应用域名>`。
+Heroku Postgres（业务库，见上文的平台适配）。部署完成后无需任何
+域名配置：控制台的 Passkey RP ID 取自请求头，在应用域名下直接可用。
 
 降级范围说清：Heroku 路由只放 HTTP(S)，能用的是**后台、HTTP 代理、
 VLESS-WS / Trojan-WS / Shadowsocks-WS**；SOCKS5、SSH、裸 Shadowsocks、裸 VLESS-TCP

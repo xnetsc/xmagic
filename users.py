@@ -19,7 +19,10 @@ likewise. Credential model per user (one identity, several protocol secrets):
     sshd on the same host accepts the key, `ssh -D` gives a SOCKS5 proxy.
 
 A first-byte dispatcher (sniff.py) owns the single public port and routes
-each connection by its opening bytes: "SSH-" banner -> sshd; a
+each connection by its opening bytes: "SSH-" banner -> sshd (only when
+XMAGIC_ENABLE_SSH=1 - SSH support is off by default: no sshd or
+tunnels process is started, and SSH-shaped configuration is refused);
+a
 well-formed SOCKS5 greeting -> SOCKS5 inbound (only when
 XMAGIC_ENABLE_SOCKS5=1 - SOCKS5 is plaintext and off by default);
 a TLS ClientHello (0x16 0x03) -> the VLESS+REALITY inbound (on by
@@ -955,6 +958,10 @@ def cmd_init(_):
 
 def cmd_add(args):
     pubkey = None
+    if args.ssh_key_file and not ssh_enabled():
+        sys.exit("ssh support is disabled (XMAGIC_ENABLE_SSH is not 1);"
+                 " set XMAGIC_ENABLE_SSH=1 and restart the node to"
+                 " register ssh keys")
     if args.ssh_key_file:
         with open(args.ssh_key_file) as f:
             pubkey = f.read().strip()
@@ -1004,6 +1011,10 @@ def cmd_passwd(args):
 
 
 def cmd_setkey(args):
+    if not getattr(args, "clear", False) and not ssh_enabled():
+        sys.exit("ssh support is disabled (XMAGIC_ENABLE_SSH is not 1);"
+                 " set XMAGIC_ENABLE_SSH=1 and restart the node to"
+                 " register ssh keys")
     if getattr(args, "clear", False):
         pubkey = None
     elif args.ssh_key_file:
@@ -1211,6 +1222,10 @@ def validate_ss_method(method):
 
 
 def cmd_upstream_add(args):
+    if args.proto == "ssh" and not ssh_enabled():
+        sys.exit("ssh upstreams are disabled together with ssh"
+                 " support (XMAGIC_ENABLE_SSH is not 1; set it to 1"
+                 " and restart the node to enable)")
     key_content = _read_key_content_arg(args)
     if getattr(args, "key_generate", False):
         if key_content is not None or args.key_file:
@@ -1232,6 +1247,10 @@ def cmd_upstream_add(args):
         if args.proto in ("vless-ws", "vless") and not vless_enabled(conn):
             sys.exit("vless upstreams are disabled together with the vless"
                      " protocol (run: users.py settings --vless on)")
+        if args.proto == "ssh" and not ssh_enabled():
+            sys.exit("ssh upstreams are disabled together with ssh"
+                     " support (XMAGIC_ENABLE_SSH is not 1; set it to 1"
+                     " and restart the node to enable)")
         try:
             validate_ss_method(args.method)
         except ValueError as exc:
@@ -1326,6 +1345,10 @@ def update_upstream(conn, name, changes):
             and not vless_enabled(conn)):
         raise ValueError("vless upstreams are disabled together with the"
                          " vless protocol (enable vless first)")
+    if changes.get("protocol") == "ssh" and not ssh_enabled():
+        raise ValueError("ssh upstreams are disabled together with ssh"
+                         " support (XMAGIC_ENABLE_SSH is not 1; set it"
+                         " to 1 and restart the node to enable)")
     row = get_upstream(conn, name)
     merged = {k: row[k] for k in row.keys()}
     applied = {}
@@ -1949,24 +1972,60 @@ def render_config(conn):
 
 
 def ssh_tunnels(conn):
+    if not ssh_enabled():
+        return []
     ups = conn.execute(
         "SELECT * FROM upstreams WHERE enabled = 1 AND protocol = 'ssh' ORDER BY grp, name"
     ).fetchall()
     tunnels = []
     for i, u in enumerate(ups):
         port = SSH_TUNNEL_BASE + i
-        tunnels.append({
+        key_file = u["key_file"]
+        # Single-container form only (PID_DIR set): the rendered -i
+        # names the STAGED copy of a managed key, never the data-dir
+        # original. The ssh client refuses a private key whose file
+        # looks world-readable, and a data filesystem that does not
+        # preserve Unix permissions (an object-storage mount) makes
+        # every stored key look that way - so the entrypoint stages
+        # root-owned 0600 copies under the pid dir (local /tmp) at
+        # every tunnels (re)start, boot and apply relaunch alike,
+        # and the tunnel reads the copy. Compose renders the
+        # recorded /keys path as-is: a real mount on a local disk,
+        # where the stored 0600 survives.
+        if (PID_DIR and key_file
+                and key_file.startswith(MANAGED_KEY_PREFIX)):
+            key_file = os.path.join(PID_DIR, "client_keys",
+                                    os.path.basename(key_file))
+        entry = {
             "name": u["name"], "group": u["grp"], "local_socks_port": port,
             "ssh_command": ["ssh", "-N",
                             "-D", f"127.0.0.1:{port}",
-                            "-i", u["key_file"],
+                            "-i", key_file,
                             "-p", str(u["port"]),
                             "-o", "BatchMode=yes",
                             "-o", "StrictHostKeyChecking=accept-new",
                             "-o", "ExitOnForwardFailure=yes",
                             "-o", "ServerAliveInterval=30",
                             f"{u['username']}@{u['address']}"],
-        })
+        }
+        # A managed key's content is an input of the tunnels process
+        # too, but the rendered script names only its path - so carry
+        # a fingerprint of the stored key in the tunnels artifact.
+        # Rotating the key then changes the artifact, and apply's
+        # hash comparison relaunches the tunnels (the relaunch is
+        # also what re-stages the /tmp copies in the single form)
+        # instead of the running ssh processes silently keeping the
+        # old key.
+        if u["key_file"] and u["key_file"].startswith(MANAGED_KEY_PREFIX):
+            try:
+                with open(os.path.join(
+                        keys_dir(),
+                        os.path.basename(u["key_file"])), "rb") as f:
+                    entry["key_sha256"] = hashlib.sha256(
+                        f.read()).hexdigest()
+            except OSError:
+                pass
+        tunnels.append(entry)
     return tunnels
 
 
@@ -2130,6 +2189,7 @@ PRIVATE_CIDRS = ("127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12",
                  "::1/128", "fc00::/7", "fe80::/10")
 DIRECT_ALLOW_PRIVATE = os.environ.get("DIRECT_ALLOW_PRIVATE", "")
 VLESS_ENABLED = os.environ.get("VLESS_ENABLED", "")
+SSH_ENABLED = os.environ.get("XMAGIC_ENABLE_SSH", "")
 
 
 # ------------------------------------------------------------ interconnect
@@ -2221,6 +2281,24 @@ def vless_enabled(conn=None):
         if raw is not None:
             return raw == "1"
     return VLESS_ENABLED.lower() in ("1", "true", "yes", "on")
+
+
+def ssh_enabled():
+    """Whether SSH support is on: the inbound sshd (users' ssh keys,
+    ssh -D/-L/-R, same-group interconnect over ssh -R) and the
+    outbound ssh upstreams served by the tunnels process.
+
+    OFF by default, opt-in via XMAGIC_ENABLE_SSH=1. Unlike
+    vless_enabled this is env-only, with no DB override: whether the
+    sshd / tunnels processes run at all is decided from the same
+    environment when the image starts, so a console or CLI toggle
+    could promise a service no process exists to provide. While off,
+    every SSH-shaped operation (setting a user's ssh key, adding or
+    editing an ssh upstream, generating a node ssh key) is refused
+    and no tunnels are rendered; stored keys and upstreams stay in
+    the DB and take effect again once the environment enables SSH
+    and the node restarts."""
+    return SSH_ENABLED.lower() in ("1", "true", "yes", "on")
 
 
 def allow_private_direct(conn=None):
@@ -2428,6 +2506,7 @@ def settings_info(conn):
         "vless_enabled": vless_enabled(conn),
         "vless_enabled_from_db":
             get_setting(conn, "vless_enabled") is not None,
+        "ssh_enabled": ssh_enabled(),
         "reality_enabled": reality_enabled(conn),
         "reality_enabled_from_db":
             get_setting(conn, "reality_enabled") is not None,
@@ -2555,6 +2634,7 @@ def cmd_settings(args):
           f"({src[info['ss_method_from_db']]})")
     print(f"vless_enabled: {info['vless_enabled']} "
           f"({src[info['vless_enabled_from_db']]})")
+    print(f"ssh_enabled: {info['ssh_enabled']} (environment)")
     print(f"reality_enabled: {info['reality_enabled']} "
           f"({src[info['reality_enabled_from_db']]})")
     print(f"reality_dest: {info['reality_dest']} "
@@ -2736,6 +2816,9 @@ def apply_changes():
                 changed.append(label)
             if proc not in needed:
                 needed.append(proc)
+    if not ssh_enabled():
+        # No sshd / tunnels processes exist to restart.
+        needed = [n for n in needed if n not in ("sshd", "tunnels")]
     restarted = {}
     container_restart = False
     if needed and PID_DIR:

@@ -9,7 +9,10 @@ Shadowsocks at the same time. Protocols with no encryption of their
 own are off by default: VLESS-WS / bare VLESS (enable in Settings)
 and public SOCKS5 (`XMAGIC_ENABLE_SOCKS5=1`); HTTP stays because it
 rides the outer HTTPS, Trojan mandates TLS by design, and
-Shadowsocks carries its own cipher.
+Shadowsocks carries its own cipher. SSH is off by default too — it
+encrypts itself, but it is an optional entry: sshd and the SSH
+upstreams run only with `XMAGIC_ENABLE_SSH=1`, and while it is off,
+SSH-shaped configuration is refused in the console and the CLIs.
 A node can also cascade to multiple upstreams: whatever protocol it
 accepts inbound, it can also speak outbound. The upstream for a
 connection is chosen by user group, or by destination domain/IP via
@@ -56,7 +59,7 @@ identity engine, so a change made in one shows up in the others.
 
 | Protocol | Client -> this node (inbound) | This node -> upstream (outbound) | Auth |
 | --- | --- | --- | --- |
-| SSH | sshd; `ssh -D` gives SOCKS5 | `ssh -N -D` tunnel mapped to a local SOCKS outbound | public key (both directions) |
+| SSH | sshd (**off by default**: `XMAGIC_ENABLE_SSH=1` to enable); `ssh -D` gives SOCKS5 | `ssh -N -D` tunnel mapped to a local SOCKS outbound | public key (both directions) |
 | SOCKS5 | Xray socks inbound (public branch **off by default**: plaintext, `XMAGIC_ENABLE_SOCKS5=1` to enable) | Xray socks outbound | username + password (may be empty) |
 | HTTP proxy | Xray http inbound (CONNECT) | Xray http outbound | Basic (may be empty) |
 | VLESS-WS | WS path dispatch -> backend (**off by default**: VLESS has no encryption of its own; enable in Settings) | same | uuid |
@@ -95,8 +98,9 @@ and upstream records to keep them distinct upstream.
 - The console has no public port of its own: open
   `http://<node>:<XRAY_PORT>/` in a browser (the dispatcher splits
   origin-form from absolute-form traffic, see Architecture). Behind a
-  domain + HTTPS, set `XMAGIC_ADMIN_RPID` / `XMAGIC_ADMIN_ORIGINS` to
-  that domain so Passkeys are issued for it.
+  domain + HTTPS nothing needs configuring either: the Passkey
+  relying-party id is taken from each request's own headers, so
+  Passkeys are issued for whatever domain the console is opened on.
 - A lost Passkey has no web recovery: run `users.py admin-reset` on
   the node to clear the credential and register again - anyone with
   host access owns the machine anyway; this break-glass path is
@@ -149,6 +153,15 @@ or `VLESS_ENABLED=1`; VLESS delegates encryption to a TLS layer
 this gateway does not terminate) and the dispatcher's public
 SOCKS5 branch (env `XMAGIC_ENABLE_SOCKS5=1`; SOCKS5 is plaintext
 and, not being HTTP, cannot ride the outer HTTPS either).
+
+SSH support is off by default as well (env `XMAGIC_ENABLE_SSH=1`,
+read at node start, env-only — no console/CLI toggle). While off,
+the sshd and tunnels processes are not started (compose form: the
+sshd service sits behind the `ssh` profile), the dispatcher does
+not route SSH banners, and user SSH keys, SSH upstreams and node
+key generation are refused everywhere. Stored keys and upstreams
+stay in the database and take effect once SSH is enabled and the
+node restarts.
 
 "Allow direct egress to private addresses" is off by default: traffic
 arriving over VLESS / Trojan / Shadowsocks cannot reach the node's own
@@ -583,11 +596,10 @@ and dyno restarts lose no users.
 
 The button uses the repo's `app.json` + `heroku.yml` to launch the
 single-container image and provisions a Heroku Postgres (the business
-database - see the platform adaptation above). After the deploy
-finishes, set two environment variables to your app's domain and
-restart the dyno, so the console's Passkey is issued for that domain:
-`XMAGIC_ADMIN_RPID=<app domain>` and
-`XMAGIC_ADMIN_ORIGINS=https://<app domain>`.
+database - see the platform adaptation above). No domain
+configuration is needed after the deploy: the console takes its
+Passkey relying-party id from the request headers, so it works on
+the app's domain as-is.
 
 The degraded scope, stated plainly: Heroku's router passes only
 HTTP(S), so what works is **the console, the HTTP proxy, and

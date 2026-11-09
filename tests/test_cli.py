@@ -31,7 +31,8 @@ def check(name, cond, extra=""):
 def main():
     workdir = tempfile.mkdtemp(prefix="xmagic-cli-test-")
     db_path = os.path.join(workdir, "data", "users.db")
-    env = dict(os.environ, PROXY_DB=db_path, XMAGIC_DOCKER_SOCK="/nonexistent.sock")
+    env = dict(os.environ, PROXY_DB=db_path, XMAGIC_DOCKER_SOCK="/nonexistent.sock",
+               XMAGIC_ENABLE_SSH="1")
     users_py = os.path.join(ROOT, "users.py")
 
     def cli(*args):
@@ -299,7 +300,7 @@ def main():
 
     # ---- parity: same DB through the web console
     server_env = dict(env, XMAGIC_ADMIN_BIND="127.0.0.1",
-                      XMAGIC_ADMIN_PORT=str(t.PORT), XMAGIC_ADMIN_RPID="localhost")
+                      XMAGIC_ADMIN_PORT=str(t.PORT))
     server = subprocess.Popen(
         [sys.executable, os.path.join(ROOT, "admin.py")],
         env=server_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -769,6 +770,73 @@ JHde4tAsdlXZGG6MF7TiAAAAEHhtYWdpYyBmaXh0dXJlLWIBAgMEBQ==
           and st["ss_method"] == "aes-128-gcm", out)
     rc, _, _ = cli("settings", "--upstream-strategy", "bogus")
     check("settings rejects a bogus strategy", rc != 0)
+
+    # ------------------------------------------ ssh: off by default
+    # SSH support is opt-in via XMAGIC_ENABLE_SSH (this suite's env
+    # sets it). Without it the engine refuses every SSH-shaped
+    # operation and reports ssh_enabled false; non-SSH operations
+    # and stored ssh state are unaffected.
+    env_off = {k: v for k, v in env.items() if k != "XMAGIC_ENABLE_SSH"}
+
+    def cli_off(*args):
+        proc = subprocess.run([sys.executable, users_py, *args],
+                              env=env_off, capture_output=True, text=True)
+        return proc.returncode, proc.stdout, proc.stderr
+
+    rc, out, err = cli_off("setkey", "alice",
+                           "--ssh-key-file", key_base + ".pub")
+    check("ssh off: setkey refused",
+          rc != 0 and "XMAGIC_ENABLE_SSH" in err + out, err + out)
+    rc, out, err = cli_off("add", "sshoff",
+                           "--ssh-key-file", key_base + ".pub")
+    check("ssh off: add with an ssh key refused",
+          rc != 0 and "XMAGIC_ENABLE_SSH" in err + out, err + out)
+    rc, _, err = cli_off("add", "sshoff")
+    check("ssh off: add without a key still works", rc == 0, err)
+    rc, out, err = cli_off("upstream-add", "upoff", "--proto", "ssh",
+                           "--addr", "10.2.2.2", "--port", "22",
+                           "--username", "tun", "--key-generate")
+    check("ssh off: ssh upstream add refused",
+          rc != 0 and "XMAGIC_ENABLE_SSH" in err + out, err + out)
+    rc, out, _ = cli_off("--json", "settings")
+    check("ssh off: settings report ssh_enabled false",
+          json.loads(out)["ssh_enabled"] is False, out)
+    rc, out, _ = cli("--json", "settings")
+    check("ssh on: settings report ssh_enabled true",
+          json.loads(out)["ssh_enabled"] is True, out)
+    rc, _, err = cli_off("setkey", "alice", "--clear")
+    check("ssh off: clearing a key still works", rc == 0, err)
+
+    # Single-form tunnel rendering names the STAGED client-key copy
+    # (under the pid dir on /tmp), never the data-dir original.
+    rc, _, err = cli("upstream-add", "uptun", "--proto", "ssh",
+                     "--addr", "10.3.3.3", "--port", "22",
+                     "--username", "tun", "--key-generate")
+    check("ssh upstream for staging checks", rc == 0, err)
+    pid_dir = os.path.join(workdir, "run")
+    tun_dir = os.path.join(workdir, "tunout")
+    proc = subprocess.run([sys.executable, users_py, "render",
+                           "--out", os.path.join(tun_dir, "config.json")],
+                          env=dict(env, XMAGIC_PID_DIR=pid_dir),
+                          capture_output=True, text=True)
+    sp = os.path.join(tun_dir, "start-tunnels.sh")
+    script = open(sp).read() if os.path.exists(sp) else ""
+    check("single-form render points -i at the staged /tmp key copy",
+          proc.returncode == 0
+          and f"-i {pid_dir}/client_keys/uptun.key" in script,
+          proc.stderr + script)
+    # Rotating only the key CONTENT (same path) still counts as a
+    # tunnels change, so apply relaunches them and re-stages.
+    rc, _, err = cli("--json", "apply")
+    check("apply settles before rotation check", rc == 0, err)
+    rc, _, err = cli("upstream-edit", "uptun",
+                     "--key-content-file", key_base)
+    check("rotate tunnel key content", rc == 0, err)
+    rc, out, err = cli("--json", "apply")
+    applied = json.loads(out) if rc == 0 else {}
+    check("key-content rotation relaunches tunnels on apply",
+          applied.get("changed") == ["tunnels"], err + out)
+    rc, _, _ = cli("upstream-remove", "uptun")
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     return 1 if FAIL else 0

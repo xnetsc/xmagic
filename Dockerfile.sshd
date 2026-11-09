@@ -1,18 +1,27 @@
 # SSH entry for the gateway node: one system user `proxy`, key-only auth,
-# TCP forwarding on (that's what `ssh -D` needs), shell present but the
-# account is meant for proxying. authorized_keys is rendered by users.py
-# from the same SQLite DB as the Xray config into the data directory
-# (mounted at /data); the entrypoint copies it into the proxy home at
-# every start - the compose apply path restarts this container after
-# each render, so key changes propagate. (A single-file bind mount of
-# authorized_keys is NOT used: Docker turns a missing source file into
-# a directory on first up, which sshd then refuses as not-a-file.)
+# TCP forwarding on (that's what `ssh -D` needs), no shell - the account
+# exists only for proxying (ForceCommand and /bin/false, see sshd_config).
+# The files sshd reads are handled so their volume-side permissions
+# never matter (a volume filesystem may not preserve Unix modes):
+#   * host keys: persistent in the /etc/ssh/keys volume (= the data
+#     dir's ssh_host_keys), staged at every start as root-owned 0600
+#     copies under /tmp and passed with -h - sshd refuses a host key
+#     that looks world-readable;
+#   * authorized_keys: not pointed at as a file at all - sshd's
+#     StrictModes walks every directory above the named file, and
+#     both the data volume and /tmp (1777) fail that walk. Instead
+#     sshd runs a root-owned cat of the canonical /data file
+#     (AuthorizedKeysCommand); only the command's own path is
+#     permission-checked. The command runs per login attempt, so
+#     key changes take effect with no restart at all.
+# (A single-file bind mount of authorized_keys is NOT used: Docker
+# turns a missing source file into a directory on first up, which
+# sshd then refuses as not-a-file.)
 FROM alpine:3.20
 RUN apk add --no-cache openssh-server \
  && adduser -D -s /bin/false proxy \
  && passwd -u proxy \
- && mkdir -p /home/proxy/.ssh /etc/ssh/keys \
- && chown proxy:proxy /home/proxy/.ssh && chmod 700 /home/proxy/.ssh
+ && mkdir -p /etc/ssh/keys
 COPY sshd_config /etc/ssh/sshd_config
 EXPOSE 12222
-CMD ["sh", "-c", "for t in rsa ecdsa ed25519; do [ -f /etc/ssh/keys/ssh_host_${t}_key ] || ssh-keygen -t $t -f /etc/ssh/keys/ssh_host_${t}_key -N ''; done; if [ -f /data/authorized_keys ]; then cp /data/authorized_keys /home/proxy/.ssh/authorized_keys; else : > /home/proxy/.ssh/authorized_keys; fi; chown proxy:proxy /home/proxy/.ssh/authorized_keys; chmod 0644 /home/proxy/.ssh/authorized_keys; exec /usr/sbin/sshd -D -e -p ${SSH_BE_PORT:-12222}"]
+CMD ["sh", "-c", "for t in rsa ecdsa ed25519; do [ -f /etc/ssh/keys/ssh_host_${t}_key ] || ssh-keygen -t $t -f /etc/ssh/keys/ssh_host_${t}_key -N ''; done; mkdir -p /tmp/xmagic-hostkeys; chmod 700 /tmp/xmagic-hostkeys; for t in rsa ecdsa ed25519; do cp /etc/ssh/keys/ssh_host_${t}_key /tmp/xmagic-hostkeys/ssh_host_${t}_key; cp /etc/ssh/keys/ssh_host_${t}_key.pub /tmp/xmagic-hostkeys/ssh_host_${t}_key.pub; chmod 0600 /tmp/xmagic-hostkeys/ssh_host_${t}_key; chmod 0644 /tmp/xmagic-hostkeys/ssh_host_${t}_key.pub; done; exec /usr/sbin/sshd -D -e -p ${SSH_BE_PORT:-12222} -h /tmp/xmagic-hostkeys/ssh_host_rsa_key -h /tmp/xmagic-hostkeys/ssh_host_ecdsa_key -h /tmp/xmagic-hostkeys/ssh_host_ed25519_key -o AuthorizedKeysFile=none -o "AuthorizedKeysCommand=/bin/cat /data/authorized_keys" -o AuthorizedKeysCommandUser=root"]

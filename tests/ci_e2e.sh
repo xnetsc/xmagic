@@ -269,6 +269,9 @@ export DIRECT_ALLOW_PRIVATE=1
 # protocols); the e2e enables both to keep exercising their paths.
 export VLESS_ENABLED=1
 export XMAGIC_ENABLE_SOCKS5=1
+# SSH is opt-in too; the e2e enables it to keep exercising the
+# sshd paths (key login, ssh -D) in both forms.
+export XMAGIC_ENABLE_SSH=1
 if [ "$FORM" = compose ]; then
   export XRAY_PORT=$PUB
   for img in xray dispatcher sshd admin; do
@@ -290,6 +293,7 @@ else
     -e DIRECT_ALLOW_PRIVATE=1 \
     -e VLESS_ENABLED=1 \
     -e XMAGIC_ENABLE_SOCKS5=1 \
+    -e XMAGIC_ENABLE_SSH=1 \
     "$PREFIX/xmagic-single:$TAG" > "$WORK/up.log" 2>&1
   check "single container starts" "$?"
 fi

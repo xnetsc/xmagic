@@ -18,24 +18,47 @@ if [ -n "${PORT:-}" ]; then
   export XRAY_PORT
 fi
 DATA_DIR=$(dirname "${PROXY_DB:-/data/users.db}")
-PID_DIR="${XMAGIC_PID_DIR:-/run/xmagic}"
+PID_DIR="${XMAGIC_PID_DIR:-/tmp/xmagic-run}"
 mkdir -p "$DATA_DIR/ssh_host_keys" "$DATA_DIR/ssh_client_keys" \
-         "$PID_DIR" /etc/ssh/keys /run/sshd
+         "$PID_DIR"
+# Runtime state lives under /tmp, not in system directories: a
+# serverless runtime may not let the image write to /run or /etc at
+# all, while /tmp is writable in every runtime. (sshd's privilege-
+# separation directory is the one exception - it is compiled in and
+# the image package provides it; create the common path best-effort.)
+mkdir -p /run/sshd 2>/dev/null || true
 chmod 755 /run/sshd 2>/dev/null || true
 rm -f "$PID_DIR"/*.pid "$PID_DIR"/*.req
+# Optional processes are chosen by the environment at image start.
+# SSH support (the sshd entry and the ssh-tunnels holder) is off
+# unless XMAGIC_ENABLE_SSH=1: with it off those processes are never
+# started (no host keys are generated either), and the engine
+# refuses every SSH-shaped operation, so a feature that is not
+# running cannot be configured either.
+SSH_ON=0
+case "$(printf '%s' "${XMAGIC_ENABLE_SSH:-}" | tr 'A-Z' 'a-z')" in
+  1|true|yes|on) SSH_ON=1 ;;
+esac
 # Uploaded ssh-upstream private keys live in the data dir; the tunnels'
 # ssh commands reference them as /keys/<file>, the same path the
-# compose form's /keys mount provides.
-ln -sfn "$DATA_DIR/ssh_client_keys" /keys
+# compose form's /keys mount provides. Best effort: on a runtime whose
+# root filesystem is not writable (serverless) the link cannot be
+# created - that must not stop the gateway, and users.py's tunnel
+# render then falls back to the keys' real data-dir path.
+ln -sfn "$DATA_DIR/ssh_client_keys" /keys 2>/dev/null || true
 
-# sshd host keys persist in the data volume (sshd_config points at
-# /etc/ssh/keys - link the persistent copies in).
-for t in rsa ecdsa ed25519; do
-  key="$DATA_DIR/ssh_host_keys/ssh_host_${t}_key"
-  [ -f "$key" ] || ssh-keygen -t "$t" -f "$key" -N ''
-  ln -sf "$key" "/etc/ssh/keys/ssh_host_${t}_key"
-  ln -sf "$key.pub" "/etc/ssh/keys/ssh_host_${t}_key.pub"
-done
+# sshd host keys persist in the data volume and are generated here on
+# first boot. sshd never reads them from there directly: every sshd
+# (re)start stages local copies under /tmp and names them with -h
+# (see start_sshd) - a data filesystem that does not preserve Unix
+# permissions (an object-storage mount presents every file as 0777)
+# would otherwise make sshd refuse the keys as too open and exit.
+if [ "$SSH_ON" = 1 ]; then
+  for t in rsa ecdsa ed25519; do
+    key="$DATA_DIR/ssh_host_keys/ssh_host_${t}_key"
+    [ -f "$key" ] || ssh-keygen -t "$t" -f "$key" -N ''
+  done
+fi
 
 # Platforms that hand the app a database URL (Heroku-style DATABASE_URL)
 # get a persistent business database: register it as the "heroku" config
@@ -87,7 +110,7 @@ EOF
 fi
 
 cd /app
-chmod 0755 "$PID_DIR" # sshd traverses this dir as the login user
+chmod 0755 "$PID_DIR" # pidfiles/markers + the staged client keys live here
 
 # Each gateway process has a start function so the watch loop can
 # relaunch it in place for an apply-requested restart.
@@ -100,22 +123,50 @@ start_xray() {
   echo $! > "$PID_DIR/xray.pid"
 }
 start_sshd() {
-  # sshd's StrictModes requires every directory above AuthorizedKeysFile
-  # to be owned by root or the login user. $DATA_DIR may be a bind mount
-  # owned by an unprivileged host user, which sshd refuses outright
-  # ("bad ownership or modes for directory /data"), so sshd reads a
-  # root-owned copy staged in the pid dir. The copy is re-staged at
-  # every sshd (re)start, so key changes take effect with an
-  # sshd-only restart.
-  SSHD_KEYS="$PID_DIR/authorized_keys"
-  if [ -f "$DATA_DIR/authorized_keys" ]; then
-    cp "$DATA_DIR/authorized_keys" "$SSHD_KEYS"
-    chown root:root "$SSHD_KEYS"; chmod 0644 "$SSHD_KEYS"
-  else
-    rm -f "$SSHD_KEYS"
-  fi
+  # authorized_keys is NOT handed to sshd as a file at all. sshd's
+  # StrictModes walks every directory above the file it is pointed
+  # at, and both candidate homes fail that walk somewhere: the data
+  # dir may be a bind mount owned by an unprivileged host user or a
+  # filesystem without Unix modes ("bad ownership or modes for
+  # directory /data"), and /tmp is world-writable (1777), which the
+  # walk rejects just the same. So sshd runs a root-owned command
+  # that cats the canonical file from the data dir - only the
+  # command's own path (/bin/cat, system-owned with a clean parent
+  # chain) is permission-checked, the data file's modes are not.
+  # The command runs per login attempt, so key changes take effect
+  # with no sshd restart at all.
+  # Host keys are staged as copies, for the mirror-image reason:
+  # sshd refuses a private host key that others can access, and the
+  # persistent copies in $DATA_DIR may sit on a filesystem that does
+  # not preserve Unix permissions (an object-storage mount presents
+  # every file as 0777 - linking sshd at them made it ignore every
+  # host key and exit). Stage root-owned 0600 copies under /tmp -
+  # writable in every runtime, including serverless ones whose system
+  # directories are not - and name them on the command line with -h
+  # instead of leaving sshd to a default location. The staging
+  # runs at every sshd (re)start: image start and every
+  # apply-requested relaunch alike.
+  HOSTKEY_DIR=/tmp/xmagic-hostkeys
+  mkdir -p "$HOSTKEY_DIR"
+  chmod 700 "$HOSTKEY_DIR"
+  for t in rsa ecdsa ed25519; do
+    cp "$DATA_DIR/ssh_host_keys/ssh_host_${t}_key" \
+       "$HOSTKEY_DIR/ssh_host_${t}_key"
+    chown root:root "$HOSTKEY_DIR/ssh_host_${t}_key"
+    chmod 0600 "$HOSTKEY_DIR/ssh_host_${t}_key"
+    if [ -f "$DATA_DIR/ssh_host_keys/ssh_host_${t}_key.pub" ]; then
+      cp "$DATA_DIR/ssh_host_keys/ssh_host_${t}_key.pub" \
+         "$HOSTKEY_DIR/ssh_host_${t}_key.pub"
+      chmod 0644 "$HOSTKEY_DIR/ssh_host_${t}_key.pub"
+    fi
+  done
   /usr/sbin/sshd -D -e -p "${SSH_BE_PORT:-12222}" \
-    -o "AuthorizedKeysFile=$SSHD_KEYS" &
+    -h "$HOSTKEY_DIR/ssh_host_rsa_key" \
+    -h "$HOSTKEY_DIR/ssh_host_ecdsa_key" \
+    -h "$HOSTKEY_DIR/ssh_host_ed25519_key" \
+    -o "AuthorizedKeysFile=none" \
+    -o "AuthorizedKeysCommand=/bin/cat $DATA_DIR/authorized_keys" \
+    -o "AuthorizedKeysCommandUser=root" &
   echo $! > "$PID_DIR/sshd.pid"
 }
 start_dispatcher() {
@@ -123,16 +174,42 @@ start_dispatcher() {
   echo $! > "$PID_DIR/dispatcher.pid"
 }
 start_tunnels() {
+  # Stage the ssh client keys next to the pidfiles (local /tmp):
+  # the canonical copies live in the data dir, but the ssh client
+  # refuses a private key whose file looks world-readable, and a
+  # data filesystem that does not preserve Unix permissions (an
+  # object-storage mount presents every file as 0777) makes every
+  # stored key look that way. users.py renders the tunnels with -i
+  # pointing at these staged copies. Staging runs here - at every
+  # tunnels (re)start, boot and apply relaunch alike - so a config
+  # update (including a key rotation, which apply counts as a
+  # tunnels change) always re-stages before the new tunnels read
+  # the keys. Staged copies whose source vanished are dropped.
+  mkdir -p "$PID_DIR/client_keys"
+  chmod 700 "$PID_DIR/client_keys" 2>/dev/null || true
+  for f in "$DATA_DIR"/ssh_client_keys/*; do
+    [ -f "$f" ] || continue
+    cp "$f" "$PID_DIR/client_keys/${f##*/}"
+    chmod 600 "$PID_DIR/client_keys/${f##*/}"
+  done
+  for f in "$PID_DIR"/client_keys/*; do
+    [ -f "$f" ] || continue
+    [ -f "$DATA_DIR/ssh_client_keys/${f##*/}" ] || rm -f "$f"
+  done
   sh /app/single-tunnels.sh &
   echo $! > "$PID_DIR/tunnels.pid"
 }
 
-NAMES="admin xray sshd dispatcher tunnels"
+if [ "$SSH_ON" = 1 ]; then
+  NAMES="admin xray sshd dispatcher tunnels"
+else
+  NAMES="admin xray dispatcher"
+fi
 start_admin
 start_xray
-start_sshd
+[ "$SSH_ON" = 1 ] && start_sshd
 start_dispatcher
-start_tunnels
+[ "$SSH_ON" = 1 ] && start_tunnels
 
 kill_all() {
   sig="${1:-TERM}"

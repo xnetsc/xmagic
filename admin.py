@@ -29,11 +29,13 @@ Environment:
                          routes the console's share of the public port
                          to it)
   XMAGIC_ADMIN_PORT      listen port (default 8090)
-  XMAGIC_ADMIN_RPID      WebAuthn relying-party id (default localhost).
-                         Set to the domain when the console is served on
-                         one, e.g. admin.example.com
-  XMAGIC_ADMIN_ORIGINS   comma-separated allowed origins
-                         (default http://localhost:PORT,http://127.0.0.1:PORT)
+  (The WebAuthn relying-party id is deliberately NOT configured:
+  it is taken from each request's own headers - the hostname of
+  the Origin header, falling back to the Host header - because a
+  Passkey binds to the domain the browser actually used, and the
+  console is served on whatever domain fronts the node. There is
+  no domain setting to get wrong; a credential registered under
+  one domain simply does not exist under another.)
   XMAGIC_DOCKER_SOCK     Docker socket for apply-by-restart
                          (default /var/run/docker.sock; unset the mount
                          and restarts are skipped, renders still happen)
@@ -55,6 +57,7 @@ import secrets
 import sys
 import threading
 import time
+import urllib.parse
 import uuid as uuidlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -62,11 +65,7 @@ import users as users_mod  # the CLI engine: db(), render_config(), ...
 
 BIND = os.environ.get("XMAGIC_ADMIN_BIND", "127.0.0.1")
 PORT = int(os.environ.get("XMAGIC_ADMIN_PORT", "8090"))
-RP_ID = os.environ.get("XMAGIC_ADMIN_RPID", "localhost")
 RP_NAME = "xmagic gateway admin"
-ORIGINS = [o.strip() for o in os.environ.get(
-    "XMAGIC_ADMIN_ORIGINS",
-    f"http://localhost:{PORT},http://127.0.0.1:{PORT}").split(",") if o.strip()]
 DOCKER_SOCK = os.environ.get("XMAGIC_DOCKER_SOCK", "/var/run/docker.sock")
 CHALLENGE_TTL = 300
 
@@ -350,7 +349,25 @@ def parse_auth_data(auth_data: bytes):
     return out
 
 
-def check_client_data(raw: bytes, expected_type: str, challenge: bytes):
+def rp_id_for(headers):
+    """The WebAuthn relying-party id for one request, from the
+    client's own headers: the hostname of the Origin header, falling
+    back to the Host header. Never configured and never stored - the
+    console answers on whatever domain fronts the node, and the
+    browser binds the ceremony to that same domain, so deriving the
+    RP id from the request is the only value that can be right.
+    Empty when the request carries neither header."""
+    origin = headers.get("Origin")
+    if origin:
+        host = urllib.parse.urlsplit(origin).hostname
+        if host:
+            return host
+    return urllib.parse.urlsplit(
+        "//" + (headers.get("Host") or "")).hostname or ""
+
+
+def check_client_data(raw: bytes, expected_type: str, challenge: bytes,
+                      rp_id: str, origin=None):
     try:
         data = json.loads(raw)
     except ValueError:
@@ -363,13 +380,18 @@ def check_client_data(raw: bytes, expected_type: str, challenge: bytes):
         raise ApiError(400, "clientData challenge is not base64url")
     if not secrets.compare_digest(got, challenge):
         raise ApiError(400, "challenge mismatch")
-    if data.get("origin") not in ORIGINS:
-        raise ApiError(400, f"origin {data.get('origin')!r} not allowed (want one of {ORIGINS})")
+    data_origin = data.get("origin") or ""
+    if origin is not None and data_origin != origin:
+        raise ApiError(400, "clientData origin does not match the"
+                            " request's Origin header")
+    if urllib.parse.urlsplit(data_origin).hostname != rp_id:
+        raise ApiError(400, "clientData origin host is not this"
+                            " request's relying-party id")
     return data
 
 
-def check_auth_data_basics(auth, require_uv=True):
-    if auth["rp_id_hash"] != hashlib.sha256(RP_ID.encode()).digest():
+def check_auth_data_basics(auth, rp_id: str, require_uv=True):
+    if auth["rp_id_hash"] != hashlib.sha256(rp_id.encode()).digest():
         raise ApiError(400, "rpId hash mismatch")
     if not auth["user_present"]:
         raise ApiError(400, "user-presence flag not set")
@@ -513,7 +535,7 @@ def cli_replace_status(ticket):
     return {"done": _live_replace_ticket(ticket)["done"]}
 
 
-def cli_replace_verify(ticket, body):
+def cli_replace_verify(ticket, body, rp_id="", origin=None):
     """Complete a CLI-issued passkey replacement: verify the
     attestation (registration_verify), swap the credential, establish
     the browser's fresh key-bound session and revoke every other
@@ -521,7 +543,8 @@ def cli_replace_verify(ticket, body):
     entry = _live_replace_ticket(ticket)
     if entry["done"]:
         raise ApiError(400, "this replace ticket was already used")
-    result, ecdh = registration_verify(body, allow_replace=True)
+    result, ecdh = registration_verify(body, rp_id, origin,
+                                       allow_replace=True)
     session = establish_session("web", body.get("label"), ecdh)
     with admin_db() as conn:
         conn.execute(
@@ -587,7 +610,10 @@ def store_credential(conn, credential_id: bytes, x: int, y: int, sign_count: int
 
 # ------------------------------------------------------------ ceremonies
 
-def registration_options(body=None, allow_replace=False):
+def registration_options(body=None, rp_id="", allow_replace=False):
+    if not rp_id:
+        raise ApiError(400, "cannot determine the relying-party id"
+                            " from the request headers")
     with admin_db() as conn:
         if load_credential(conn) is not None and not allow_replace:
             raise ApiError(403, "an admin passkey is already registered; "
@@ -596,7 +622,7 @@ def registration_options(body=None, allow_replace=False):
         "register", (body or {}).get("ecdh_pub"))
     out = {
         "challenge": b64u_encode(challenge),
-        "rp": {"id": RP_ID, "name": RP_NAME},
+        "rp": {"id": rp_id, "name": RP_NAME},
         "user": {"id": b64u_encode(secrets.token_bytes(32)),
                  "name": "admin", "displayName": "admin"},
         "pubKeyCredParams": [{"type": "public-key", "alg": -7}],
@@ -610,7 +636,7 @@ def registration_options(body=None, allow_replace=False):
     return out
 
 
-def registration_verify(body, allow_replace=False):
+def registration_verify(body, rp_id="", origin=None, allow_replace=False):
     with admin_db() as conn:
         if load_credential(conn) is not None and not allow_replace:
             raise ApiError(403, "an admin passkey is already registered")
@@ -623,9 +649,10 @@ def registration_verify(body, allow_replace=False):
     except Exception as exc:
         raise ApiError(400, f"malformed registration response: {exc}")
     ecdh = take_challenge(raw_challenge, "register")
-    check_client_data(client_data, "webauthn.create", raw_challenge)
+    check_client_data(client_data, "webauthn.create", raw_challenge,
+                      rp_id, origin)
     auth = parse_auth_data(attestation["authData"])
-    check_auth_data_basics(auth)
+    check_auth_data_basics(auth, rp_id)
     if "credential_id" not in auth:
         raise ApiError(400, "no attested credential data in authData")
     cose = auth["cose_key"]
@@ -654,7 +681,10 @@ def registration_verify(body, allow_replace=False):
     return {"status": "registered"}, ecdh
 
 
-def login_options(body=None):
+def login_options(body=None, rp_id=""):
+    if not rp_id:
+        raise ApiError(400, "cannot determine the relying-party id"
+                            " from the request headers")
     with admin_db() as conn:
         cred = load_credential(conn)
     if cred is None:
@@ -663,7 +693,7 @@ def login_options(body=None):
         "login", (body or {}).get("ecdh_pub"))
     out = {
         "challenge": b64u_encode(challenge),
-        "rpId": RP_ID,
+        "rpId": rp_id,
         "allowCredentials": [{"type": "public-key", "id": cred["credential_id"]}],
         "userVerification": "required",
         "timeout": 60000,
@@ -673,7 +703,7 @@ def login_options(body=None):
     return out
 
 
-def login_verify(body):
+def login_verify(body, rp_id="", origin=None):
     with admin_db() as conn:
         cred = load_credential(conn)
     if cred is None:
@@ -690,9 +720,10 @@ def login_verify(body):
     except Exception as exc:
         raise ApiError(400, f"malformed assertion: {exc}")
     ecdh = take_challenge(raw_challenge, "login")
-    check_client_data(client_data, "webauthn.get", raw_challenge)
+    check_client_data(client_data, "webauthn.get", raw_challenge,
+                      rp_id, origin)
     auth = parse_auth_data(auth_data)
-    check_auth_data_basics(auth)
+    check_auth_data_basics(auth, rp_id)
     pub = (int(cred["public_key_x"]), int(cred["public_key_y"]))
     signed = auth_data + hashlib.sha256(client_data).digest()
     if not ecdsa_verify(pub, signature, signed):
@@ -742,13 +773,18 @@ def api_list_users():
         if r["username"] in members:
             d["interconnect"] = list(members[r["username"]])
         users.append(d)
-    return {"users": users, "vless_enabled": v_on}
+    return {"users": users, "vless_enabled": v_on,
+            "ssh_enabled": users_mod.ssh_enabled()}
 
 
 def api_add_user(body):
     username = (body.get("username") or "").strip()
     if not username or any(c.isspace() for c in username):
         raise ApiError(400, "username must be non-empty without whitespace")
+    if (body.get("ssh_pubkey") or "").strip() and not users_mod.ssh_enabled():
+        raise ApiError(400, "ssh support is disabled (XMAGIC_ENABLE_SSH"
+                            " is not 1); set XMAGIC_ENABLE_SSH=1 and"
+                            " restart the node to register ssh keys")
     from datetime import datetime, timezone
     user_uuid = str(uuidlib.uuid4())
     trojan_pw, ss_pw = users_mod.gen_password(), users_mod.gen_password()
@@ -768,7 +804,7 @@ def api_add_user(body):
         v_on = users_mod.vless_enabled(conn)
     applied = apply_changes()
     return {"user": _user_dict(row, with_secrets=True), "applied": applied,
-            "vless_enabled": v_on}
+            "vless_enabled": v_on, "ssh_enabled": users_mod.ssh_enabled()}
 
 
 def api_user_action(username, action, body):
@@ -784,6 +820,12 @@ def api_user_action(username, action, body):
                          " WHERE username = ?",
                          (users_mod.gen_password(), users_mod.gen_password(), username))
         elif action == "setkey":
+            if (body.get("ssh_pubkey") or "").strip() \
+                    and not users_mod.ssh_enabled():
+                raise ApiError(400, "ssh support is disabled"
+                                    " (XMAGIC_ENABLE_SSH is not 1); set"
+                                    " XMAGIC_ENABLE_SSH=1 and restart"
+                                    " the node to register ssh keys")
             conn.execute("UPDATE users SET ssh_pubkey = ? WHERE username = ?",
                          (body.get("ssh_pubkey") or None, username))
         elif action == "setgroup":
@@ -807,6 +849,7 @@ def api_user_action(username, action, body):
         v_on = users_mod.vless_enabled(conn)
     applied = apply_changes()
     return {"applied": applied, "vless_enabled": v_on,
+            "ssh_enabled": users_mod.ssh_enabled(),
             "user": _user_dict(row, with_secrets=True) if row else None}
 
 
@@ -830,6 +873,10 @@ def api_generate_keypair(body):
     USER keypairs are never minted here - the console generates them
     in the page (genUserKeypair) and the remote CLI generates them
     locally, so a user's private key never exists on the server."""
+    if not users_mod.ssh_enabled():
+        raise ApiError(400, "ssh support is disabled (XMAGIC_ENABLE_SSH"
+                            " is not 1); set XMAGIC_ENABLE_SSH=1 and"
+                            " restart the node to use ssh keys")
     comment = str((body or {}).get("comment") or "xmagic")[:64]
     pem, pub, fp = users_mod.generate_ed25519_keypair(comment)
     return {"private_key": pem, "public_key": pub, "fingerprint": fp}
@@ -865,6 +912,10 @@ def api_add_upstream(body):
         if proto in ("vless-ws", "vless") and not users_mod.vless_enabled(conn):
             raise ApiError(400, "vless upstreams are disabled together with"
                                 " the vless protocol (enable vless first)")
+        if proto == "ssh" and not users_mod.ssh_enabled():
+            raise ApiError(400, "ssh upstreams are disabled together with"
+                                " ssh support (XMAGIC_ENABLE_SSH is not 1;"
+                                " set it to 1 and restart the node)")
         try:
             conn.execute(
                 "INSERT INTO upstreams (name, grp, address, port, protocol, path, uuid,"
@@ -1270,10 +1321,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if getattr(self, "_session_row", None) is None:
             raise ApiError(401, "not logged in")
 
+    def _rp_context(self):
+        """(rp_id, origin) for this request, both taken from its own
+        headers - see rp_id_for. Nothing about the console's domain
+        is configured anywhere."""
+        return rp_id_for(self.headers), self.headers.get("Origin")
+
     def _check_origin(self):
+        # Same-origin guard, derived from the request itself: an
+        # Origin header whose host is not the host the request was
+        # sent to belongs to some other site. Loopback aliases count
+        # as one host (localhost == 127.0.0.1 == ::1).
         origin = self.headers.get("Origin")
-        if origin is not None and origin not in ORIGINS:
-            raise ApiError(403, f"origin {origin!r} not allowed")
+        if origin is None:
+            return
+        o_host = urllib.parse.urlsplit(origin).hostname or ""
+        h_host = urllib.parse.urlsplit(
+            "//" + (self.headers.get("Host") or "")).hostname or ""
+        loopback = {"localhost", "127.0.0.1", "::1"}
+        if o_host != h_host and not (
+                o_host in loopback and h_host in loopback):
+            raise ApiError(403, f"origin {origin!r} does not match"
+                                " this host")
 
     # -- routing
     def do_GET(self):
@@ -1311,7 +1380,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             with admin_db() as conn:
                 registered = load_credential(conn) is not None
             self._send_json(200, {"registered": registered,
-                                  "rp_id": RP_ID})
+                                  "rp_id": rp_id_for(self.headers)})
             return
         if path == "/cli/xmagic.py":
             self._send_cli_script()
@@ -1377,15 +1446,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except ValueError:
                 raise ApiError(400, "request body is not JSON")
         ua_label = (self.headers.get("User-Agent") or "")[:80] or None
+        rp_id, req_origin = self._rp_context()
         if path == "/api/register/options":
             allow = self._session_row is not None
-            self._send_json(200, registration_options(body, allow_replace=allow))
+            self._send_json(200, registration_options(
+                body, rp_id, allow_replace=allow))
             return
         if path == "/api/register/verify":
             authed = self._session_row is not None
             with admin_db() as conn:
                 had_credential = load_credential(conn) is not None
-            result, ecdh = registration_verify(body, allow_replace=authed)
+            result, ecdh = registration_verify(
+                body, rp_id, req_origin, allow_replace=authed)
             session = establish_session("web", ua_label, ecdh)
             if had_credential:
                 # The passkey was replaced: every other session dies here.
@@ -1395,10 +1467,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send_json(200, result)
             return
         if path == "/api/login/options":
-            self._send_json(200, login_options(body))
+            self._send_json(200, login_options(body, rp_id))
             return
         if path == "/api/login/verify":
-            result, ecdh = login_verify(body)
+            result, ecdh = login_verify(body, rp_id, req_origin)
             result["session"] = establish_session("web", ua_label, ecdh)
             self._send_json(200, result)
             return
@@ -1417,10 +1489,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if path == "/api/cli-replace-options":
             _live_replace_ticket(body.get("ticket"))
-            self._send_json(200, registration_options(body, allow_replace=True))
+            self._send_json(200, registration_options(
+                body, rp_id, allow_replace=True))
             return
         if path == "/api/cli-replace-verify":
-            self._send_json(200, cli_replace_verify(body.get("ticket"), body))
+            self._send_json(200, cli_replace_verify(
+                body.get("ticket"), body, rp_id, req_origin))
             return
         if path == "/api/logout":
             drop_session(self._session_row["sid"])
@@ -1671,7 +1745,7 @@ td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
       <section class="view" data-view="users">
         <div class="card">
           <h2>代理用户</h2>
-          <p class="sub">每个用户有一套 Trojan / HTTP 凭证与独立的 Shadowsocks 密码，可选登记 SSH 公钥。VLESS 默认关闭（在「设置」里开启后凭 UUID 接入），公网 SOCKS5 默认关闭。</p>
+          <p class="sub">每个用户有一套 Trojan / HTTP 凭证与独立的 Shadowsocks 密码，可选登记 SSH 公钥。VLESS 默认关闭（在「设置」里开启后凭 UUID 接入），公网 SOCKS5 默认关闭，SSH 默认关闭（靠部署环境变量 XMAGIC_ENABLE_SSH=1 开启）。</p>
           <div class="add-bar"><span class="lbl">添加用户：</span><button class="btn ghost sm" data-add-user>+ 代理用户</button></div>
           <div class="tabs" id="user-tabs">
             <button type="button" class="tab active" data-user-tab="list">用户列表</button>
@@ -1807,7 +1881,9 @@ td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
           专属端口段（每人 16 个端口，见用户列表），同组成员经代理拨 <code>127.0.0.1:端口</code> 即可
           互访，如同在同一局域网；不想互访的分组填到上面即关闭该组互访。非同组成员拨回环一律拦截。<br>
           默认不加密的协议不开：VLESS 入站默认关闭（协议自身不加密，需要时勾选上面的开关开启）；
-          公网 SOCKS5 默认关闭（明文且不能借道 HTTPS，靠部署环境变量 XMAGIC_ENABLE_SOCKS5=1 开启）。
+          公网 SOCKS5 默认关闭（明文且不能借道 HTTPS，靠部署环境变量 XMAGIC_ENABLE_SOCKS5=1 开启）。<br>
+          <span id="set-ssh-state">SSH 支持：读取中。</span>
+          SSH 关闭时 sshd 与隧道进程不启动，SSH 公钥、SSH 上级与组内互访都不可用，控制台不能开启它。
           Trojan（设计上强制 TLS）、Shadowsocks（自带加密）、HTTP 代理（借道外层 HTTPS）不受影响。<br>
           REALITY 入站默认开启且与 VLESS 开关独立：客户端以 VLESS + REALITY（flow xtls-rprx-vision、
           fingerprint chrome）直连公网口，参数取上面的 dest / serverNames / shortIds 与公钥加上用户自己的 UUID；
@@ -2034,14 +2110,16 @@ async function refresh() {
   const usersResp = await api("/api/users");
   const users = usersResp.users;
   window.__vlessOn = !!usersResp.vless_enabled;
+  window.__sshOn = !!usersResp.ssh_enabled;
+  syncSshAvailability();
   $("users-table").innerHTML = "<tr><th>用户</th><th>分组</th><th>启用</th><th>凭证</th><th>操作</th></tr>" +
     users.map(u => `<tr><td><strong>${u.username}</strong>${u.note ? `<br><span class="small">${u.note}</span>` : ""}</td><td>${u.group}</td>
       <td><span class="badge ${u.enabled ? "on" : "off"}">${u.enabled ? "启用" : "停用"}</span></td>
       <td><code>vless uuid ${u.vless_uuid}${window.__vlessOn ? "" : "（未启用）"}<br>密码 ${u.password}<br>ss ${u.ss_method} / ${u.ss_password}` +
-      `${u.ssh_key ? "<br>SSH 公钥已登记" + (u.ssh_fingerprint ? " " + u.ssh_fingerprint : "") + "<br>ssh -D 1080 -N -i xmagic-" + u.username + ".key -p " + s.public_port + " proxy@" + location.hostname : ""}${u.interconnect ? "<br>组内互访端口 " + u.interconnect[0] + "-" + u.interconnect[1] : ""}</code></td>
+      `${u.ssh_key ? "<br>SSH 公钥已登记" + (u.ssh_fingerprint ? " " + u.ssh_fingerprint : "") + (window.__sshOn ? "<br>ssh -D 1080 -N -i xmagic-" + u.username + ".key -p " + s.public_port + " proxy@" + location.hostname : "（未启用）") : ""}${u.interconnect && window.__sshOn ? "<br>组内互访端口 " + u.interconnect[0] + "-" + u.interconnect[1] : ""}</code></td>
       <td><div class="row-actions"><button class="sm" data-act="passwd" data-u="${u.username}">换密码</button>
       <button class="sm" data-act="rotate-uuid" data-u="${u.username}">换UUID</button>
-      <button class="sm" data-act="setkey" data-u="${u.username}">公钥</button>
+      <button class="sm" data-act="setkey" data-u="${u.username}"${window.__sshOn ? "" : " disabled"}>公钥</button>
       <button class="sm" data-act="setgroup" data-u="${u.username}" data-g="${u.group}">分组</button>
       <button class="sm" data-act="setmethod" data-u="${u.username}" data-m="${u.ss_method}">SS方法</button>
       <button class="sm" data-act="setnote" data-u="${u.username}" data-n="${u.note || ""}">备注</button>
@@ -2076,6 +2154,8 @@ async function refresh() {
   sf.querySelector("[name=vless_enabled]").checked =
     !!settings.vless_enabled;
   window.__vlessOn = !!settings.vless_enabled;
+  window.__sshOn = !!settings.ssh_enabled;
+  syncSshAvailability();
   sf.querySelector("[name=reality_enabled]").checked =
     !!settings.reality_enabled;
   sf.querySelector("[name=reality_dest]").value =
@@ -2459,9 +2539,23 @@ function closeUserFormTab() {
 document.querySelectorAll("#user-tabs .tab").forEach(t =>
   t.addEventListener("click", () => switchUserTab(t.dataset.userTab)));
 $("user-cancel").onclick = () => closeUserFormTab();
+function syncSshAvailability() {
+  const on = !!window.__sshOn;
+  const el = $("set-ssh-state");
+  if (el) el.textContent = on
+    ? "SSH 支持：已启用（部署环境变量 XMAGIC_ENABLE_SSH=1）。"
+    : "SSH 支持：未启用（默认关；靠部署环境变量 XMAGIC_ENABLE_SSH=1 开启，修改后需重启节点）。";
+  const pub = document.querySelector('#form-user [name="ssh_pubkey"]');
+  if (pub) pub.disabled = !on;
+  for (const id of ["btn-pick-pubkey", "btn-gen-userkey",
+                    "btn-pick-privkey", "btn-gen-upkey"]) {
+    const b = $(id); if (b) b.disabled = !on;
+  }
+}
 function buildUpAddBtns() {
   const list = UP_PROTOS.filter(p =>
-    window.__vlessOn || (p !== "vless-ws" && p !== "vless"));
+    (window.__vlessOn || (p !== "vless-ws" && p !== "vless")) &&
+    (window.__sshOn || p !== "ssh"));
   $("up-add-btns").innerHTML = list.map(p =>
     `<button class="btn ghost sm" data-add-up="${p}">+ ${UP_LABELS[p]}</button>`).join(" ");
 }
@@ -2469,7 +2563,8 @@ function buildUpProtoOptions(keep) {
   const sel = $("form-upstream").querySelector("[name=protocol]");
   const cur = keep || sel.value;
   const list = UP_PROTOS.filter(p =>
-    window.__vlessOn || (p !== "vless-ws" && p !== "vless") || p === keep);
+    ((window.__vlessOn || (p !== "vless-ws" && p !== "vless")) &&
+     (window.__sshOn || p !== "ssh")) || p === keep);
   sel.innerHTML = list.map(p => `<option>${p}</option>`).join("");
   sel.value = list.includes(cur) ? cur : list[0];
 }
@@ -2968,7 +3063,7 @@ def main():
             print(f"first-boot render failed: {exc}", file=sys.stderr)
     server = http.server.ThreadingHTTPServer((BIND, PORT), Handler)
     print(f"xmagic admin console on http://{BIND}:{PORT} "
-          f"(rp_id={RP_ID}, origins={ORIGINS}, "
+          f"(rp_id taken from request headers, "
           f"admin {'registered' if registered else 'NOT registered - setup open'})")
     try:
         server.serve_forever()

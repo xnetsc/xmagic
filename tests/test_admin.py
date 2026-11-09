@@ -237,7 +237,7 @@ def main():
     db_path = os.path.join(workdir, "data", "users.db")
     env = dict(os.environ, PROXY_DB=db_path,
                XMAGIC_ADMIN_BIND="127.0.0.1", XMAGIC_ADMIN_PORT=str(PORT),
-               XMAGIC_ADMIN_RPID="localhost", XMAGIC_DOCKER_SOCK="/nonexistent.sock")
+               XMAGIC_ENABLE_SSH="1", XMAGIC_DOCKER_SOCK="/nonexistent.sock")
     server = subprocess.Popen(
         [sys.executable, os.path.join(ROOT, "admin.py")],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -276,6 +276,11 @@ def main():
 
         status, body = client.call("GET", "/api/status")
         check("status: registered", body["registered"] is True)
+        check("status rp_id comes from the request headers",
+              body.get("rp_id") == "localhost", f"{body}")
+        status, body = client.call("GET", "/api/users")
+        check("users payload reports ssh_enabled true",
+              body.get("ssh_enabled") is True, f"{body}")
         status, _ = client.call("GET", "/api/state")
         check("the negotiated session key opens the API", status == 200)
 
@@ -978,6 +983,65 @@ def main():
         fresh = Client()
         status, body = fresh.call("GET", "/api/status")
         check("setup reopens after admin-reset", body["registered"] is False)
+
+        # -------------------------------------- ssh off by default
+        # A node started without XMAGIC_ENABLE_SSH refuses every
+        # SSH-shaped operation; the rest of the API is unaffected.
+        workdir2 = tempfile.mkdtemp(prefix="xmagic-admin-sshoff-")
+        env2 = dict(os.environ,
+                    PROXY_DB=os.path.join(workdir2, "data", "users.db"),
+                    XMAGIC_ADMIN_BIND="127.0.0.1",
+                    XMAGIC_ADMIN_PORT=str(PORT + 7),
+                    XMAGIC_DOCKER_SOCK="/nonexistent.sock")
+        server2 = subprocess.Popen(
+            [sys.executable, os.path.join(ROOT, "admin.py")],
+            env=env2, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True)
+        try:
+            c2 = Client(port=PORT + 7)
+            for _ in range(50):
+                try:
+                    c2.call("GET", "/api/status")
+                    break
+                except OSError:
+                    time.sleep(0.2)
+            auth_off = Authenticator()
+            origin2 = f"http://localhost:{PORT + 7}"
+            status, opts = c2.options("register")
+            status, body = c2.verify(
+                "register",
+                auth_off.attestation(opts["challenge"], "localhost",
+                                     origin2))
+            check("ssh-off node: registration still works",
+                  status == 200, f"{status} {body}")
+            status, body = c2.call("GET", "/api/users")
+            check("ssh-off node: users payload reports ssh_enabled false",
+                  body.get("ssh_enabled") is False, f"{body}")
+            status, _ = c2.call("POST", "/api/keys/generate", {})
+            check("ssh-off node: keys/generate refused",
+                  status == 400, f"got {status}")
+            status, _ = c2.call("POST", "/api/users",
+                                {"username": "ned",
+                                 "ssh_pubkey": "ssh-ed25519 AAAA"})
+            check("ssh-off node: add user with an ssh key refused",
+                  status == 400, f"got {status}")
+            status, _ = c2.call("POST", "/api/users",
+                                {"username": "ned"})
+            check("ssh-off node: add user without a key works",
+                  status == 201, f"got {status}")
+            status, _ = c2.call("POST", "/api/users/ned/setkey",
+                                {"ssh_pubkey": "ssh-ed25519 AAAA"})
+            check("ssh-off node: setkey refused",
+                  status == 400, f"got {status}")
+            status, _ = c2.call("POST", "/api/upstreams",
+                                {"name": "upoff", "address": "10.9.9.9",
+                                 "port": 22, "protocol": "ssh",
+                                 "username": "proxy",
+                                 "key_file": "/keys/x.key"})
+            check("ssh-off node: ssh upstream refused",
+                  status == 400, f"got {status}")
+        finally:
+            server2.terminate()
     finally:
         server.terminate()
         out = server.stdout.read() if server.stdout else ""

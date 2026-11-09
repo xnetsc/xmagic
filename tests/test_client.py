@@ -39,7 +39,7 @@ def start_server(port, workdir):
     env = dict(os.environ,
                PROXY_DB=os.path.join(workdir, "data", "users.db"),
                XMAGIC_ADMIN_BIND="127.0.0.1", XMAGIC_ADMIN_PORT=str(port),
-               XMAGIC_ADMIN_RPID="localhost", XMAGIC_DOCKER_SOCK="/nonexistent.sock")
+               XMAGIC_ENABLE_SSH="1", XMAGIC_DOCKER_SOCK="/nonexistent.sock")
     proc = subprocess.Popen([sys.executable, os.path.join(ROOT, "admin.py")],
                             env=env, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True)
