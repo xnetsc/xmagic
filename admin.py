@@ -65,6 +65,13 @@ import users as users_mod  # the CLI engine: db(), render_config(), ...
 
 BIND = os.environ.get("XMAGIC_ADMIN_BIND", "127.0.0.1")
 PORT = int(os.environ.get("XMAGIC_ADMIN_PORT", "8090"))
+
+
+def _blog(msg):
+    """Boot diagnostics, flushed immediately: a startup that hangs
+    or dies must leave its last completed step in the log, which a
+    buffered print would never do."""
+    print(f"admin[boot] {time.strftime('%H:%M:%S')} {msg}", flush=True)
 RP_NAME = "xmagic gateway admin"
 DOCKER_SOCK = os.environ.get("XMAGIC_DOCKER_SOCK", "/var/run/docker.sock")
 CHALLENGE_TTL = 300
@@ -589,9 +596,23 @@ def drop_session(sid):
 
 # ------------------------------------------------------------ admin DB
 
+_DB_BOOT = [True]
+
+
 def admin_db():
+    # The first call happens at startup, before the port is bound;
+    # log its steps once so a deployment log shows whether the
+    # database connect or the schema write is where startup stops.
+    first = _DB_BOOT[0]
+    _DB_BOOT[0] = False
+    if first:
+        _blog(f"connecting to database ({users_mod.DB_PATH}) ...")
     conn = users_mod.db()
+    if first:
+        _blog("database connected; applying admin schema ...")
     conn.executescript(ADMIN_SCHEMA)
+    if first:
+        _blog("admin schema applied")
     return conn
 
 
@@ -3049,8 +3070,12 @@ start();
 
 
 def main():
+    _blog(f"starting (db={users_mod.DB_PATH}, bind={BIND}:{PORT}) ...")
+    _t0 = time.time()
     with admin_db() as conn:
         registered = load_credential(conn) is not None
+    _blog(f"admin database ready in {time.time() - _t0:.2f}s "
+          f"(passkey {'registered' if registered else 'not registered'})")
     data_dir = os.path.dirname(os.path.abspath(users_mod.DB_PATH))
     if not os.path.exists(os.path.join(data_dir, "config.json")):
         # First boot: render an empty-but-valid config so the xray/sshd
@@ -3058,13 +3083,18 @@ def main():
         # admin has added anyone.
         try:
             result = users_mod.render_all(data_dir)
-            print(f"first boot: rendered initial config ({result['users']} users)")
+            print(f"first boot: rendered initial config ({result['users']} users)",
+                  flush=True)
         except Exception as exc:  # noqa: BLE001
-            print(f"first-boot render failed: {exc}", file=sys.stderr)
+            print(f"first-boot render failed: {exc}", file=sys.stderr, flush=True)
+    else:
+        _blog(f"config.json present in {data_dir}; no first-boot render")
+    _blog(f"binding http://{BIND}:{PORT} ...")
     server = http.server.ThreadingHTTPServer((BIND, PORT), Handler)
     print(f"xmagic admin console on http://{BIND}:{PORT} "
           f"(rp_id taken from request headers, "
-          f"admin {'registered' if registered else 'NOT registered - setup open'})")
+          f"admin {'registered' if registered else 'NOT registered - setup open'})",
+          flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

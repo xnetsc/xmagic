@@ -17,6 +17,13 @@ if [ -n "${PORT:-}" ]; then
   XRAY_PORT="$PORT"
   export XRAY_PORT
 fi
+# Boot diagnostics: one timestamped prefix for every line this script
+# logs, so a failing deployment's log shows which process started,
+# which is still alive seconds later, and which one died (or whether
+# the script was signalled instead). Children's own output stays on
+# the same stream, unprefixed.
+BOOT_TS=$(date +%s)
+xlog() { echo "xmagic: $(date '+%H:%M:%S') $*" >&2; }
 DATA_DIR=$(dirname "${PROXY_DB:-/data/users.db}")
 PID_DIR="${XMAGIC_PID_DIR:-/tmp/xmagic-run}"
 mkdir -p "$DATA_DIR/ssh_host_keys" "$DATA_DIR/ssh_client_keys" \
@@ -97,6 +104,11 @@ fi
 # First boot: render an initial (empty but valid) gateway config so
 # xray has a file to start with. Best effort only - the admin console
 # also renders on its own first boot and after every change.
+if [ -f "$DATA_DIR/config.json" ]; then
+  xlog "boot: config.json already present in $DATA_DIR"
+else
+  xlog "boot: no config.json in $DATA_DIR; rendering initial config"
+fi
 if [ ! -f "$DATA_DIR/config.json" ]; then
   python3 - <<'EOF' || true
 import os
@@ -115,14 +127,17 @@ chmod 0755 "$PID_DIR" # pidfiles/markers + the staged client keys live here
 # Each gateway process has a start function so the watch loop can
 # relaunch it in place for an apply-requested restart.
 start_admin() {
+  xlog "starting admin"
   python3 /app/admin.py &
   echo $! > "$PID_DIR/admin.pid"
 }
 start_xray() {
+  xlog "starting xray"
   /usr/local/bin/xray run -c "$DATA_DIR/config.json" &
   echo $! > "$PID_DIR/xray.pid"
 }
 start_sshd() {
+  xlog "starting sshd"
   # authorized_keys is NOT handed to sshd as a file at all. sshd's
   # StrictModes walks every directory above the file it is pointed
   # at, and both candidate homes fail that walk somewhere: the data
@@ -170,10 +185,12 @@ start_sshd() {
   echo $! > "$PID_DIR/sshd.pid"
 }
 start_dispatcher() {
+  xlog "starting dispatcher"
   python3 /app/sniff.py &
   echo $! > "$PID_DIR/dispatcher.pid"
 }
 start_tunnels() {
+  xlog "starting tunnels"
   # Stage the ssh client keys next to the pidfiles (local /tmp):
   # the canonical copies live in the data dir, but the ssh client
   # refuses a private key whose file looks world-readable, and a
@@ -200,16 +217,49 @@ start_tunnels() {
   echo $! > "$PID_DIR/tunnels.pid"
 }
 
+# One-shot boot probe (not a supervised process): a few seconds
+# after start, and once more later, record which processes are
+# alive and whether the admin backend actually accepts connections.
+# This is what tells "admin died" apart from "admin is alive but
+# never listened" in a deployment log.
+probe_state() {
+  _aport="${ADMIN_BE_PORT:-${XMAGIC_ADMIN_PORT:-18090}}"
+  for _n in $NAMES; do
+    _p=$(cat "$PID_DIR/$_n.pid" 2>/dev/null || echo "")
+    if [ -n "$_p" ] && kill -0 "$_p" 2>/dev/null; then
+      xlog "probe: $_n (pid $_p) alive"
+    else
+      xlog "probe: $_n (pid ${_p:-none}) NOT RUNNING"
+    fi
+  done
+  if python3 -c 'import socket, sys; s = socket.socket(); s.settimeout(2); sys.exit(0 if s.connect_ex(("127.0.0.1", int(sys.argv[1]))) == 0 else 1)' "$_aport" 2>/dev/null; then
+    xlog "probe: admin port $_aport LISTENING"
+  else
+    xlog "probe: admin port $_aport NOT LISTENING"
+  fi
+}
+
 if [ "$SSH_ON" = 1 ]; then
   NAMES="admin xray sshd dispatcher tunnels"
 else
   NAMES="admin xray dispatcher"
 fi
+xlog "boot: data_dir=$DATA_DIR pid_dir=$PID_DIR ssh_on=$SSH_ON xray_port=${XRAY_PORT:-8080} admin_port=${XMAGIC_ADMIN_PORT:-8090}"
+_mnt=$(grep ' /data ' /proc/mounts 2>/dev/null || true)
+[ -n "$_mnt" ] && xlog "boot: /data mount: $_mnt"
+if touch "$DATA_DIR/.xmagic-probe" 2>/dev/null; then
+  rm -f "$DATA_DIR/.xmagic-probe"
+  xlog "boot: data dir is writable"
+else
+  xlog "boot: data dir is NOT writable"
+fi
+ls -la "$DATA_DIR" 2>/dev/null | while IFS= read -r _line; do xlog "boot: data: $_line"; done
 start_admin
 start_xray
 [ "$SSH_ON" = 1 ] && start_sshd
 start_dispatcher
 [ "$SSH_ON" = 1 ] && start_tunnels
+( sleep 4; probe_state; sleep 11; probe_state ) &
 
 kill_all() {
   sig="${1:-TERM}"
@@ -219,6 +269,7 @@ kill_all() {
 }
 
 shutdown() {
+  xlog "shutdown requested (signal received); stopping all processes"
   kill_all TERM
   exit "${1:-0}"
 }
@@ -240,13 +291,13 @@ while :; do
       req="$PID_DIR/restart-$name.req"
       if [ -f "$req" ] && [ "$(cat "$req" 2>/dev/null)" = "$pid" ]; then
         rm -f "$req"
-        echo "xmagic: restarting $name (apply requested)" >&2
+        xlog "restarting $name (apply requested)"
         start_$name
         continue
       fi
       code=0
       wait "$pid" 2>/dev/null || code=$?
-      echo "xmagic: process $name ($pid) exited (status $code); shutting down" >&2
+      xlog "process $name ($pid) exited (status $code) after $(( $(date +%s) - BOOT_TS ))s; shutting down"
       kill_all TERM
       sleep 1
       kill_all KILL
