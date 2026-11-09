@@ -1,6 +1,18 @@
 # First-byte dispatcher: owns the single public port and routes each
 # connection by its opening bytes (SSH banner / SOCKS5 / HTTP / WS /
 # anything else) to the sshd, the proxy inbounds, or the Xray mux.
+
+# Native SS-WS termination accelerator (_demuxaccel): built here,
+# imported by sniff.py when present; the pure-Python demuxer is the
+# fallback when it is not.
+FROM python:3.12-alpine AS accel
+RUN apk add --no-cache gcc musl-dev
+COPY demuxaccel.c /src/
+RUN cc -O2 -fPIC -shared \
+      -I"$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["include"])')" \
+      -o /src/_demuxaccel.so /src/demuxaccel.c -lpthread
+
 FROM python:3.12-alpine
 COPY sniff.py /app/sniff.py
+COPY --from=accel /src/_demuxaccel.so /app/_demuxaccel.so
 CMD ["python3", "/app/sniff.py"]

@@ -105,6 +105,11 @@ import time
 import uuid
 import zlib
 
+try:
+    import _demuxaccel      # native SS-WS termination (demuxaccel.c)
+except ImportError:
+    _demuxaccel = None
+
 LISTEN_PORT = int(os.environ.get("XRAY_PORT", "8080"))
 TARGETS = {
     "mux": ("127.0.0.1", int(os.environ.get("XRAY_MUX_PORT", "18080"))),
@@ -1381,6 +1386,10 @@ def _serve_ss_ws(client, mux, addr, be_port, path, head_done):
         pass
     t.join(timeout=5)
     log(f"{addr}: v2ray-plugin mux on {path} - demultiplexing")
+    if _demuxaccel is not None and _demuxaccel.demux_submit(
+            client.fileno(), be_port, path, payload,
+            bytes(rawbuf[consumed:])):
+        return              # the native pool owns the connection now
     _SSDemux(client, be_port, path).serve(payload,
                                           bytes(rawbuf[consumed:]))
 

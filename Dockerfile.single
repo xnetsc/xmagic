@@ -39,6 +39,16 @@
 ARG XRAY_VERSION=26.10.31
 FROM ghcr.io/xtls/xray-core:${XRAY_VERSION} AS xray-core
 
+# Native SS-WS termination accelerator (_demuxaccel): built here,
+# imported by sniff.py when present; the pure-Python demuxer is the
+# fallback when it is not.
+FROM python:3.12-alpine AS accel
+RUN apk add --no-cache gcc musl-dev
+COPY demuxaccel.c /src/
+RUN cc -O2 -fPIC -shared \
+      -I"$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["include"])')" \
+      -o /src/_demuxaccel.so /src/demuxaccel.c -lpthread
+
 FROM python:3.12-alpine
 RUN apk add --no-cache openssh-server openssh-client \
  && adduser -D -s /bin/false proxy \
@@ -50,6 +60,7 @@ RUN apk add --no-cache openssh-server openssh-client \
 RUN pip install --no-cache-dir "psycopg[binary]" "pymysql"
 COPY --from=xray-core /usr/local/bin/xray /usr/local/bin/xray
 COPY users.py admin.py sniff.py xmagic.py /app/
+COPY --from=accel /src/_demuxaccel.so /app/_demuxaccel.so
 # Precompile bytecode: on a cold start with a heavily throttled
 # CPU (serverless containers), compiling ~250KB of Python at
 # import time takes seconds the gateway may not have.
