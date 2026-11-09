@@ -268,16 +268,28 @@ fetch() {
   curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 \
     -o "$1" "$2"
 }
-fetch "$WORK/xray.zip" \
-  "https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/Xray-linux-64.zip"
-(cd "$WORK" && unzip -o -q xray.zip xray && chmod +x xray)
+# The binary comes out of the official image the Dockerfiles
+# build from: the release-zip endpoint once served 504s for
+# hours (every retry failed) while GHCR - this script's own
+# image source anyway - stayed up, so the download is gone.
+docker pull -q "ghcr.io/xtls/xray-core:${XRAY_VERSION}"
+cid=$(docker create "ghcr.io/xtls/xray-core:${XRAY_VERSION}")
+docker cp "$cid:/usr/local/bin/xray" "$WORK/xray"
+docker rm "$cid" > /dev/null
+chmod +x "$WORK/xray"
 
 # Mihomo client (pinned), for the SIP003 v2ray-plugin dialect check
 # against the SS-WS inbound.
 MIHOMO_VERSION=1.19.33
-fetch "$WORK/mihomo.gz" \
-  "https://github.com/MetaCubeX/mihomo/releases/download/v${MIHOMO_VERSION}/mihomo-linux-amd64-v${MIHOMO_VERSION}.gz"
-gunzip -f "$WORK/mihomo.gz" && chmod +x "$WORK/mihomo"
+# Mihomo has no image in this pipeline; if its download is
+# unreachable the one check that needs it is skipped (loudly),
+# not failed downstream for a missing binary.
+if fetch "$WORK/mihomo.gz" \
+  "https://github.com/MetaCubeX/mihomo/releases/download/v${MIHOMO_VERSION}/mihomo-linux-amd64-v${MIHOMO_VERSION}.gz"; then
+  gunzip -f "$WORK/mihomo.gz" && chmod +x "$WORK/mihomo"
+else
+  echo "WARN mihomo download failed - the mihomo check will be skipped"
+fi
 
 export DIRECT_ALLOW_PRIVATE=1
 # VLESS and public SOCKS5 are opt-in now (plaintext-by-default
@@ -345,7 +357,11 @@ check_via_client ss
 check_via_client ss-ws
 check_via_client vmess
 check_via_client vmess-ws
-check_via_mihomo
+if [ -x "$WORK/mihomo" ]; then
+  check_via_mihomo
+else
+  echo "SKIP mihomo ss+v2ray-plugin (websocket) -> target (no mihomo binary)"
+fi
 check_via_client vless-tcp
 check_reality
 
