@@ -446,10 +446,10 @@ def main():
     cfg = json.load(open(cfg_path))
     direct = [o for o in cfg["outbounds"] if o.get("tag") == "direct"][0]
     rules0 = direct.get("settings", {}).get("finalRules", [])
-    check("default render: only the interconnect loopback finalRule, "
-          "private targets stay blocked",
-          len(rules0) == 1 and rules0[0]["ip"] == ["127.0.0.0/8"],
-          json.dumps(direct))
+    check("default render: no freedom finalRules while nobody holds"
+          " a slice (all users keyless so far), private targets stay"
+          " blocked",
+          rules0 == [], json.dumps(direct))
     rc, out, _ = cli("settings", "--direct-allow-private", "on")
     check("settings enable direct_allow_private via CLI",
           rc == 0 and "True" in out, out)
@@ -547,10 +547,11 @@ JHde4tAsdlXZGG6MF7TiAAAAEHhtYWdpYyBmaXh0dXJlLWIBAgMEBQ==
     check("add kerin (team, with key)", rc == 0, err)
     rc, out, _ = cli("--json", "settings")
     info = json.loads(out)
-    everyone = {"alice", "bob", "carol", "kdave", "kerin"}
-    check("interconnect on by default: no opt-outs, every user a member",
+    check("interconnect on by default: slices are claimed at add time,"
+          " keyed users only (keyless alice/bob/carol hold none)",
           info.get("interconnect_off_groups") == []
-          and set(info.get("interconnect_slices", {})) == everyone, out)
+          and info.get("interconnect_slices") == {
+              "kdave": [20000, 20015], "kerin": [20016, 20031]}, out)
     rc, out, _ = cli("render", "--out", cfg_path)
     cfg = json.load(open(cfg_path))
     rules = cfg["routing"]["rules"]
@@ -560,23 +561,22 @@ JHde4tAsdlXZGG6MF7TiAAAAEHhtYWdpYyBmaXh0dXJlLWIBAgMEBQ==
               and r.get("ip") == ["127.0.0.0/8"]]
     direct = [o for o in cfg["outbounds"] if o.get("tag") == "direct"][0]
     by_port = {r.get("port"): r.get("user") for r in band}
-    check("interconnect render: one slice rule per member, dialers are"
-          " groupmates only, loopback block, loopback-only finalRule",
-          len(band) == 5
-          and by_port.get("20000-20015") == ["alice", "bob", "carol"]
-          and by_port.get("20048-20063") == ["kdave", "kerin"]
-          and by_port.get("20064-20079") == ["kdave", "kerin"]
-          and set(by_port) == {"20000-20015", "20016-20031", "20032-20047",
-                               "20048-20063", "20064-20079"}
+    check("interconnect render: one slice rule per holder, dialers are"
+          " the holder's groupmates, loopback block, loopback-only"
+          " finalRule",
+          len(band) == 2
+          and by_port.get("20000-20015") == ["kdave", "kerin"]
+          and by_port.get("20016-20031") == ["kdave", "kerin"]
+          and set(by_port) == {"20000-20015", "20016-20031"}
           and len(blocks) == 1
           and direct.get("settings", {}).get("finalRules", [{}])[0].get("ip")
           == ["127.0.0.0/8"], json.dumps(rules))
     keys_out = os.path.join(workdir, "data", "authorized_keys")
     rc, out, _ = cli("render-keys", "--out", keys_out)
     ktext = open(keys_out).read()
-    check("interconnect keys: every keyed user carries their own slice only",
-          'permitlisten="127.0.0.1:20048"' in ktext
-          and 'permitlisten="127.0.0.1:20064"' in ktext
+    check("interconnect keys: every holder carries their own slice only",
+          'permitlisten="127.0.0.1:20000"' in ktext
+          and 'permitlisten="127.0.0.1:20016"' in ktext
           and ktext.count("permitlisten=") == 32, ktext[:160])
     if shutil.which("ssh-keygen"):
         derived = subprocess.run(["ssh-keygen", "-y", "-f", dave_key],
@@ -586,18 +586,23 @@ JHde4tAsdlXZGG6MF7TiAAAAEHhtYWdpYyBmaXh0dXJlLWIBAgMEBQ==
     rc, out, _ = cli("settings", "--interconnect-off-groups", "team")
     check("settings opt team out of interconnect",
           rc == 0 and "team" in out, out)
+    rc, out, _ = cli("--json", "settings")
+    check("opting a group out releases its members' slices",
+          json.loads(out)["interconnect_slices"] == {}, out)
     rc, out, _ = cli("render", "--out", cfg_path)
     cfg = json.load(open(cfg_path))
     band = [r for r in cfg["routing"]["rules"]
             if r.get("outboundTag") == "direct"
             and r.get("ip") == ["127.0.0.0/8"]]
-    check("opted-out members lose their slice rules (unreachable + cannot dial)",
-          {r.get("port") for r in band}
-          == {"20000-20015", "20016-20031", "20032-20047"}
-          and all(r.get("user") == ["alice", "bob", "carol"] for r in band),
-          json.dumps(band))
+    check("opted-out group renders no slice rules",
+          band == [], json.dumps(band))
     rc, out, _ = cli("settings", "--interconnect-off-groups", "")
     check("clearing the opt-out restores the default", rc == 0, out)
+    rc, out, _ = cli("--json", "settings")
+    check("re-enabled group regains its remembered blocks while they"
+          " are still free (soft preference)",
+          json.loads(out)["interconnect_slices"] == {
+              "kdave": [20000, 20015], "kerin": [20016, 20031]}, out)
 
     # Pidfile restart channel (single-container form): apply restarts
     # only the processes whose rendered inputs changed - it writes a
@@ -660,6 +665,19 @@ JHde4tAsdlXZGG6MF7TiAAAAEHhtYWdpYyBmaXh0dXJlLWIBAgMEBQ==
         f.write("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPidfileTestKey alice\n")
     rc, _, err = cli("setkey", "alice", "--ssh-key-file", pub_path)
     check("setkey for the pidfile scenarios", rc == 0, err)
+    proc, applied = pid_apply()
+    check("a first key also claims a slice: config and keys change",
+          applied.get("changed") == ["config", "keys"]
+          and applied.get("restarted") == {"xray": True, "sshd": True}
+          and exited("xray") and exited("sshd"),
+          proc.stdout + proc.stderr)
+    spawn("xray")
+    spawn("sshd")
+    pub2_path = os.path.join(workdir, "alice2.pub")
+    with open(pub2_path, "w") as f:
+        f.write("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIRotatedPidfileKey alice\n")
+    rc, _, err = cli("setkey", "alice", "--ssh-key-file", pub2_path)
+    check("rotate alice's key (slice unchanged)", rc == 0, err)
     proc, applied = pid_apply()
     check("key change restarts only sshd",
           applied.get("restarted") == {"sshd": True}
@@ -958,6 +976,25 @@ JHde4tAsdlXZGG6MF7TiAAAAEHhtYWdpYyBmaXh0dXJlLWIBAgMEBQ==
     rc, out, _ = cli("--json", "settings")
     check("ssh on: settings report ssh_enabled true",
           json.loads(out)["ssh_enabled"] is True, out)
+    rc, out, _ = cli_off("settings")
+    check("ssh off: settings text marks interconnect unavailable",
+          rc == 0
+          and "interconnect: unavailable (SSH not enabled)" in out, out)
+    rc, out, _ = cli_off("settings", "--interconnect-off-groups", "team")
+    check("ssh off: interconnect opt-out still editable, shown with"
+          " the unavailable mark",
+          rc == 0 and "interconnect_off_groups: team" in out
+          and "interconnect: unavailable (SSH not enabled)" in out, out)
+    rc, out, _ = cli_off("--json", "settings")
+    check("ssh off: stored interconnect opt-out survives in the payload",
+          json.loads(out)["interconnect_off_groups"] == ["team"], out)
+    rc, _, err = cli_off("settings", "--interconnect-off-groups", "")
+    check("ssh off: clearing the interconnect opt-out still works",
+          rc == 0, err)
+    rc, out, _ = cli("settings")
+    check("ssh on: settings text marks interconnect available",
+          rc == 0 and "interconnect: available" in out
+          and "unavailable" not in out, out)
     rc, _, err = cli_off("setkey", "alice", "--clear")
     check("ssh off: clearing a key still works", rc == 0, err)
 
@@ -1027,6 +1064,429 @@ JHde4tAsdlXZGG6MF7TiAAAAEHhtYWdpYyBmaXh0dXJlLWIBAgMEBQ==
     check("migration: upstreams CHECK rebuilt with vmess, rows survive",
           proc.returncode == 0 and "'vmess'" in mig_ddl
           and mig_rows == 1, mig_ddl)
+
+    # ---- interconnect capacity under the allocation-table model.
+    # The limit is on slices HELD (100 blocks), not on user count:
+    # claims happen on the write paths, releases return blocks to
+    # the pool. Fresh DBs keep the counts exact; holders are seeded
+    # directly (user rows with keys + allocation rows).
+    cap_db = os.path.join(workdir, "cap.db")
+    env_cap = dict(env, PROXY_DB=cap_db)
+
+    def cli_cap(*args):
+        proc = subprocess.run([sys.executable, users_py, *args],
+                              env=env_cap, capture_output=True, text=True)
+        return proc.returncode, proc.stdout, proc.stderr
+
+    rc, _, err = cli_cap("init")
+    raw = sqlite3.connect(cap_db)
+    for i in range(1, 101):
+        name = f"cap{i:03d}"
+        raw.execute(
+            "INSERT INTO users (username, vless_uuid, trojan_password,"
+            " ss_password, ss_method, ssh_pubkey, upstream_group,"
+            " created_at) VALUES (?,?,?,?,?,?,?,?)",
+            (name, f"uuid-{i}", "pw", "pw", "aes-256-gcm",
+             f"ssh-ed25519 AAAA {name}", "capped",
+             f"2026-01-01T00:{i // 60:02d}:{i % 60:02d}.000000+00:00"))
+        lo = 20000 + (i - 1) * 16
+        raw.execute(
+            "INSERT INTO interconnect_allocations (username, port_lo,"
+            " port_hi) VALUES (?,?,?)", (name, lo, lo + 15))
+    raw.commit()
+    raw.close()
+    kg1pub = os.path.join(keys_dir, "kg1.pub")
+    check("capacity fixture: fresh db, 100 keyed holders seeded", rc == 0,
+          err)
+    rc, out, err = cli_cap("add", "late1", "--group", "capped",
+                           "--ssh-key-file", kg1pub)
+    check("full pool: a keyed add that would need a slice is refused",
+          rc != 0 and "late1" in err + out and "capped" in err + out
+          and "20000-21599" in err + out and "100" in err + out,
+          err + out)
+    rc, _, err = cli_cap("add", "late1", "--group", "capped")
+    check("keyless users never need a slice: the 101st user is added",
+          rc == 0, err)
+    rc, out, err = cli_cap("setkey", "late1", "--ssh-key-file", kg1pub)
+    check("full pool: setkey refused when the claim cannot be served",
+          rc != 0 and "20000-21599" in err + out, err + out)
+    rc, out, _ = cli_cap("--json", "list")
+    late1_rec = [u for u in json.loads(out)
+                 if u["username"] == "late1"][0]
+    check("refused setkey left the user keyless (write rolled back)",
+          late1_rec["ssh_key"] is False, out)
+    rc, _, err = cli_cap("disable", "cap001")
+    check("disable releases the holder's slice", rc == 0, err)
+    rc, _, err = cli_cap("setkey", "late1", "--ssh-key-file", kg1pub)
+    check("setkey claims once a block is free", rc == 0, err)
+    rc, out, _ = cli_cap("--json", "settings")
+    cap_info = json.loads(out)
+    check("the claim takes the lowest free block; other holders do"
+          " not drift",
+          cap_info["interconnect_slices"].get("late1") == [20000, 20015]
+          and cap_info["interconnect_slices"].get("cap002")
+          == [20016, 20031], out)
+    raw = sqlite3.connect(cap_db)
+    n_alloc = raw.execute("SELECT COUNT(*) FROM interconnect_allocations"
+                          ).fetchone()[0]
+    raw.close()
+    check("settings capacity summary matches the allocation table",
+          cap_info["interconnect_capacity"] == {
+              "total_blocks": 100, "claimed_blocks": n_alloc,
+              "free_blocks": 100 - n_alloc}, out)
+    rc, _, err = cli_cap("settings", "--interconnect-off-groups", "late")
+    check("opt a fresh group out", rc == 0, err)
+    rc, _, err = cli_cap("add", "late9", "--group", "late",
+                         "--ssh-key-file", kg1pub)
+    check("keyed add into an opted-out group claims nothing",
+          rc == 0, err)
+    rc, out, err = cli_cap("settings", "--interconnect-off-groups", "")
+    check("turning a group on refused when its member cannot claim",
+          rc != 0 and "group 'late'" in err + out
+          and "cannot be served: late9" in err + out, err + out)
+    rc, out, _ = cli_cap("--json", "settings")
+    check("refused turn-on leaves the stored opt-out untouched",
+          json.loads(out)["interconnect_off_groups"] == ["late"], out)
+    rc, _, err = cli_cap("disable", "cap002")
+    check("disable another holder to free a block", rc == 0, err)
+    rc, _, err = cli_cap("settings", "--interconnect-off-groups", "")
+    check("turning the group on succeeds once a block is free",
+          rc == 0, err)
+    rc, out, _ = cli_cap("--json", "settings")
+    check("the waiting member claims the freed block (lowest free)",
+          json.loads(out)["interconnect_slices"].get("late9")
+          == [20016, 20031], out)
+
+    # ---- group opt-out releases, remembered blocks, soft preference
+    cap2_db = os.path.join(workdir, "cap2.db")
+    env_cap2 = dict(env, PROXY_DB=cap2_db)
+
+    def cli_cap2(*args):
+        proc = subprocess.run([sys.executable, users_py, *args],
+                              env=env_cap2, capture_output=True, text=True)
+        return proc.returncode, proc.stdout, proc.stderr
+
+    cli_cap2("init")
+    for user, grp in (("a1", "ga"), ("a2", "ga"), ("b1", "gb")):
+        rc, _, err = cli_cap2("add", user, "--group", grp,
+                              "--ssh-key-file", kg1pub)
+        assert rc == 0, err
+    rc, out, _ = cli_cap2("--json", "settings")
+    check("claims land lowest-free in claim order",
+          json.loads(out)["interconnect_slices"] == {
+              "a1": [20000, 20015], "a2": [20016, 20031],
+              "b1": [20032, 20047]}, out)
+    rc, _, err = cli_cap2("settings", "--interconnect-off-groups", "ga")
+    check("opt group ga out", rc == 0, err)
+    rc, out, _ = cli_cap2("--json", "settings")
+    check("opting a group out releases its members' slices",
+          json.loads(out)["interconnect_slices"] == {"b1": [20032, 20047]},
+          out)
+    rc, _, err = cli_cap2("add", "c1", "--group", "gc",
+                          "--ssh-key-file", kg1pub)
+    check("another group's newcomer can claim a released block",
+          rc == 0, err)
+    rc, out, _ = cli_cap2("--json", "settings")
+    check("the newcomer took the lowest free (a1's old) block",
+          json.loads(out)["interconnect_slices"].get("c1")
+          == [20000, 20015], out)
+    rc, _, err = cli_cap2("settings", "--interconnect-off-groups", "")
+    check("turn group ga back on", rc == 0, err)
+    rc, out, _ = cli_cap2("--json", "settings")
+    slices2 = json.loads(out)["interconnect_slices"]
+    check("remembered block taken: members land on other free blocks,"
+          " nobody else drifts",
+          slices2.get("a1") == [20016, 20031]
+          and slices2.get("a2") == [20048, 20063]
+          and slices2.get("b1") == [20032, 20047]
+          and slices2.get("c1") == [20000, 20015], out)
+    cap2_cfg = os.path.join(workdir, "cap2-config.json")
+    rc, out, _ = cli_cap2("render", "--out", cap2_cfg)
+    cfg2 = json.load(open(cap2_cfg))
+    band2 = {r.get("port"): r.get("user")
+             for r in cfg2["routing"]["rules"]
+             if r.get("outboundTag") == "direct"
+             and r.get("ip") == ["127.0.0.0/8"]}
+    check("rendered rules follow the re-claimed slices",
+          band2.get("20016-20031") == ["a1", "a2"]
+          and band2.get("20048-20063") == ["a1", "a2"], json.dumps(band2))
+    rc, _, err = cli_cap2("settings", "--interconnect-off-groups", "gb")
+    check("opt group gb out", rc == 0, err)
+    rc, _, err = cli_cap2("settings", "--interconnect-off-groups", "")
+    check("turn group gb back on", rc == 0, err)
+    rc, out, _ = cli_cap2("--json", "settings")
+    check("soft preference: an untouched remembered block is regained",
+          json.loads(out)["interconnect_slices"].get("b1")
+          == [20032, 20047], out)
+
+    # ---- quantified turn-on shortfall + structured --json error.
+    # 97 blocks held by group "full"; group "gx" has 5 keyed members
+    # and is opted out, so turning it on needs 5 blocks with 3 free.
+    cap3_db = os.path.join(workdir, "cap3.db")
+    env_cap3 = dict(env, PROXY_DB=cap3_db)
+
+    def cli_cap3(*args):
+        proc = subprocess.run([sys.executable, users_py, *args],
+                              env=env_cap3, capture_output=True, text=True)
+        return proc.returncode, proc.stdout, proc.stderr
+
+    cli_cap3("init")
+    raw = sqlite3.connect(cap3_db)
+    for i in range(1, 98):
+        name = f"full{i:03d}"
+        raw.execute(
+            "INSERT INTO users (username, vless_uuid, trojan_password,"
+            " ss_password, ss_method, ssh_pubkey, upstream_group,"
+            " created_at) VALUES (?,?,?,?,?,?,?,?)",
+            (name, f"uuid-f{i}", "pw", "pw", "aes-256-gcm",
+             f"ssh-ed25519 AAAA {name}", "full",
+             f"2026-01-01T00:{i // 60:02d}:{i % 60:02d}.000000+00:00"))
+        lo = 20000 + (i - 1) * 16
+        raw.execute(
+            "INSERT INTO interconnect_allocations (username, port_lo,"
+            " port_hi) VALUES (?,?,?)", (name, lo, lo + 15))
+    for i in range(1, 6):
+        raw.execute(
+            "INSERT INTO users (username, vless_uuid, trojan_password,"
+            " ss_password, ss_method, ssh_pubkey, upstream_group,"
+            " created_at) VALUES (?,?,?,?,?,?,?,?)",
+            (f"gx{i}", f"uuid-g{i}", "pw", "pw", "aes-256-gcm",
+             f"ssh-ed25519 AAAA gx{i}", "gx",
+             f"2026-02-01T00:00:0{i}.000000+00:00"))
+    raw.commit()
+    raw.close()
+    rc, _, err = cli_cap3("settings", "--interconnect-off-groups", "gx")
+    check("quantified fixture: gx opted out", rc == 0, err)
+    rc, out, err = cli_cap3("settings", "--interconnect-off-groups", "")
+    check("turn-on shortfall error spells out N, free M and the gap",
+          rc != 0
+          and "cannot enable interconnect for group 'gx'" in err + out
+          and "5 member(s) need a port slice (16 ports each, 80 ports"
+              " in total)" in err + out
+          and "only 3 free block(s) (48 ports)" in err + out
+          and "short 2 block(s) (32 ports)" in err + out
+          and "cannot be served: gx4, gx5" in err + out, err + out)
+    rc, out, err = cli_cap3("--json", "settings",
+                            "--interconnect-off-groups", "")
+    try:
+        eobj = json.loads(err)
+    except ValueError:
+        eobj = {}
+    check("--json turn-on shortfall is a structured error object with"
+          " the same figures",
+          rc != 0 and eobj.get("code")
+          == "interconnect_insufficient_ports"
+          and eobj.get("group") == "gx"
+          and eobj.get("needed_users")
+          == ["gx1", "gx2", "gx3", "gx4", "gx5"]
+          and eobj.get("needed_count") == 5
+          and eobj.get("free_blocks") == 3
+          and eobj.get("free_ports") == 48
+          and eobj.get("shortfall_blocks") == 2
+          and eobj.get("shortfall_ports") == 32
+          and eobj.get("users_without_ports") == ["gx4", "gx5"]
+          and "short 2 block(s) (32 ports)" in eobj.get("error", ""),
+          err + out)
+    rc, out, _ = cli_cap3("--json", "settings")
+    info3 = json.loads(out)
+    check("shortfall refusal is atomic: no new claims, setting kept",
+          info3["interconnect_off_groups"] == ["gx"]
+          and info3["interconnect_capacity"]["claimed_blocks"] == 97
+          and not any(k.startswith("gx")
+                      for k in info3["interconnect_slices"]), out)
+
+    # ---- migration backfill: a database the static model served
+    # (no allocations table, no last_interconnect_lo column) keeps
+    # the legacy ports of every still-eligible holder.
+    legacy_db = os.path.join(workdir, "legacy.db")
+    raw = sqlite3.connect(legacy_db)
+    raw.execute(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT"
+        " UNIQUE NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,"
+        " vless_uuid TEXT NOT NULL, trojan_password TEXT NOT NULL,"
+        " ss_password TEXT NOT NULL, ss_method TEXT NOT NULL DEFAULT"
+        " 'aes-256-gcm', ssh_pubkey TEXT, upstream_group TEXT NOT NULL"
+        " DEFAULT 'default', note TEXT, created_at TEXT NOT NULL)")
+    raw.execute(
+        "CREATE TABLE admin_settings (key TEXT PRIMARY KEY,"
+        " value TEXT NOT NULL)")
+    raw.execute(
+        "INSERT INTO admin_settings (key, value) VALUES"
+        " ('interconnect_off_groups', 'offg')")
+    legacy_users = [
+        ("old1", 1, "ssh-ed25519 AAAA old1", "default", "00:01"),
+        ("old2", 1, "ssh-ed25519 AAAA old2", "default", "00:02"),
+        ("old3", 1, "ssh-ed25519 AAAA old3", "offg", "00:03"),
+        ("old4", 1, None, "default", "00:04"),
+        ("old5", 1, "ssh-ed25519 AAAA old5", "default", "00:05"),
+        ("old6", 0, "ssh-ed25519 AAAA old6", "default", "00:06"),
+    ]
+    for name, en, key, grp, ts in legacy_users:
+        raw.execute(
+            "INSERT INTO users (username, enabled, vless_uuid,"
+            " trojan_password, ss_password, ssh_pubkey, upstream_group,"
+            " created_at) VALUES (?,?,?,?,?,?,?,?)",
+            (name, en, f"uuid-{name}", "pw", "pw", key, grp,
+             f"2026-01-01T00:{ts}.000000+00:00"))
+    raw.commit()
+    raw.close()
+    env_legacy = dict(env, PROXY_DB=legacy_db)
+
+    def cli_legacy(*args):
+        proc = subprocess.run([sys.executable, users_py, *args],
+                              env=env_legacy, capture_output=True,
+                              text=True)
+        return proc.returncode, proc.stdout, proc.stderr
+
+    rc, out, err = cli_legacy("--json", "settings")
+    legacy_slices = json.loads(out)["interconnect_slices"] \
+        if rc == 0 else {}
+    check("migration backfill: eligible legacy holders keep their"
+          " exact legacy blocks (old3 opted out, old4 keyless,"
+          " old5 keeps block 4 uncompacted)",
+          legacy_slices == {"old1": [20000, 20015],
+                            "old2": [20016, 20031],
+                            "old5": [20064, 20079]}, err + out)
+    raw = sqlite3.connect(legacy_db)
+    alloc_rows = raw.execute(
+        "SELECT username, port_lo FROM interconnect_allocations"
+        " ORDER BY port_lo").fetchall()
+    raw.close()
+    check("migration backfill wrote exactly the eligible rows",
+          alloc_rows == [("old1", 20000), ("old2", 20016),
+                         ("old5", 20064)], str(alloc_rows))
+    rc, _, err = cli_legacy("add", "new1", "--ssh-key-file", kg1pub)
+    check("post-migration keyed add claims the lowest free block",
+          rc == 0, err)
+    rc, out, _ = cli_legacy("--json", "settings")
+    check("the new claim reuses a block the backfill left in the pool",
+          json.loads(out)["interconnect_slices"].get("new1")
+          == [20032, 20047], out)
+
+    # ---- apply-time claim reconcile: users seeded directly (no
+    # write path ever touched them) can sit claim-eligible yet
+    # rowless; apply tops the table up before rendering, so their
+    # slice rules and permitlisten appear. Ineligible seeded users
+    # (keyless, opted-out group, disabled) stay rowless.
+    rec_db = os.path.join(workdir, "rec.db")
+    env_rec = dict(env, PROXY_DB=rec_db)
+
+    def cli_rec(*args):
+        proc = subprocess.run([sys.executable, users_py, *args],
+                              env=env_rec, capture_output=True, text=True)
+        return proc.returncode, proc.stdout, proc.stderr
+
+    rc, _, err = cli_rec("init")
+    check("reconcile fixture: fresh db", rc == 0, err)
+    raw = sqlite3.connect(rec_db)
+    seeded = [
+        # name, enabled, key, group, created second, remembered block
+        ("rec1", 1, "ssh-ed25519 AAAA rec1", "rec", "01", None),
+        ("rec2", 1, "ssh-ed25519 AAAA rec2", "rec", "02", 20064),
+        ("reckeyless", 1, None, "rec", "03", None),
+        ("recoff", 1, "ssh-ed25519 AAAA recoff", "recoff", "04", None),
+        ("recdis", 0, "ssh-ed25519 AAAA recdis", "rec", "05", None),
+    ]
+    for name, en, key, grp, sec, last_lo in seeded:
+        raw.execute(
+            "INSERT INTO users (username, enabled, vless_uuid,"
+            " trojan_password, ss_password, ss_method, ssh_pubkey,"
+            " upstream_group, created_at, last_interconnect_lo)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (name, en, f"uuid-{name}", "pw", "pw", "aes-256-gcm", key,
+             grp, f"2026-03-01T00:00:{sec}.000000+00:00", last_lo))
+    raw.execute(
+        "INSERT INTO admin_settings (key, value) VALUES"
+        " ('interconnect_off_groups', 'recoff')")
+    raw.commit()
+    raw.close()
+    rc, out, _ = cli_rec("--json", "settings")
+    check("seeded eligible users hold nothing before apply (the gap)",
+          json.loads(out)["interconnect_slices"] == {}, out)
+    rc, _, err = cli_rec("apply")
+    check("apply runs clean over seeded data", rc == 0, err)
+    rc, out, _ = cli_rec("--json", "settings")
+    check("apply reconcile: eligible seeded users claim in creation"
+          " order, the remembered block first when free; keyless,"
+          " opted-out and disabled users stay rowless",
+          json.loads(out)["interconnect_slices"] == {
+              "rec1": [20000, 20015], "rec2": [20064, 20079]}, out)
+    rec_cfg = json.load(open(os.path.join(workdir, "config.json")))
+    rec_band = {r.get("port"): r.get("user")
+                for r in rec_cfg["routing"]["rules"]
+                if r.get("outboundTag") == "direct"
+                and r.get("ip") == ["127.0.0.0/8"]}
+    check("reconciled slices render as band rules for the group",
+          rec_band.get("20000-20015") == ["rec1", "rec2"]
+          and rec_band.get("20064-20079") == ["rec1", "rec2"],
+          json.dumps(rec_band))
+    rec_keys = open(os.path.join(workdir, "authorized_keys")).read()
+    check("reconciled holders carry permitlisten, nobody else does",
+          'permitlisten="127.0.0.1:20000"' in rec_keys
+          and 'permitlisten="127.0.0.1:20064"' in rec_keys
+          and rec_keys.count("permitlisten=") == 32,
+          rec_keys[:160])
+    rc, _, err = cli_rec("apply")
+    rc, out, _ = cli_rec("--json", "settings")
+    check("a second apply moves nothing (holders never drift)",
+          rc == 0
+          and json.loads(out)["interconnect_slices"] == {
+              "rec1": [20000, 20015], "rec2": [20064, 20079]}, out)
+
+    # ---- reconcile under a nearly full band: claims proceed in
+    # order until the pool runs out; the rest stay rowless and
+    # apply still succeeds (no refusal gate at apply time).
+    recf_db = os.path.join(workdir, "recfull.db")
+    env_recf = dict(env, PROXY_DB=recf_db)
+
+    def cli_recf(*args):
+        proc = subprocess.run([sys.executable, users_py, *args],
+                              env=env_recf, capture_output=True,
+                              text=True)
+        return proc.returncode, proc.stdout, proc.stderr
+
+    rc, _, err = cli_recf("init")
+    raw = sqlite3.connect(recf_db)
+    for i in range(1, 100):
+        name = f"rh{i:03d}"
+        raw.execute(
+            "INSERT INTO users (username, vless_uuid, trojan_password,"
+            " ss_password, ss_method, ssh_pubkey, upstream_group,"
+            " created_at) VALUES (?,?,?,?,?,?,?,?)",
+            (name, f"uuid-r{i}", "pw", "pw", "aes-256-gcm",
+             f"ssh-ed25519 AAAA {name}", "pool",
+             f"2026-01-01T00:{i // 60:02d}:{i % 60:02d}.000000+00:00"))
+        lo = 20000 + (i - 1) * 16
+        raw.execute(
+            "INSERT INTO interconnect_allocations (username, port_lo,"
+            " port_hi) VALUES (?,?,?)", (name, lo, lo + 15))
+    for j, name in enumerate(("wait1", "wait2", "wait3"), start=1):
+        raw.execute(
+            "INSERT INTO users (username, vless_uuid, trojan_password,"
+            " ss_password, ss_method, ssh_pubkey, upstream_group,"
+            " created_at) VALUES (?,?,?,?,?,?,?,?)",
+            (name, f"uuid-{name}", "pw", "pw", "aes-256-gcm",
+             f"ssh-ed25519 AAAA {name}", "pool",
+             f"2026-04-01T00:00:0{j}.000000+00:00"))
+    raw.commit()
+    raw.close()
+    check("reconcile full-band fixture: 99 holders, 3 waiting",
+          rc == 0, err)
+    rc, _, err = cli_recf("apply")
+    check("apply succeeds even when the band cannot serve everyone",
+          rc == 0, err)
+    rc, out, _ = cli_recf("--json", "settings")
+    recf_info = json.loads(out)
+    check("reconcile fills the last block in creation order and"
+          " stops: wait1 holds it, wait2/wait3 stay rowless",
+          recf_info["interconnect_slices"].get("wait1")
+          == [21584, 21599]
+          and "wait2" not in recf_info["interconnect_slices"]
+          and "wait3" not in recf_info["interconnect_slices"], out)
+    check("capacity after reconcile: band exactly full",
+          recf_info["interconnect_capacity"] == {
+              "total_blocks": 100, "claimed_blocks": 100,
+              "free_blocks": 0}, out)
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     return 1 if FAIL else 0

@@ -241,6 +241,7 @@ CREATE TABLE IF NOT EXISTS users (
   ss_method TEXT NOT NULL DEFAULT 'aes-256-gcm',
   ssh_pubkey TEXT,
   upstream_group TEXT NOT NULL DEFAULT 'default',
+  last_interconnect_lo INTEGER,
   note TEXT,
   created_at TEXT NOT NULL
 );
@@ -292,7 +293,8 @@ if UPSTREAM_STRATEGY not in STRATEGIES:
 # the same registry.
 
 BUSINESS_TABLES = ("users", "upstreams", "routes", "admin_settings",
-                   "admin_credentials", "admin_sessions")
+                   "admin_credentials", "admin_sessions",
+                   "interconnect_allocations")
 DB_TYPES = ("sqlite", "postgres", "mysql")
 LOCAL_DB_PATH = os.environ.get(
     "XMAGIC_LOCAL_DB",
@@ -466,6 +468,8 @@ class DB:
                               "sid VARCHAR(255) PRIMARY KEY")
             sql = sql.replace("username TEXT UNIQUE NOT NULL",
                               "username VARCHAR(255) UNIQUE NOT NULL")
+            sql = sql.replace("username TEXT PRIMARY KEY",
+                              "username VARCHAR(255) PRIMARY KEY")
             sql = sql.replace("name TEXT UNIQUE NOT NULL",
                               "name VARCHAR(255) UNIQUE NOT NULL")
             sql = sql.replace("credential_id TEXT UNIQUE NOT NULL",
@@ -595,6 +599,17 @@ def ensure_schema(conn):
     if cols and "upstream_group" not in cols:  # migrate pre-group databases
         conn.execute("ALTER TABLE users ADD COLUMN upstream_group"
                      " TEXT NOT NULL DEFAULT 'default'")
+    if cols and "last_interconnect_lo" not in cols:
+        # migrate pre-allocation-table databases: the soft-preference
+        # memory of a user's last interconnect block
+        conn.execute("ALTER TABLE users ADD COLUMN last_interconnect_lo"
+                     " INTEGER")
+    alloc_cols = conn.columns("interconnect_allocations")
+    conn.execute(ALLOCATIONS_SCHEMA)
+    if not alloc_cols:
+        # the allocation table is new to this database: backfill it
+        # from the static model it replaces (defined below)
+        _backfill_interconnect_allocations(conn)
     ucols = conn.columns("upstreams")
     if ucols and "username" not in ucols:  # migrate pre-http/socks databases
         conn.execute("ALTER TABLE upstreams ADD COLUMN username TEXT")
@@ -1013,6 +1028,10 @@ def cmd_add(args):
             )
         except IntegrityError:
             sys.exit(f"user already exists: {args.user}")
+        try:
+            require_interconnect_slice(conn, args.user)
+        except ValueError as exc:
+            sys.exit(str(exc))
     if JSON_OUT:
         with db() as conn:
             print(json.dumps(_user_record(get_user(conn, args.user)),
@@ -1059,6 +1078,13 @@ def cmd_setkey(args):
     with db() as conn:
         get_user(conn, args.user)
         conn.execute("UPDATE users SET ssh_pubkey = ? WHERE username = ?", (pubkey, args.user))
+        if pubkey:
+            try:
+                require_interconnect_slice(conn, args.user)
+            except ValueError as exc:
+                sys.exit(str(exc))
+        else:
+            _release_interconnect_slice(conn, args.user)
     if JSON_OUT:
         with db() as conn:
             print(json.dumps(_user_record(get_user(conn, args.user)),
@@ -1115,6 +1141,13 @@ def cmd_flag(args, value):
     with db() as conn:
         get_user(conn, args.user)
         conn.execute("UPDATE users SET enabled = ? WHERE username = ?", (value, args.user))
+        if value:
+            try:
+                require_interconnect_slice(conn, args.user)
+            except ValueError as exc:
+                sys.exit(str(exc))
+        else:
+            _release_interconnect_slice(conn, args.user)
     if JSON_OUT:
         with db() as conn:
             print(json.dumps(_user_record(get_user(conn, args.user)),
@@ -1126,6 +1159,7 @@ def cmd_flag(args, value):
 def cmd_remove(args):
     with db() as conn:
         get_user(conn, args.user)
+        _release_interconnect_slice(conn, args.user)
         conn.execute("DELETE FROM users WHERE username = ?", (args.user,))
     if JSON_OUT:
         print(json.dumps({"removed": args.user}, indent=2))
@@ -1144,8 +1178,10 @@ def cmd_list(_):
         print("(no users)")
     for r in rows:
         key = _fingerprint_or_none(r["ssh_pubkey"]) or ("yes" if r["ssh_pubkey"] else "no")
+        ic = members.get(r["username"])
         print(f"{r['username']:<20} enabled={bool(r['enabled'])!s:<5} group={r['upstream_group']:<10} "
-              f"ssh_key={key} created={r['created_at']}")
+              f"ssh_key={key} created={r['created_at']}"
+              + (f" interconnect={ic[0]}-{ic[1]}" if ic else ""))
 
 
 def cmd_setgroup(args):
@@ -1153,6 +1189,13 @@ def cmd_setgroup(args):
         get_user(conn, args.user)
         conn.execute("UPDATE users SET upstream_group = ? WHERE username = ?",
                      (args.group, args.user))
+        if args.group in interconnect_off_groups(conn):
+            _release_interconnect_slice(conn, args.user)
+        else:
+            try:
+                require_interconnect_slice(conn, args.user)
+            except ValueError as exc:
+                sys.exit(str(exc))
     if JSON_OUT:
         with db() as conn:
             print(json.dumps(_user_record(get_user(conn, args.user)),
@@ -2331,9 +2374,28 @@ def interconnect_off_groups(conn):
     return {g.strip() for g in raw.split(",") if g.strip()}
 
 
+ALLOCATIONS_SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS interconnect_allocations"
+    " (username TEXT PRIMARY KEY, port_lo INTEGER NOT NULL,"
+    " port_hi INTEGER NOT NULL)")
+
+
 def interconnect_slices(conn):
-    """{username: (first_port, last_port)} for every enabled user, in
-    creation order - stable across renders and group toggles."""
+    """{username: (first_port, last_port)} - read from the allocation
+    table, the only source of truth for who holds which slice. Rows
+    are claimed and released on the write paths (add / enable /
+    setkey / setgroup / opt-out changes); rendering and display
+    only ever read."""
+    rows = conn.execute(
+        "SELECT username, port_lo, port_hi"
+        " FROM interconnect_allocations").fetchall()
+    return {r["username"]: (r["port_lo"], r["port_hi"]) for r in rows}
+
+
+def _legacy_interconnect_slices(conn):
+    """The pre-allocation-table model, kept only for the one-time
+    backfill: the first INTERCONNECT_MAX_USERS enabled users in
+    creation order, consecutive blocks from the base."""
     rows = conn.execute(
         "SELECT username FROM users WHERE enabled = 1"
         " ORDER BY created_at, username").fetchall()
@@ -2344,6 +2406,217 @@ def interconnect_slices(conn):
         start = INTERCONNECT_PORT_BASE + i * INTERCONNECT_PORTS_PER_USER
         out[r["username"]] = (start, start + INTERCONNECT_PORTS_PER_USER - 1)
     return out
+
+
+def _backfill_interconnect_allocations(conn):
+    """One-time, when the allocation table first appears in a
+    database the static model served: every legacy slice holder who
+    is still claim-eligible (enabled, holds an ssh key, group not
+    opted out) keeps exactly their legacy ports as a table row.
+    Legacy slices of anyone else return to the pool unrecorded."""
+    legacy = _legacy_interconnect_slices(conn)
+    if not legacy:
+        return
+    off = interconnect_off_groups(conn)
+    rows = conn.execute(
+        "SELECT username, ssh_pubkey, upstream_group FROM users"
+        " WHERE enabled = 1").fetchall()
+    for r in rows:
+        if (r["username"] in legacy and (r["ssh_pubkey"] or "").strip()
+                and r["upstream_group"] not in off):
+            lo, hi = legacy[r["username"]]
+            conn.execute(
+                "INSERT INTO interconnect_allocations"
+                " (username, port_lo, port_hi) VALUES (?,?,?)",
+                (r["username"], lo, hi))
+
+
+def _slice_eligible(row, off):
+    """A user needs a slice when they can actually expose services:
+    enabled, holding an ssh key (no key, no ssh -R), and in a group
+    whose interconnect is on. Pure dialers need no slice."""
+    return (bool(row["enabled"])
+            and bool((row["ssh_pubkey"] or "").strip())
+            and row["upstream_group"] not in off)
+
+
+def _claim_interconnect_slice(conn, username, last_lo=None):
+    """Record a slice for username and return it as (lo, hi): the
+    remembered block (last_lo) when that whole block is still free -
+    a soft preference, best effort only - else the lowest free
+    block. Returns the held slice unchanged when already claimed,
+    and None when every block is held."""
+    rows = conn.execute(
+        "SELECT username, port_lo FROM interconnect_allocations").fetchall()
+    held = {r["username"]: r["port_lo"] for r in rows}
+    if username in held:
+        lo = held[username]
+        return lo, lo + INTERCONNECT_PORTS_PER_USER - 1
+    used = set(held.values())
+    starts = [INTERCONNECT_PORT_BASE + i * INTERCONNECT_PORTS_PER_USER
+              for i in range(INTERCONNECT_MAX_USERS)]
+    pick = None
+    if last_lo in starts and last_lo not in used:
+        pick = last_lo
+    else:
+        for lo in starts:
+            if lo not in used:
+                pick = lo
+                break
+    if pick is None:
+        return None
+    conn.execute(
+        "INSERT INTO interconnect_allocations (username, port_lo, port_hi)"
+        " VALUES (?,?,?)",
+        (username, pick, pick + INTERCONNECT_PORTS_PER_USER - 1))
+    return pick, pick + INTERCONNECT_PORTS_PER_USER - 1
+
+
+def _release_interconnect_slice(conn, username):
+    """Drop username's allocation row, remembering its block start on
+    the user record (last_interconnect_lo) so a later claim can
+    prefer the same block while it is still free."""
+    row = conn.execute(
+        "SELECT port_lo FROM interconnect_allocations WHERE username = ?",
+        (username,)).fetchone()
+    if row is None:
+        return
+    conn.execute(
+        "UPDATE users SET last_interconnect_lo = ? WHERE username = ?",
+        (row[0], username))
+    conn.execute(
+        "DELETE FROM interconnect_allocations WHERE username = ?",
+        (username,))
+
+
+def _slice_full_error(username, group):
+    lo, hi = _interconnect_band()
+    return (f"user '{username}' cannot claim an interconnect port"
+            f" slice in group '{group}': the interconnect port band"
+            f" {lo}-{hi} is fully allocated"
+            f" ({INTERCONNECT_PORTS_PER_USER} ports per user, at most"
+            f" {INTERCONNECT_MAX_USERS} users holding slices at once)")
+
+
+class InterconnectShortfall(ValueError):
+    """Turning a group on needs more slices than the band has free.
+
+    Carries the machine-readable shortfall in .fields (stable `code`
+    plus the quantified breakdown) for the --json error channel and
+    the API error body; the human text is generated from the same
+    numbers, so the two can never disagree."""
+
+    CODE = "interconnect_insufficient_ports"
+
+    def __init__(self, group, needy_names, free_blocks):
+        per = INTERCONNECT_PORTS_PER_USER
+        n = len(needy_names)
+        d = n - free_blocks
+        self.fields = {
+            "code": self.CODE,
+            "group": group,
+            "needed_users": list(needy_names),
+            "needed_count": n,
+            "free_blocks": free_blocks,
+            "free_ports": free_blocks * per,
+            "shortfall_blocks": d,
+            "shortfall_ports": d * per,
+            "users_without_ports": list(needy_names[free_blocks:]),
+        }
+        super().__init__(
+            f"cannot enable interconnect for group '{group}': {n}"
+            f" member(s) need a port slice ({per} ports each,"
+            f" {n * per} ports in total), but only {free_blocks} free"
+            f" block(s) ({free_blocks * per} ports) remain - short {d}"
+            f" block(s) ({d * per} ports); {d} member(s) cannot be"
+            f" served: {', '.join(needy_names[free_blocks:])}")
+
+
+def require_interconnect_slice(conn, username):
+    """Called after a write that may have made username claim-eligible
+    (add / enable / setkey / setgroup), inside the same transaction:
+    claim their slice, or raise ValueError so the whole write is
+    refused. Users who need no slice (disabled, keyless, group
+    opted out) are untouched, and a held slice is never moved."""
+    row = conn.execute(
+        "SELECT enabled, ssh_pubkey, upstream_group, last_interconnect_lo"
+        " FROM users WHERE username = ?", (username,)).fetchone()
+    if row is None:
+        return
+    if not _slice_eligible(row, interconnect_off_groups(conn)):
+        return
+    if _claim_interconnect_slice(conn, username,
+                                 row["last_interconnect_lo"]) is None:
+        raise ValueError(_slice_full_error(username,
+                                           row["upstream_group"]))
+
+
+def _reconcile_interconnect_claims(conn):
+    """Top up the allocation table: every claim-eligible user who
+    holds no row claims a slice, in creation order. Runs only from
+    apply_changes - the write paths claim eagerly for the user they
+    touch, but a user seeded outside them (imported data, a legacy
+    slice the migration returned to the pool) can sit eligible and
+    rowless until some write happens to name him, and rendering
+    stays silent about it; apply is the one operation every surface
+    runs, so it closes the gap. Claim-only and never fatal: holders
+    are never moved, nothing is released, and a full band simply
+    leaves the rest rowless - the refusal gates live on the write
+    paths, and apply is not an interconnect operation."""
+    off = interconnect_off_groups(conn)
+    held = interconnect_slices(conn)
+    rows = conn.execute(
+        "SELECT username, enabled, ssh_pubkey, upstream_group,"
+        " last_interconnect_lo FROM users"
+        " ORDER BY created_at, username").fetchall()
+    for r in rows:
+        if r["username"] in held or not _slice_eligible(r, off):
+            continue
+        got = _claim_interconnect_slice(conn, r["username"],
+                                        r["last_interconnect_lo"])
+        if got is None:
+            break
+        held[r["username"]] = got
+
+
+def interconnect_off_transition(conn, old_off, new_off):
+    """Apply the allocation side of an interconnect_off_groups change,
+    inside the settings write's own transaction:
+    - groups entering the opt-out list release every member's slice
+      (ports return to the pool; the block is remembered per user);
+    - groups leaving it have every eligible member (enabled, keyed,
+      not yet holding) claim a slice, in creation order. If a group
+      cannot be fully served, ValueError refuses the whole settings
+      write with the shortfall spelled out, so no group ever ends
+      up half-claimed and the setting itself stays untouched."""
+    released = new_off - old_off
+    if released:
+        rows = conn.execute(
+            "SELECT username, upstream_group FROM users").fetchall()
+        for r in rows:
+            if r["upstream_group"] in released:
+                _release_interconnect_slice(conn, r["username"])
+    turned_on = old_off - new_off
+    if not turned_on:
+        return
+    held = interconnect_slices(conn)
+    rows = conn.execute(
+        "SELECT username, upstream_group, ssh_pubkey, last_interconnect_lo"
+        " FROM users WHERE enabled = 1 ORDER BY created_at, username"
+    ).fetchall()
+    for group in sorted(turned_on):
+        needy = [r for r in rows
+                 if r["upstream_group"] == group
+                 and (r["ssh_pubkey"] or "").strip()
+                 and r["username"] not in held]
+        free = INTERCONNECT_MAX_USERS - len(held)
+        if len(needy) > free:
+            raise InterconnectShortfall(
+                group, [r["username"] for r in needy], free)
+        for r in needy:
+            got = _claim_interconnect_slice(
+                conn, r["username"], r["last_interconnect_lo"])
+            held[r["username"]] = got
 
 
 def interconnect_groups_members(conn):
@@ -2370,6 +2643,16 @@ def interconnect_members(conn):
     for members in interconnect_groups_members(conn).values():
         out.update(members)
     return out
+
+
+def _interconnect_band():
+    lo = INTERCONNECT_PORT_BASE
+    hi = (INTERCONNECT_PORT_BASE
+          + INTERCONNECT_MAX_USERS * INTERCONNECT_PORTS_PER_USER - 1)
+    return lo, hi
+
+
+
 
 
 def vless_enabled(conn=None):
@@ -2692,7 +2975,18 @@ def settings_info(conn):
         "interconnect_slices": {
             name: list(span) for name, span
             in interconnect_members(conn).items()},
+        "interconnect_capacity": interconnect_capacity(conn),
     }
+
+
+def interconnect_capacity(conn):
+    """Pool summary for the settings payload (pre-flight for
+    automation): how many of the slice blocks are claimed."""
+    claimed = conn.execute(
+        "SELECT COUNT(*) FROM interconnect_allocations").fetchone()[0]
+    return {"total_blocks": INTERCONNECT_MAX_USERS,
+            "claimed_blocks": claimed,
+            "free_blocks": INTERCONNECT_MAX_USERS - claimed}
 
 
 def session_ttl_hours(conn):
@@ -2731,15 +3025,30 @@ def cmd_settings(args):
                 value = ",".join(_parse_paths(value, "/unused"))
             set_setting(conn, key, value)
         if getattr(args, "interconnect_off_groups", None) is not None:
+            old_off = interconnect_off_groups(conn)
             if args.interconnect_off_groups == "":
-                delete_setting(conn, "interconnect_off_groups")
+                canonical, new_off = None, set()
             else:
                 try:
-                    set_setting(conn, "interconnect_off_groups",
-                                normalize_group_list(
-                                    args.interconnect_off_groups))
+                    canonical = normalize_group_list(
+                        args.interconnect_off_groups)
                 except ValueError as exc:
                     sys.exit(str(exc))
+                new_off = set(canonical.split(",")) if canonical else set()
+            try:
+                interconnect_off_transition(conn, old_off, new_off)
+            except InterconnectShortfall as exc:
+                if JSON_OUT:
+                    print(json.dumps({"error": str(exc), **exc.fields}),
+                          file=sys.stderr)
+                    sys.exit(1)
+                sys.exit(str(exc))
+            except ValueError as exc:
+                sys.exit(str(exc))
+            if canonical is None:
+                delete_setting(conn, "interconnect_off_groups")
+            else:
+                set_setting(conn, "interconnect_off_groups", canonical)
         if getattr(args, "vless", None) is not None:
             if args.vless == "":
                 delete_setting(conn, "vless_enabled")
@@ -2839,6 +3148,12 @@ def cmd_settings(args):
     print(f"interconnect_off_groups: "
           f"{','.join(info['interconnect_off_groups']) or '(none)'} "
           f"({src[info['interconnect_off_groups_from_db']]})")
+    print(f"interconnect: "
+          f"{'available' if info['ssh_enabled'] else 'unavailable (SSH not enabled)'}")
+    print(f"interconnect_capacity: "
+          f"{info['interconnect_capacity']['claimed_blocks']}/"
+          f"{info['interconnect_capacity']['total_blocks']} blocks claimed, "
+          f"{info['interconnect_capacity']['free_blocks']} free")
 
 
 def render_all(out_dir):
@@ -2996,6 +3311,13 @@ def restart_channel():
 
 def apply_changes():
     out_dir = os.path.dirname(os.path.abspath(DB_PATH))
+    # Claim any slices seeded data left unclaimed, in one committed
+    # transaction ahead of the render, so the files rendered below
+    # already carry the topped-up table (rendering itself stays
+    # read-only). Both surfaces - the node CLI and the console -
+    # funnel through here, so both get the reconcile.
+    with db() as conn:
+        _reconcile_interconnect_claims(conn)
     before = _artifact_hashes(out_dir)
     result = render_all(out_dir)
     after = _artifact_hashes(out_dir)

@@ -306,6 +306,9 @@ class Api:
         self.url = url.rstrip("/")
         self.sid = session["id"] if session else None
         self.master = _b64u_decode(session["key"]) if session else None
+        # set by authed_api from --json: API error bodies are then
+        # re-emitted as JSON objects on stderr instead of die() text
+        self.json_out = False
 
     def _decrypt(self, method, path, payload):
         if self.master is not None and isinstance(payload, dict) \
@@ -339,10 +342,14 @@ class Api:
                                      json.loads(resp.read() or b"{}"))
         except urllib.error.HTTPError as exc:
             try:
-                message = self._decrypt(
-                    method, path, json.loads(exc.read())).get("error", exc.reason)
+                body = self._decrypt(method, path, json.loads(exc.read()))
+                message = body.get("error", exc.reason)
             except Exception:
-                message = exc.reason
+                body, message = None, exc.reason
+            if self.json_out and isinstance(body, dict) and "error" in body:
+                print(json.dumps(body, ensure_ascii=False),
+                      file=sys.stderr)
+                sys.exit(EXIT_API)
             if exc.code == 401:
                 die(EXIT_AUTH, f"session rejected by the node ({message}) - "
                                "run: xmagic login")
@@ -355,7 +362,9 @@ def authed_api(args):
     cfg, _ = load_config(args)
     name, url = resolve_node(args, cfg)
     session = load_session(args, name, url)
-    return Api(url, session), name, url
+    api = Api(url, session)
+    api.json_out = bool(getattr(args, "json", False))
+    return api, name, url
 
 
 def emit(args, payload, human):
@@ -620,6 +629,12 @@ def cmd_settings_show(args):
         f"interconnect_off_groups: "
         f"{','.join(payload['interconnect_off_groups']) or '(none)'} "
         f"({src[payload['interconnect_off_groups_from_db']]})",
+        f"interconnect: "
+        f"{'available' if payload.get('ssh_enabled', True) else 'unavailable (SSH not enabled)'}",
+        f"interconnect_capacity: "
+        f"{payload['interconnect_capacity']['claimed_blocks']}/"
+        f"{payload['interconnect_capacity']['total_blocks']} blocks claimed, "
+        f"{payload['interconnect_capacity']['free_blocks']} free",
     ]))
 
 
@@ -678,12 +693,14 @@ def cmd_settings_set(args):
         die(2, "nothing to set: pass at least one --option (empty string "
             "clears a value back to the env default)")
     payload = api.call("POST", "/api/settings", body)
+    ic_note = ("" if payload.get("ssh_enabled", True) else
+               " (interconnect unavailable: SSH not enabled)")
     emit(args, payload,
          f"settings saved; session_ttl_hours={payload['session_ttl_hours']}, "
          f"strategy={payload['upstream_strategy']}, "
          f"ss_method={payload['ss_method']}, "
          f"interconnect_off_groups="
-         f"{','.join(payload['interconnect_off_groups']) or '(none)'}, "
+         f"{','.join(payload['interconnect_off_groups']) or '(none)'}{ic_note}, "
          f"reality_enabled={payload['reality_enabled']}, "
          f"reality_dest={payload['reality_dest']}, "
          f"reality_public_key={payload['reality_public_key']}\n"
@@ -717,12 +734,14 @@ def cmd_users_list(args):
     ssh_off = "" if payload.get("ssh_enabled", True) else " (off)"
     lines = []
     for u in payload["users"]:
+        ic = u.get("interconnect")
         lines.append(
             f"{u['username']:<16} group={u['group']:<10} "
             f"enabled={u['enabled']!s:<5} vless uuid={u['vless_uuid']}{off}\n"
             f"{'':<16} password={u['password']}  ss={u['ss_method']}/{u['ss_password']}"
             + (f"  ssh-key={u.get('ssh_fingerprint') or 'yes'}{ssh_off}"
-               if u["ssh_key"] else ""))
+               if u["ssh_key"] else "")
+            + (f"  interconnect={ic[0]}-{ic[1]}" if ic else ""))
     emit(args, payload, "\n".join(lines) if lines else "(no users)")
 
 

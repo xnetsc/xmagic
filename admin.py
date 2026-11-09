@@ -101,9 +101,11 @@ CREATE TABLE IF NOT EXISTS admin_credentials (
 
 
 class ApiError(Exception):
-    def __init__(self, status, message):
+    def __init__(self, status, message, fields=None):
         super().__init__(message)
         self.status, self.message = status, message
+        # optional machine-readable extras, merged into the error body
+        self.fields = fields
 
 
 def b64u_encode(raw: bytes) -> str:
@@ -824,6 +826,10 @@ def api_add_user(body):
                  body.get("note"), datetime.now(timezone.utc).isoformat()))
         except users_mod.IntegrityError:
             raise ApiError(409, f"user already exists: {username}")
+        try:
+            users_mod.require_interconnect_slice(conn, username)
+        except ValueError as exc:
+            raise ApiError(400, str(exc))
         row = users_mod.get_user(conn, username)
         v_on = users_mod.vless_enabled(conn)
     applied = apply_changes()
@@ -833,12 +839,20 @@ def api_add_user(body):
 
 def api_user_action(username, action, body):
     with users_mod.db() as conn:
-        users_mod.get_user(conn, username)
+        urow = users_mod.get_user(conn, username)
         if action == "remove":
+            users_mod._release_interconnect_slice(conn, username)
             conn.execute("DELETE FROM users WHERE username = ?", (username,))
         elif action in ("enable", "disable"):
             conn.execute("UPDATE users SET enabled = ? WHERE username = ?",
                          (1 if action == "enable" else 0, username))
+            if action == "enable":
+                try:
+                    users_mod.require_interconnect_slice(conn, username)
+                except ValueError as exc:
+                    raise ApiError(400, str(exc))
+            else:
+                users_mod._release_interconnect_slice(conn, username)
         elif action == "passwd":
             conn.execute("UPDATE users SET trojan_password = ?, ss_password = ?"
                          " WHERE username = ?",
@@ -852,9 +866,24 @@ def api_user_action(username, action, body):
                                     " the node to register ssh keys")
             conn.execute("UPDATE users SET ssh_pubkey = ? WHERE username = ?",
                          (body.get("ssh_pubkey") or None, username))
+            if (body.get("ssh_pubkey") or "").strip():
+                try:
+                    users_mod.require_interconnect_slice(conn, username)
+                except ValueError as exc:
+                    raise ApiError(400, str(exc))
+            else:
+                users_mod._release_interconnect_slice(conn, username)
         elif action == "setgroup":
             conn.execute("UPDATE users SET upstream_group = ? WHERE username = ?",
                          (body.get("group") or "default", username))
+            if (body.get("group") or "default") \
+                    in users_mod.interconnect_off_groups(conn):
+                users_mod._release_interconnect_slice(conn, username)
+            else:
+                try:
+                    users_mod.require_interconnect_slice(conn, username)
+                except ValueError as exc:
+                    raise ApiError(400, str(exc))
         elif action == "rotate-uuid":
             conn.execute("UPDATE users SET vless_uuid = ? WHERE username = ?",
                          (str(uuidlib.uuid4()), username))
@@ -1200,17 +1229,29 @@ def api_set_settings(body):
         if "interconnect_off_groups" in body:
             render_relevant = True
             value = body["interconnect_off_groups"]
+            old_off = users_mod.interconnect_off_groups(conn)
             if value is None or value == "" or value == []:
-                users_mod.delete_setting(conn, "interconnect_off_groups")
+                canonical, new_off = None, set()
             else:
                 if isinstance(value, list):
                     value = ",".join(str(v) for v in value)
                 try:
-                    users_mod.set_setting(
-                        conn, "interconnect_off_groups",
-                        users_mod.normalize_group_list(value))
+                    canonical = users_mod.normalize_group_list(value)
                 except ValueError as exc:
                     raise ApiError(400, str(exc))
+                new_off = set(canonical.split(",")) if canonical else set()
+            try:
+                users_mod.interconnect_off_transition(conn, old_off,
+                                                      new_off)
+            except users_mod.InterconnectShortfall as exc:
+                raise ApiError(400, str(exc), exc.fields)
+            except ValueError as exc:
+                raise ApiError(400, str(exc))
+            if canonical is None:
+                users_mod.delete_setting(conn, "interconnect_off_groups")
+            else:
+                users_mod.set_setting(conn, "interconnect_off_groups",
+                                      canonical)
     result = api_get_settings()
     if render_relevant:
         result["applied"] = apply_changes()
@@ -1411,7 +1452,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             self._route_get()
         except ApiError as exc:
-            self._send_json(exc.status, {"error": exc.message})
+            self._send_json(exc.status, {"error": exc.message, **(exc.fields or {})})
         except SystemExit as exc:
             self._send_json(404, {"error": str(exc.code)})
         except Exception as exc:  # noqa: BLE001 - surface as 500 JSON
@@ -1421,7 +1462,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             self._route_post()
         except ApiError as exc:
-            self._send_json(exc.status, {"error": exc.message})
+            self._send_json(exc.status, {"error": exc.message, **(exc.fields or {})})
         except SystemExit as exc:
             self._send_json(404, {"error": str(exc.code)})
         except Exception as exc:  # noqa: BLE001
@@ -1926,7 +1967,7 @@ td .row-actions{display:flex;flex-wrap:wrap;gap:.3rem}
               <div class="wide"><label>REALITY serverNames（逗号分隔）</label><input name="reality_server_names"></div>
               <div class="wide"><label>REALITY shortIds（逗号分隔，偶数长度 hex，最长 16）</label><input name="reality_short_ids"></div>
               <div class="wide"><label>REALITY 公钥（客户端 pbk，只读）</label><input name="reality_public_key" readonly></div>
-              <div class="wide"><label>关闭组内互访的分组（逗号分隔，空 = 全部组互访）</label><input name="interconnect_off_groups" placeholder="例如 team"></div>
+              <div class="wide"><label>关闭组内互访的分组（逗号分隔，空 = 全部组互访）</label><input name="interconnect_off_groups" placeholder="例如 team"><p class="hint hidden" id="interconnect-ssh-note">本节点未启用 SSH，组内互访不可用：互访靠 <code>ssh -R</code> 反向转发，须先以部署环境变量 <code>XMAGIC_ENABLE_SSH=1</code> 启用 SSH 并重启节点。已保存的分组设置仍会保留，启用 SSH 后生效。</p></div>
             </div>
             <div class="form-actions">
               <span class="check"><input type="checkbox" name="direct_allow_private" id="set-dap"><label for="set-dap">允许直连内网地址</label></span>
@@ -2625,6 +2666,15 @@ function syncSshAvailability() {
     : "SSH 支持：未启用（默认关；靠部署环境变量 XMAGIC_ENABLE_SSH=1 开启，修改后需重启节点）。";
   const pub = document.querySelector('#form-user [name="ssh_pubkey"]');
   if (pub) pub.disabled = !on;
+  // Interconnect rides ssh -R, so it is unavailable while SSH is
+  // off: disable its settings input (the stored value stays shown
+  // and is still submitted by the settings handler, which reads
+  // .value directly) and show the note next to it.
+  const icInput = document.querySelector(
+    '#form-settings [name="interconnect_off_groups"]');
+  if (icInput) icInput.disabled = !on;
+  const icNote = $("interconnect-ssh-note");
+  if (icNote) icNote.classList.toggle("hidden", on);
   for (const id of ["btn-pick-pubkey", "btn-gen-userkey",
                     "btn-pick-privkey", "btn-gen-upkey"]) {
     const b = $(id); if (b) b.disabled = !on;

@@ -28,6 +28,7 @@ from test_admin import Authenticator, Client as Browser  # noqa: E402
 
 PASS, FAIL = [], []
 PORT_A, PORT_B = 18101, 18102
+PORT_C = 18104  # 18103 is the self-update test's http.server
 
 
 def check(name, cond, extra=""):
@@ -35,11 +36,12 @@ def check(name, cond, extra=""):
     print(("PASS " if cond else "FAIL ") + name + (f"  {extra}" if extra and not cond else ""))
 
 
-def start_server(port, workdir):
+def start_server(port, workdir, ssh=True):
     env = dict(os.environ,
                PROXY_DB=os.path.join(workdir, "data", "users.db"),
                XMAGIC_ADMIN_BIND="127.0.0.1", XMAGIC_ADMIN_PORT=str(port),
-               XMAGIC_ENABLE_SSH="1", XMAGIC_DOCKER_SOCK="/nonexistent.sock")
+               XMAGIC_ENABLE_SSH="1" if ssh else "",
+               XMAGIC_DOCKER_SOCK="/nonexistent.sock")
     proc = subprocess.Popen([sys.executable, os.path.join(ROOT, "admin.py")],
                             env=env, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True)
@@ -321,6 +323,14 @@ def main():
         check("settings set via CLI", rc == 0 and "24" in out, err + out)
         rc, out, _ = cli("--json", "settings", "show")
         check("settings show via CLI", json.loads(out)["session_ttl_hours"] == 24)
+        rc, out, err = cli("--json", "settings", "show")
+        check("settings show reports ssh_enabled true via remote CLI",
+              rc == 0 and json.loads(out).get("ssh_enabled") is True,
+              err + out)
+        rc, out, err = cli("settings", "show")
+        check("settings show marks interconnect available via remote CLI",
+              rc == 0 and "ssh_enabled: True" in out
+              and "interconnect: available" in out, err + out)
 
         # ---- ssh keys: generate, scan, select (remote CLI)
         rc, out, err = cli("--json", "keys", "generate", "ck1")
@@ -803,6 +813,134 @@ def main():
               rc == 0 and not os.path.exists(session_a), err + out)
         rc, _, _ = cli("users", "list")
         check("A requires login after logout", rc == 3, f"rc={rc}")
+
+        # ---- a node with SSH off: settings show ssh_enabled false
+        # and interconnect unavailable, while the stored opt-out
+        # stays editable through the remote CLI.
+        server_c, _ = start_server(PORT_C, os.path.join(workdir, "c"),
+                                   ssh=False)
+        try:
+            auth_c = Authenticator()
+            rc, out, err = cli("node", "add", "c", "--url",
+                               f"http://127.0.0.1:{PORT_C}")
+            check("node add c (ssh off)", rc == 0, err + out)
+            rc, out, err = drive_login(cli_home, PORT_C, auth_c,
+                                       extra_args=("--node", "c"))
+            check("browser login to C (ssh off) succeeds", rc == 0, err)
+            rc, out, err = cli("--node", "c", "--json", "settings", "show")
+            check("ssh off: settings show reports ssh_enabled false"
+                  " via remote CLI",
+                  rc == 0 and json.loads(out).get("ssh_enabled") is False,
+                  err + out)
+            rc, out, err = cli("--node", "c", "settings", "show")
+            check("ssh off: settings show marks interconnect unavailable"
+                  " via remote CLI",
+                  rc == 0 and "ssh_enabled: False" in out
+                  and "interconnect: unavailable (SSH not enabled)" in out,
+                  err + out)
+            rc, out, err = cli("--node", "c", "settings", "set",
+                               "--interconnect-off-groups", "team")
+            check("ssh off: interconnect opt-out still stored via"
+                  " remote CLI, with the unavailable mark",
+                  rc == 0 and "interconnect_off_groups=team" in out
+                  and "interconnect unavailable: SSH not enabled" in out,
+                  err + out)
+            rc, out, err = cli("--node", "c", "--json", "settings", "show")
+            check("ssh off: stored opt-out reads back via remote CLI",
+                  rc == 0
+                  and json.loads(out)["interconnect_off_groups"] == ["team"],
+                  err + out)
+            rc, out, err = cli("--node", "c", "settings", "set",
+                               "--interconnect-off-groups", "")
+            check("ssh off: clearing the opt-out via remote CLI",
+                  rc == 0 and "interconnect_off_groups=(none)" in out,
+                  err + out)
+
+            # Capacity: seed 100 keyed holders of group "capped"
+            # directly (user rows + allocation rows), then exercise
+            # the claim gates through the remote surface.
+            raw = sqlite3.connect(os.path.join(workdir, "c", "data",
+                                               "users.db"))
+            for i in range(1, 101):
+                name = f"cap{i:03d}"
+                raw.execute(
+                    "INSERT INTO users (username, vless_uuid,"
+                    " trojan_password, ss_password, ss_method,"
+                    " ssh_pubkey, upstream_group, created_at)"
+                    " VALUES (?,?,?,?,?,?,?,?)",
+                    (name, f"uuid-{i}", "pw", "pw", "aes-256-gcm",
+                     f"ssh-ed25519 AAAA {name}", "capped",
+                     f"2026-01-01T00:{i // 60:02d}:{i % 60:02d}"
+                     ".000000+00:00"))
+                lo = 20000 + (i - 1) * 16
+                raw.execute(
+                    "INSERT INTO interconnect_allocations (username,"
+                    " port_lo, port_hi) VALUES (?,?,?)",
+                    (name, lo, lo + 15))
+            raw.commit()
+            raw.close()
+            # user101 exists as a keyed, sliceless member (seeded:
+            # this node has SSH off, so keys cannot be registered
+            # through the API here).
+            raw = sqlite3.connect(os.path.join(workdir, "c", "data",
+                                               "users.db"))
+            raw.execute(
+                "INSERT INTO users (username, vless_uuid,"
+                " trojan_password, ss_password, ss_method, ssh_pubkey,"
+                " upstream_group, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                ("user101", "uuid-101", "pw", "pw", "aes-256-gcm",
+                 "ssh-ed25519 AAAA user101", "capped",
+                 "2026-11-01T00:00:00.000000+00:00"))
+            raw.commit()
+            raw.close()
+            rc, out, err = cli("--node", "c", "settings", "set",
+                               "--interconnect-off-groups", "capped")
+            check("capacity: opting the group out via remote CLI",
+                  rc == 0 and "interconnect_off_groups=capped" in out,
+                  err + out)
+            rc, out, err = cli("--node", "c", "settings", "set",
+                               "--interconnect-off-groups", "")
+            check("capacity: turning the group on refused via remote"
+                  " CLI; the quantified error names the shortfall",
+                  rc != 0
+                  and "cannot enable interconnect for group 'capped'"
+                  in err + out
+                  and "101 member(s) need a port slice" in err + out
+                  and "only 100 free block(s) (1600 ports)" in err + out
+                  and "short 1 block(s) (16 ports)" in err + out
+                  and "cannot be served: user101" in err + out,
+                  err + out)
+            rc, out, err = cli("--node", "c", "--json", "settings",
+                               "set", "--interconnect-off-groups", "")
+            try:
+                eobj = json.loads(err)
+            except ValueError:
+                eobj = {}
+            check("capacity: --json refusal is the structured error"
+                  " object with the same figures",
+                  rc != 0 and eobj.get("code")
+                  == "interconnect_insufficient_ports"
+                  and eobj.get("group") == "capped"
+                  and eobj.get("needed_count") == 101
+                  and len(eobj.get("needed_users", [])) == 101
+                  and eobj.get("needed_users", [None])[-1] == "user101"
+                  and eobj.get("free_blocks") == 100
+                  and eobj.get("free_ports") == 1600
+                  and eobj.get("shortfall_blocks") == 1
+                  and eobj.get("shortfall_ports") == 16
+                  and eobj.get("users_without_ports") == ["user101"],
+                  err + out)
+            rc, out, err = cli("--node", "c", "--json", "settings",
+                               "show")
+            c_show = json.loads(out) if rc == 0 else {}
+            check("capacity: refusal was atomic (opt-out kept, all"
+                  " slices still released, capacity summary agrees)",
+                  c_show.get("interconnect_off_groups") == ["capped"]
+                  and c_show.get("interconnect_capacity") == {
+                      "total_blocks": 100, "claimed_blocks": 0,
+                      "free_blocks": 100}, err + out)
+        finally:
+            server_c.terminate()
 
         # ---- remote db management: the whole `db` group against A.
         # Runs last: the final bare switch leaves the CLI logged out

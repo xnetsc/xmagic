@@ -514,13 +514,26 @@ python3 users.py route-add --kind full --pattern example.com --to intl --user ca
 Users in the same group can reach each other's services through the
 gateway, LAN-style. It is **on by default**; Settings (or
 `settings --interconnect-off-groups`) lists the groups that opt out.
+Interconnect depends on SSH support: the reverse forwards are SSH
+sessions, so it is available only while SSH is enabled
+(`XMAGIC_ENABLE_SSH=1`). While SSH is off, the console shows the
+opt-out list disabled and the CLIs report interconnect as
+unavailable; the stored list is kept and takes effect again once
+SSH is enabled and the node has restarted.
 
 - Expose: a user holds a reverse forward to the gateway loopback,
   e.g. `ssh -R 127.0.0.1:20005:127.0.0.1:8080 -N -i <keyfile> -p <port> proxy@<node>`
-  publishes their local port 8080. Each user owns a fixed slice of
-  16 ports (20000-21599, shown in the console's user list); sshd
-  enforces the slice per key (`permitlisten` in authorized_keys), so
-  nobody can squat on another user's ports.
+  publishes their local port 8080. A slice of 16 ports
+  (20000-21599) is allocated when a member needs one — enabled,
+  with an SSH key registered, in a group with interconnect on —
+  and released when the member is disabled, the key is removed, or
+  the group opts out; a member who needs a slice again gets their
+  previous block back when it is still free. At most 100 slices
+  are held at once; an operation that would need one more is
+  refused with the shortfall spelled out. sshd enforces the slice
+  per key (`permitlisten` in authorized_keys, slices shown in the
+  console's user list), so nobody can squat on another user's
+  ports.
 - Visit: any member of the group dials `127.0.0.1:<port>` through
   their proxy like any other destination. Routing sends a member's
   slice only to members of the group; every other loopback

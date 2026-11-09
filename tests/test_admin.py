@@ -30,6 +30,9 @@ ORIGIN = f"http://localhost:{PORT}"
 PASS = []
 FAIL = []
 
+SSH_PUBKEY = ("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestAdminKey"
+              " test@admin")
+
 
 def check(name, cond, extra=""):
     (PASS if cond else FAIL).append(name)
@@ -503,15 +506,27 @@ def main():
               f"{status} {body}")
 
         # ---- interconnect via settings + user rows
-        status, body = client.call("POST", "/api/users",
-                                   {"username": "gina", "group": "team"})
-        check("console adds a team user", status == 201, f"{status} {body}")
+        status, body = client.call(
+            "POST", "/api/users",
+            {"username": "gina", "group": "team",
+             "ssh_pubkey": SSH_PUBKEY})
+        check("console adds a team user with a key", status == 201,
+              f"{status} {body}")
         status, body = client.call("GET", "/api/users")
         gina = [u for u in body["users"] if u["username"] == "gina"][0]
-        check("interconnect on by default: member row carries a slice",
-              isinstance(gina.get("interconnect"), list)
-              and gina["interconnect"][1] - gina["interconnect"][0] == 15,
-              f"{gina}")
+        check("keyed add claims the first slice at once",
+              gina.get("interconnect") == [20000, 20015], f"{gina}")
+        status, body = client.call("POST", "/api/users",
+                                   {"username": "hank", "group": "team"})
+        check("console adds a keyless team user", status == 201,
+              f"{status} {body}")
+        status, body = client.call("GET", "/api/users")
+        hank = [u for u in body["users"] if u["username"] == "hank"][0]
+        check("keyless member holds no slice (dialers need none)",
+              "interconnect" not in hank, f"{hank}")
+        status, body = client.call("POST", "/api/users/hank/remove", {})
+        check("keyless user removed again", status == 200,
+              f"{status} {body}")
         status, body = client.call("POST", "/api/settings",
                                    {"vless_enabled": True})
         check("settings: vless_enabled can be switched on",
@@ -533,15 +548,21 @@ def main():
               status == 200 and body["interconnect_off_groups"] == ["team"]
               and body["db_values"]["interconnect_off_groups"] == "team",
               f"{status} {body}")
+        check("settings payload reports ssh_enabled true",
+              body.get("ssh_enabled") is True, f"{body}")
         status, body = client.call("GET", "/api/users")
         gina = [u for u in body["users"] if u["username"] == "gina"][0]
-        check("opted-out member's row loses the slice",
+        check("opting the group out releases the member's slice",
               "interconnect" not in gina, f"{gina}")
         status, body = client.call("POST", "/api/settings",
                                    {"interconnect_off_groups": ""})
         check("settings: opt-out cleared, default-on restored",
               status == 200 and body["interconnect_off_groups"] == [],
               f"{status} {body}")
+        status, body = client.call("GET", "/api/users")
+        gina = [u for u in body["users"] if u["username"] == "gina"][0]
+        check("re-enabled member regains the remembered block",
+              gina.get("interconnect") == [20000, 20015], f"{gina}")
         status, body = client.call("POST", "/api/users/gina/remove", {})
         check("interconnect test user removed again", status == 200,
               f"{status} {body}")
@@ -933,6 +954,9 @@ def main():
               'id="btn-gen-userkey"' in page
               and 'id="btn-gen-upkey"' in page
               and 'name="interconnect_off_groups"' in page
+              and 'id="interconnect-ssh-note"' in page
+              and "本节点未启用 SSH，组内互访不可用" in page
+              and "icInput.disabled = !on" in page
               and 'name="vless_enabled"' in page
               and 'name="reality_enabled"' in page
               and 'name="reality_dest"' in page
@@ -1105,6 +1129,35 @@ def main():
             status, body = c2.call("GET", "/api/users")
             check("ssh-off node: users payload reports ssh_enabled false",
                   body.get("ssh_enabled") is False, f"{body}")
+            status, body = c2.call("GET", "/api/settings")
+            check("ssh-off node: settings payload reports ssh_enabled false",
+                  status == 200 and body.get("ssh_enabled") is False,
+                  f"{status} {body}")
+            status, body = c2.call("POST", "/api/settings",
+                                   {"interconnect_off_groups": "team"})
+            check("ssh-off node: interconnect opt-out still stored",
+                  status == 200
+                  and body.get("interconnect_off_groups") == ["team"],
+                  f"{status} {body}")
+            status, body = c2.call("POST", "/api/settings",
+                                   {"interconnect_off_groups": ""})
+            check("ssh-off node: interconnect opt-out cleared again",
+                  status == 200
+                  and body.get("interconnect_off_groups") == [],
+                  f"{status} {body}")
+            conn = http.client.HTTPConnection("127.0.0.1", PORT + 7,
+                                              timeout=10)
+            conn.request("GET", "/")
+            resp = conn.getresponse()
+            page2 = resp.read().decode("utf-8", "replace")
+            conn.close()
+            check("ssh-off node: console page carries the interconnect"
+                  " ssh note and the disabling logic",
+                  resp.status == 200
+                  and 'id="interconnect-ssh-note"' in page2
+                  and "本节点未启用 SSH，组内互访不可用" in page2
+                  and "icInput.disabled = !on" in page2,
+                  f"status {resp.status}")
             status, _ = c2.call("POST", "/api/keys/generate", {})
             check("ssh-off node: keys/generate refused",
                   status == 400, f"got {status}")
@@ -1128,6 +1181,116 @@ def main():
                                  "key_file": "/keys/x.key"})
             check("ssh-off node: ssh upstream refused",
                   status == 400, f"got {status}")
+
+            # ---- interconnect capacity: the limit is on slices
+            # HELD. 100 keyed holders of group "capped" are seeded
+            # directly (user rows + allocation rows); ned is keyless
+            # and holds nothing.
+            raw = sqlite3.connect(os.path.join(workdir2, "data",
+                                               "users.db"))
+            for i in range(1, 101):
+                name = f"cap{i:03d}"
+                raw.execute(
+                    "INSERT INTO users (username, vless_uuid,"
+                    " trojan_password, ss_password, ss_method,"
+                    " ssh_pubkey, upstream_group, created_at)"
+                    " VALUES (?,?,?,?,?,?,?,?)",
+                    (name, f"uuid-{i}", "pw", "pw", "aes-256-gcm",
+                     f"ssh-ed25519 AAAA {name}", "capped",
+                     f"2026-01-01T00:{i // 60:02d}:{i % 60:02d}"
+                     ".000000+00:00"))
+                lo = 20000 + (i - 1) * 16
+                raw.execute(
+                    "INSERT INTO interconnect_allocations (username,"
+                    " port_lo, port_hi) VALUES (?,?,?)",
+                    (name, lo, lo + 15))
+            raw.commit()
+            raw.close()
+            # (This node has SSH off, so keyed members are seeded as
+            # data rows; the API paths exercised below - settings
+            # transitions, disable, list - are the ones that run.)
+            status, body = c2.call("POST", "/api/users",
+                                   {"username": "user102",
+                                    "group": "capped"})
+            check("capacity: keyless add allowed past 100 users",
+                  status == 201, f"{status} {body}")
+            # quantified, atomic turn-on refusal: group "late" has two
+            # keyed members; exactly one block is free.
+            raw = sqlite3.connect(os.path.join(workdir2, "data",
+                                               "users.db"))
+            for late_user, day in (("late2", "01"), ("late3", "02")):
+                raw.execute(
+                    "INSERT INTO users (username, vless_uuid,"
+                    " trojan_password, ss_password, ss_method,"
+                    " ssh_pubkey, upstream_group, created_at)"
+                    " VALUES (?,?,?,?,?,?,?,?)",
+                    (late_user, f"uuid-{late_user}", "pw", "pw",
+                     "aes-256-gcm", f"ssh-ed25519 AAAA {late_user}",
+                     "late", f"2026-02-{day}T00:00:00.000000+00:00"))
+            raw.commit()
+            raw.close()
+            status, body = c2.call("POST", "/api/settings",
+                                   {"interconnect_off_groups": "late"})
+            check("capacity: opt a fresh group out", status == 200,
+                  f"{status} {body}")
+            status, _ = c2.call("POST", "/api/users/cap002/disable", {})
+            check("capacity: free exactly one block", status == 200,
+                  f"got {status}")
+            status, body = c2.call("POST", "/api/settings",
+                                   {"interconnect_off_groups": ""})
+            check("capacity: turn-on refusal is quantified (N, free M,"
+                  " shortfall, unserved names)",
+                  status == 400
+                  and "cannot enable interconnect for group 'late'"
+                  in body.get("error", "")
+                  and "2 member(s) need a port slice (16 ports each,"
+                      " 32 ports in total)" in body.get("error", "")
+                  and "only 1 free block(s) (16 ports)"
+                  in body.get("error", "")
+                  and "short 1 block(s) (16 ports)"
+                  in body.get("error", "")
+                  and "cannot be served: late3" in body.get("error", "")
+                  and body.get("code")
+                  == "interconnect_insufficient_ports"
+                  and body.get("needed_count") == 2
+                  and body.get("free_blocks") == 1
+                  and body.get("users_without_ports") == ["late3"],
+                  f"{status} {body}")
+            status, body = c2.call("GET", "/api/settings")
+            check("capacity: refused turn-on leaves the stored opt-out"
+                  " untouched",
+                  status == 200
+                  and body["interconnect_off_groups"] == ["late"],
+                  f"{status} {body}")
+            status, body = c2.call("GET", "/api/users")
+            rows2 = {u["username"]: u for u in body["users"]}
+            check("capacity: refusal is atomic - neither waiting"
+                  " member claimed a slice",
+                  "interconnect" not in rows2["late2"]
+                  and "interconnect" not in rows2["late3"],
+                  f"{rows2.get('late2')} {rows2.get('late3')}")
+            status, _ = c2.call("POST", "/api/users/cap003/disable", {})
+            check("capacity: free one more block", status == 200,
+                  f"got {status}")
+            status, body = c2.call("POST", "/api/settings",
+                                   {"interconnect_off_groups": ""})
+            check("capacity: turn-on succeeds once both fit",
+                  status == 200 and body["interconnect_off_groups"] == [],
+                  f"{status} {body}")
+            status, body = c2.call("GET", "/api/users")
+            rows2 = {u["username"]: u for u in body["users"]}
+            check("capacity: both members claimed lowest-free in order",
+                  rows2["late2"].get("interconnect") == [20016, 20031]
+                  and rows2["late3"].get("interconnect")
+                  == [20032, 20047],
+                  f"{rows2.get('late2')} {rows2.get('late3')}")
+            status, body = c2.call("GET", "/api/settings")
+            check("capacity: settings payload summary matches the"
+                  " table (98 seeded holders left + 2 new claims)",
+                  status == 200
+                  and body.get("interconnect_capacity") == {
+                      "total_blocks": 100, "claimed_blocks": 100,
+                      "free_blocks": 0}, f"{status} {body}")
         finally:
             server2.terminate()
     finally:
