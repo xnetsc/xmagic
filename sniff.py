@@ -1122,14 +1122,20 @@ class _SSDemux:
         # Mux.Cool option bit 0x01 = OptionData (a data segment
         # follows); 0x02 is OptionError. Data frames must carry
         # 0x01 - without it the peer treats the frame as meta-only
-        # and the return stream desynchronizes.
+        # and the return stream desynchronizes. The u16 data
+        # length is part of the data segment: a frame without
+        # OptionData ends at the meta. (An earlier shape wrote
+        # the length for empty frames too; per-message readers
+        # discard the two stray bytes, a strict stream reader
+        # desyncs on them.)
         option = 0x01 if data else 0x00
         meta = sid.to_bytes(2, "big") + bytes([status, option])
         chunks = [data[i:i + 60000]
                   for i in range(0, len(data), 60000)] or [b""]
         for chunk in chunks:
-            frame = (len(meta).to_bytes(2, "big") + meta
-                     + len(chunk).to_bytes(2, "big") + chunk)
+            frame = len(meta).to_bytes(2, "big") + meta
+            if chunk:
+                frame += len(chunk).to_bytes(2, "big") + chunk
             try:
                 self._send_ws(0x2, frame)
             except OSError:

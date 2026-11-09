@@ -124,11 +124,9 @@ def ref_mux_frame(sid, status, data=b"", target=b"", server=False):
     out = len(meta).to_bytes(2, "big") + meta
     if data:
         out += len(data).to_bytes(2, "big") + data
-    elif server:
-        # The gateway's send_frame emits the data length even for
-        # an empty chunk; client frames carry nothing after a
-        # data-less meta.
-        out += b"\x00\x00"
+    # A data-less frame ends at the meta, in both directions (the
+    # spec's shape; the gateway once appended a zero length for
+    # empty server frames, which strict stream readers desync on).
     return out
 
 

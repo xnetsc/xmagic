@@ -215,7 +215,9 @@ static int mux_build(buf_t *out, uint16_t sid, int status,
     hdr[h++] = (uint8_t)(sid >> 8); hdr[h++] = (uint8_t)sid;
     hdr[h++] = (uint8_t)status;
     hdr[h++] = len ? 0x01 : 0x00;                     /* OptionData */
-    hdr[h++] = (uint8_t)(len >> 8); hdr[h++] = (uint8_t)len;
+    if (len) {                                        /* dataLen iff data */
+        hdr[h++] = (uint8_t)(len >> 8); hdr[h++] = (uint8_t)len;
+    }
     if (buf_append(out, hdr, h) < 0) return -1;
     if (len) return buf_append(out, data, len);
     return 0;
@@ -258,6 +260,7 @@ struct conn {
     char path[1024];
     ws_reader_t rd;
     buf_t muxbuf;
+    buf_t mux_out;                /* staged mux stream toward the client */
     buf_t to_client;
     int trace_left;
     session_t *sessions;
@@ -350,9 +353,14 @@ static void append_client_frame(conn_t *c, int opcode,
     buf_free(&tmp);
 }
 
-/* Mux frames to the client with sniff.py's send_frame byte shape:
- * option 0x01 only for a non-empty payload, the u16 data length
- * present for every chunk including the empty one, 60000 chunks. */
+/* Mux frames to the client, staged as a raw byte stream in
+ * c->mux_out (60000-byte mux chunks, spec byte shape) and wrapped
+ * into WebSocket messages by flush_mux_out - the way the Go mux
+ * server over its WS transport packages the stream: frames share
+ * messages and may straddle them, instead of one frame per
+ * message. Strict stream readers (Shadowrocket's mux) desync on
+ * per-message packaging quirks they never see from a real
+ * v2ray-plugin server. */
 static void append_mux(conn_t *c, uint16_t sid, int status,
                        const uint8_t *data, size_t len) {
     size_t off = 0;
@@ -362,11 +370,23 @@ static void append_mux(conn_t *c, uint16_t sid, int status,
         buf_t frame = {NULL, 0, 0, 0};
         if (mux_build(&frame, sid, status, chunk ? data + off : NULL,
                       chunk) == 0)
-            append_client_frame(c, 0x2, frame.data, frame.len);
+            buf_append(&c->mux_out, frame.data, frame.len);
         buf_free(&frame);
         off += chunk;
         if (off >= len) break;
     }
+}
+
+#define STREAM_CHUNK 4096
+static void flush_mux_out(conn_t *c) {
+    while (c->mux_out.len > c->mux_out.off) {
+        size_t n = c->mux_out.len - c->mux_out.off;
+        if (n > STREAM_CHUNK) n = STREAM_CHUNK;
+        append_client_frame(c, 0x2,
+                            c->mux_out.data + c->mux_out.off, n);
+        c->mux_out.off += n;
+    }
+    c->mux_out.len = c->mux_out.off = 0;
 }
 
 static void client_pong_cb(void *ctx, const uint8_t *payload, size_t len) {
@@ -408,7 +428,8 @@ static void destroy_conn(worker_t *w, conn_t *c) {
     }
     close(c->fd);
     buf_free(&c->rd.raw); buf_free(&c->rd.frag);
-    buf_free(&c->muxbuf); buf_free(&c->to_client);
+    buf_free(&c->muxbuf); buf_free(&c->mux_out);
+    buf_free(&c->to_client);
     free(c);
 }
 
@@ -507,6 +528,7 @@ static void handle_client(worker_t *w, conn_t *c, short revents) {
     if (fr == 0 || fr == -1) { destroy_conn(w, c); return; }
     if (fr == 2) return;
     if (conn_pump(w, c) < 0) return;         /* conn already destroyed */
+    flush_mux_out(c);
     if (c->to_client.len > c->to_client.off &&
         flush_out(c->fd, &c->to_client) < 0)
         destroy_conn(w, c);
@@ -605,6 +627,7 @@ static void handle_session(worker_t *w, conn_t *c, session_t *s,
         append_mux(c, s->sid, 2, s->pending.data, s->pending.len);
         s->pending.len = s->pending.off = 0;
     }
+    flush_mux_out(c);
     if (c->to_client.len > c->to_client.off)
         flush_out(c->fd, &c->to_client);
 }
@@ -631,6 +654,7 @@ static void *worker_loop(void *arg) {
         pf[i] = (struct pollfd){.fd = w->wake, .events = POLLIN};
         kind[i] = 0; pc[i] = NULL; ps[i] = NULL; i++;
         for (conn_t *c = w->conns; c; c = c->next) {
+            flush_mux_out(c);
             int be_backlog = 0;
             for (session_t *s = c->sessions; s; s = s->next)
                 if (s->to_be.len - s->to_be.off >= OUT_PAUSE) be_backlog = 1;
